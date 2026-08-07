@@ -118,13 +118,30 @@ resource "aws_iam_policy" "agent_secrets" {
 # Secrets Manager. No IRSA role needed.
 
 # CI role (assumed by GitHub Actions via OIDC — no long-lived keys in CI)
+#
+# var.create_github_oidc_provider (default true) toggles whether this
+# resource is actually created. Set to false for an account that already
+# has a token.actions.githubusercontent.com OIDC provider registered by
+# something else (e.g. a shared/corporate account another team's CI already
+# depends on) — AWS allows only one OIDC provider per issuer URL per
+# account, so leaving this true there fails with EntityAlreadyExists.
+# local.github_oidc_provider_arn below always resolves to the right ARN
+# either way, since the ARN shape is deterministic from the account ID —
+# no data-source lookup or import needed for the false case, and the
+# pre-existing provider is never touched by this Terraform at all.
 resource "aws_iam_openid_connect_provider" "github_actions" {
+  count = var.create_github_oidc_provider ? 1 : 0
+
   url = "https://token.actions.githubusercontent.com"
 
   client_id_list = ["sts.amazonaws.com"]
 
   # GitHub's current OIDC thumbprint — rotate if GitHub rotates their cert.
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
+locals {
+  github_oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github_actions[0].arn : "arn:aws:iam::${data.aws_caller_identity.this.account_id}:oidc-provider/token.actions.githubusercontent.com"
 }
 
 resource "aws_iam_role" "ci" {
@@ -135,13 +152,18 @@ resource "aws_iam_role" "ci" {
     Statement = [{
       Effect = "Allow"
       Principal = {
-        Federated = aws_iam_openid_connect_provider.github_actions.arn
+        Federated = local.github_oidc_provider_arn
       }
       Action = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringLike = {
           # Locked to these repos only. agentify2 added 2026-07-20 so it can
           # share this same CI role/cluster/ECR (deliberate — not isolated infra).
+          # kschandramouli7/agentify2 added 2026-08-07 — a second GitHub
+          # account's fork/mirror of agentify2, used to redeploy this stack
+          # into a separate AWS account; still sharing this role definition
+          # (each AWS account gets its own copy of this role via its own
+          # `terraform apply`, only the trust policy's allowed repos differ).
           #
           # GitHub's OIDC `sub` claim embeds immutable owner/repo IDs inline
           # (e.g. "repo:kschandramouli@47712058/agentify2@1306530798:ref:...")
@@ -153,6 +175,8 @@ resource "aws_iam_role" "ci" {
             "repo:kschandramouli/agentify2:*",
             "repo:kschandramouli@*/agentify:*",
             "repo:kschandramouli@*/agentify2@*:*",
+            "repo:kschandramouli7/agentify2:*",
+            "repo:kschandramouli7@*/agentify2@*:*",
           ]
         }
         StringEquals = {

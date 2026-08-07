@@ -96,6 +96,12 @@ variable "ci_role_name" {
   description = "Name of the CI IAM role to attach Vault secrets read policy to. Leave empty to skip attachment."
 }
 
+variable "create_github_oidc_provider" {
+  type        = bool
+  default     = true
+  description = "Whether to create the GitHub Actions OIDC identity provider (token.actions.githubusercontent.com) in this account. Set to false when the account already has one registered by something else — AWS allows only one OIDC provider per issuer URL per account, so applying with this left true against such an account fails with EntityAlreadyExists. When false, the CI role's trust policy is built against the existing provider's well-known ARN pattern instead, without Terraform ever creating, importing, or otherwise touching it."
+}
+
 # ── P15 test log-platform (ADR 0021) ─────────────────────────────────────────
 # Fargate + Kinesis Firehose + OpenSearch, used to validate the P15 log
 # connector against a real, isolated log source. Off by default — the
