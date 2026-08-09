@@ -63,23 +63,25 @@ jobs:
         run: |
           echo "Agent (Python) — compiles the FastAPI/Claude reasoning layer and runs its pytest suite." >> "$GITHUB_STEP_SUMMARY"
 
-  adapter:
-    name: Adapter (Python)
+  discovery:
+    name: Discovery (Python)
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: src/adapters
+        working-directory: src/adapters/discovery
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install kubernetes requests cryptography
-      - run: python -m py_compile $(find k8fy -name "*.py")
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m py_compile $(find . -name "*.py" -not -path "./.venv/*")
+      - run: python -m pytest tests/ -q
       - name: Job summary
         if: always()
         run: |
-          echo "Adapter (Python) — compiles the k8fy adapter that watches the cluster and emits events." >> "$GITHUB_STEP_SUMMARY"
+          echo "Discovery (Python) — compiles and tests the per-cluster collector (ADR 0022/0027) that watches the cluster and pushes events/inventory to the Hub." >> "$GITHUB_STEP_SUMMARY"
 
   frontend:
     name: Frontend (TypeScript)
