@@ -32,7 +32,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket         = "agentify-tfstate-f6e00ef8"
+    bucket         = "agentify-tfstate-e906dcc8"
     key            = "agentify/dev/terraform.tfstate"
     region         = "ap-southeast-2"
     dynamodb_table = "agentify-tfstate-lock"
