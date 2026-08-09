@@ -1,3 +1,12 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentify-backend
+  namespace: agentify
+  annotations:
+    eks.amazonaws.com/role-arn: "REPLACE_WITH_TERRAFORM_OUTPUT_backend_irsa_role_arn"
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -113,12 +122,3 @@ spec:
   - port: 8080
     targetPort: 8080
   type: ClusterIP
-
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: agentify-backend
-  namespace: agentify
-  annotations:
-    eks.amazonaws.com/role-arn: "REPLACE_WITH_TERRAFORM_OUTPUT_backend_irsa_role_arn"
