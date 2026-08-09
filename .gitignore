@@ -45,6 +45,9 @@ prescriptive-guidance.pdf
 *.tfvars
 !*.tfvars.example
 
+# Locally-downloaded CLI binaries — never commit
+*.exe
+
 # Claude Code internal files (settings, memory) — do not commit
 .claude/
 # ...but project-level skills are shared config and should be versioned

@@ -16,13 +16,13 @@ import urllib.error
 from nacl import encoding, public
 
 
-OWNER = "kschandramouli"
-REPO  = "agentify"
+OWNER = "kschandramouli7"
+REPO  = "agentify2"
 
 SECRETS = {
-    "AWS_ROLE_ARN":      "arn:aws:iam::175920682311:role/agentify-dev-ci",
+    "AWS_ROLE_ARN":      "arn:aws:iam::637423369012:role/agentify-dev-ci",
     "AWS_REGION":        "ap-southeast-2",
-    "ECR_REGISTRY":      "175920682311.dkr.ecr.ap-southeast-2.amazonaws.com",
+    "ECR_REGISTRY":      "637423369012.dkr.ecr.ap-southeast-2.amazonaws.com",
     "EKS_CLUSTER_NAME":  "agentify-dev",
 }
 

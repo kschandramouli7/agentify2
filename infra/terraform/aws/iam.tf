@@ -169,15 +169,9 @@ resource "aws_iam_role" "ci" {
           # (e.g. "repo:kschandramouli@47712058/agentify2@1306530798:ref:...")
           # rather than the plain "repo:OWNER/REPO:..." form docs commonly show —
           # confirmed 2026-07-20 by decoding an actual token. Both forms are kept
-          # here so this survives if GitHub ever reverts the format.
-          "token.actions.githubusercontent.com:sub" = [
-            "repo:kschandramouli/agentify:*",
-            "repo:kschandramouli/agentify2:*",
-            "repo:kschandramouli@*/agentify:*",
-            "repo:kschandramouli@*/agentify2@*:*",
-            "repo:kschandramouli7/agentify2:*",
-            "repo:kschandramouli7@*/agentify2@*:*",
-          ]
+          # in var.github_oidc_trusted_repos's default so this survives if GitHub
+          # ever reverts the format.
+          "token.actions.githubusercontent.com:sub" = var.github_oidc_trusted_repos
         }
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
@@ -257,13 +251,15 @@ resource "aws_iam_role_policy" "ci" {
         ]
         Resource = "arn:aws:iam::${data.aws_caller_identity.this.account_id}:policy/${local.name}-agent-secrets"
       },
-      # S3 + DynamoDB: Terraform remote state (targeted apply)
+      # S3 + DynamoDB: Terraform remote state (targeted apply). Bucket name
+      # comes from var.tfstate_bucket, not hardcoded — it's random-suffixed
+      # per bootstrap run and differs per AWS account.
       {
         Effect = "Allow"
         Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
         Resource = [
-          "arn:aws:s3:::agentify-tfstate-f6e00ef8",
-          "arn:aws:s3:::agentify-tfstate-f6e00ef8/*",
+          "arn:aws:s3:::${var.tfstate_bucket}",
+          "arn:aws:s3:::${var.tfstate_bucket}/*",
         ]
       },
       {

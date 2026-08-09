@@ -102,6 +102,31 @@ variable "create_github_oidc_provider" {
   description = "Whether to create the GitHub Actions OIDC identity provider (token.actions.githubusercontent.com) in this account. Set to false when the account already has one registered by something else — AWS allows only one OIDC provider per issuer URL per account, so applying with this left true against such an account fails with EntityAlreadyExists. When false, the CI role's trust policy is built against the existing provider's well-known ARN pattern instead, without Terraform ever creating, importing, or otherwise touching it."
 }
 
+variable "github_oidc_trusted_repos" {
+  type = list(string)
+  default = [
+    "repo:kschandramouli/agentify:*",
+    "repo:kschandramouli/agentify2:*",
+    "repo:kschandramouli@*/agentify:*",
+    "repo:kschandramouli@*/agentify2@*:*",
+    "repo:kschandramouli7/agentify2:*",
+    "repo:kschandramouli7@*/agentify2@*:*",
+  ]
+  description = "GitHub repos (StringLike patterns on token.actions.githubusercontent.com:sub) allowed to assume the CI role. Defaults to every repo used across every account this stack has been deployed to so far — override with -var for an account where only a subset should be trusted (e.g. a shared/corporate account, where trusting unrelated personal repos is unnecessary over-permissioning even though harmless: they have no secrets pointing at that account anyway)."
+}
+
+variable "tfstate_bucket" {
+  type        = string
+  default     = "agentify-tfstate-f6e00ef8"
+  description = "The S3 bucket infra/terraform/aws/backend.tf's remote state lives in (from infra/terraform/bootstrap's state_bucket output). Defaults to the original account's bucket for backward compatibility — MUST be overridden with -var when applying against a different AWS account, since bucket names are random-suffixed per bootstrap run and this can't be derived automatically. Used by the CI role's Terraform-state IAM grant (the Pause/Resume workflows' targeted `terraform apply`), not by the backend block itself (which can't reference variables and is edited directly per docs/DEPLOYMENT.md)."
+}
+
+variable "enable_nat_gateway" {
+  type        = bool
+  default     = false
+  description = "Whether to create a NAT gateway and run the EKS node group in private subnets (with public subnets reserved for the internet-facing ALB only). Defaults to false — the original account's cost-optimized setup runs nodes directly in public subnets with no NAT gateway (saves ~$35/month, see main.tf). Set to true for an account whose security policy denies ec2:RunInstances with AssociatePublicIpAddress=true (a common Service Control Policy in governed/corporate AWS Organizations) — that denial surfaces as an opaque 'not authorized to launch instances with this launch template' error on the EKS node group, decodable via `aws sts decode-authorization-message`."
+}
+
 # ── P15 test log-platform (ADR 0021) ─────────────────────────────────────────
 # Fargate + Kinesis Firehose + OpenSearch, used to validate the P15 log
 # connector against a real, isolated log source. Off by default — the

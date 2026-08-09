@@ -8,8 +8,12 @@ module "eks" {
   cluster_name    = local.name
   cluster_version = var.cluster_version
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids                     = module.vpc.public_subnets
+  vpc_id = module.vpc.vpc_id
+  # Control-plane ENI subnets: both public and private, always offered —
+  # existing regardless of var.enable_nat_gateway, so this costs nothing and
+  # doesn't force a choice at the cluster level (only the node group below
+  # actually needs to pick one, per var.enable_nat_gateway).
+  subnet_ids                     = concat(module.vpc.public_subnets, module.vpc.private_subnets)
   cluster_endpoint_public_access = true
 
   # Grant the Terraform executor (SSO role) cluster admin via EKS Access Entries.
@@ -29,7 +33,7 @@ module "eks" {
       }
     }
     root = {
-      principal_arn = "arn:aws:iam::175920682311:root"
+      principal_arn = "arn:aws:iam::${data.aws_caller_identity.this.account_id}:root"
       policy_associations = {
         admin = {
           policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
@@ -44,8 +48,26 @@ module "eks" {
 
   eks_managed_node_groups = {
     main = {
+      # Public subnets (default, no NAT cost) unless var.enable_nat_gateway —
+      # then private, since that flag exists specifically for accounts whose
+      # security policy denies EC2 instances a public IP (see variables.tf).
+      subnet_ids = var.enable_nat_gateway ? module.vpc.private_subnets : module.vpc.public_subnets
+      # Leaving this unset was expected to defer to the subnet's own
+      # map_public_ip_on_launch (confirmed false on both private subnets via
+      # `aws ec2 describe-subnets`), but EKS managed node groups' own
+      # provisioning path doesn't reliably inherit that the way a
+      # self-managed ASG would (confirmed via `aws sts decode-authorization-
+      # message` showing ec2:IsLaunchTemplateResource=false on the denied
+      # RunInstances call — EKS isn't going through the launch template's
+      # NetworkInterfaces array the way a plain ASG launch does). Forcing it
+      # explicitly here instead of relying on inheritance.
+      network_interfaces = var.enable_nat_gateway ? [{
+        associate_public_ip_address = false
+        delete_on_termination       = true
+        device_index                = 0
+      }] : []
       instance_types = [var.node_instance_type]
-      ami_type       = "AL2023_x86_64_STANDARD"  # correct key in module v20.37.2; AL2 dropped in EKS 1.33
+      ami_type       = "AL2023_x86_64_STANDARD" # correct key in module v20.37.2; AL2 dropped in EKS 1.33
       min_size       = var.node_min
       max_size       = var.node_max
       desired_size   = var.node_desired
