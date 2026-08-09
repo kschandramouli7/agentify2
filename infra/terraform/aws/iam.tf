@@ -216,10 +216,14 @@ resource "aws_iam_role_policy" "ci" {
           "arn:aws:iam::${data.aws_caller_identity.this.account_id}:role/agentify-dev-*",
         ]
       },
-      # Secrets Manager: read secrets to sync into K8s during deploy
+      # Secrets Manager: read secrets to sync into K8s during deploy.
+      # GetResourcePolicy: the AWS provider's aws_secretsmanager_secret Read
+      # now calls this during every plan/refresh (to detect an attached
+      # resource-based policy), not just an apply-time action — needed here
+      # even though this stack never actually attaches one.
       {
         Effect = "Allow"
-        Action = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Action = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret", "secretsmanager:GetResourcePolicy"]
         Resource = [
           aws_secretsmanager_secret.db.arn,
           aws_secretsmanager_secret.anthropic.arn,
@@ -233,6 +237,7 @@ resource "aws_iam_role_policy" "ci" {
           "secretsmanager:PutSecretValue",
           "secretsmanager:GetSecretValue",
           "secretsmanager:DescribeSecret",
+          "secretsmanager:GetResourcePolicy",
           "secretsmanager:TagResource",
           "secretsmanager:DeleteSecret",
         ]
