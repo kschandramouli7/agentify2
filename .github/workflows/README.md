@@ -15,7 +15,7 @@ references the workflow's own filename.
 
 | # | Workflow | Trigger | Purpose |
 |---|----------|---------|---------|
-| 01 | [CI](01-ci.yml) | push/PR to `main` | Fast tests for backend (Go), agent (Python), adapter (Python), frontend (TS). No Docker build, no AWS calls. |
+| 01 | [CI](01-ci.yml) | push/PR to `main` | Fast tests for backend (Go), agent (Python), discovery (Python), frontend (TS). No Docker build, no AWS calls. |
 | 02 | [Deploy](02-deploy.yml) | `workflow_dispatch`, or push to `main` touching `src/**` / `infra/kubernetes/**` | Build images, push to ECR, roll out to EKS. The core deploy pipeline. |
 | 03 | [Vault Bootstrap](03-vault-bootstrap.yml) | `workflow_dispatch`, or automatically after a successful Deploy | Creates namespace-scoped PKI engines, roles, KV paths, and Vault policies; applies the `payments-test` manifests so pods pick up Vault-injected certs. |
 | 04 | [Bootstrap Langfuse Secret](04-bootstrap-langfuse-secret.yml) | `workflow_dispatch` | One-time (or post-rotation) setup: applies the IAM policy for the agent to read Langfuse credentials, then populates the secret in Secrets Manager. |

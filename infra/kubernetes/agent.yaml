@@ -126,4 +126,4 @@ metadata:
   name: agentify-agent
   namespace: agentify
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::175920682311:role/agentify-dev-agent"
+    eks.amazonaws.com/role-arn: "REPLACE_WITH_TERRAFORM_OUTPUT_agent_irsa_role_arn"
