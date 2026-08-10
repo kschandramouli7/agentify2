@@ -63,6 +63,15 @@ spec:
       containers:
       - name: worker
         image: alpine:3.19
+        env:
+        # Stable (false) for every regular deploy — a healthy baseline the
+        # eval-regression gate and general health queries can answer
+        # against. 05-payment-test.yml's Phase 3 flips this to "true" via
+        # `kubectl set env` (not a manifest re-apply) to build real restart
+        # history on demand, then flips it back in cleanup — the manifest
+        # itself never changes.
+        - name: CRASH_LOOP
+          value: "false"
         command:
         - /bin/sh
         - -c
@@ -72,6 +81,11 @@ spec:
           ls -la /vault/secrets/ 2>/dev/null && echo "Certs present ✅" || echo "Certs missing ❌"
           [ -f /vault/secrets/db-creds ] && . /vault/secrets/db-creds || true
           echo "DB_HOST: ${DB_HOST:-not set}"
+          if [ "$CRASH_LOOP" = "true" ]; then
+            echo "CRASH_LOOP=true — simulating a crash for restart-trend testing (P4b, ADR 0013)"
+            sleep 5
+            exit 1
+          fi
           while true; do
             echo "payment-worker running — certs from Vault PKI"
             sleep 30

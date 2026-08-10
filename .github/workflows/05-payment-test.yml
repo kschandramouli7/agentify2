@@ -128,15 +128,15 @@ jobs:
       - name: "Phase 3 — Deploy crashing worker (CrashLoopBackOff)"
         run: |
           echo "━━━ PHASE 3: Restart trend ━━━"
-          kubectl apply -f infra/kubernetes/payments-test/payment-worker.yaml
-          echo "Worker deployed — will crash every ~5s to build restart trend."
+          kubectl set env deployment/payment-worker -n payments CRASH_LOOP=true
+          echo "Worker set to crash every ~5s to build restart trend."
           echo "Waiting for restart count to climb (7+ scan cycles at 20s)..."
           sleep 150
 
           echo "Current pod state:"
           kubectl get pods -n payments -o wide
           echo ""
-          kubectl describe pod -n payments -l app=payment-worker | grep -A 5 "Last State:"
+          kubectl describe pod -n payments -l app=payment-worker | grep -A 5 "Last State:" || echo "(no restart history yet — pod may still be on its first crash)"
 
       - name: "Phase 3 — Validate: restart trend visible"
         run: |
@@ -211,6 +211,21 @@ jobs:
               print('  •', a)
           print('Sources  :', r.get('sources'))
           "
+
+      # Always restore payment-worker to stable, regardless of the cleanup
+      # choice below — leaving CRASH_LOOP=true would otherwise crash-loop
+      # this pod forever, which would keep polluting the eval-regression
+      # gate (and burning resources) on every future deploy, not just this
+      # test run.
+      - name: "Restore payment-worker to stable"
+        if: always()
+        run: |
+          kubectl set env deployment/payment-worker -n payments CRASH_LOOP=false 2>/dev/null || {
+            echo "payment-worker deployment not found (test likely failed before Phase 3) — nothing to restore"
+            exit 0
+          }
+          kubectl rollout status deployment/payment-worker -n payments --timeout=60s
+          echo "payment-worker restored to stable (CRASH_LOOP=false)"
 
       # ── Cleanup ─────────────────────────────────────────────────────────────
       - name: "Cleanup — remove payment test resources"
