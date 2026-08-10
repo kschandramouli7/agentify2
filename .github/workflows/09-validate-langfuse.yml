@@ -48,7 +48,7 @@ jobs:
 
           print(f"Connecting to Langfuse at {url} ...")
           try:
-              lf = Langfuse(public_key=pk, secret_key=sk, base_url=url)
+              lf = Langfuse(public_key=pk, secret_key=sk, host=url)
               # auth() raises if credentials are invalid
               lf.auth_check()
               print("OK  credentials are valid")
