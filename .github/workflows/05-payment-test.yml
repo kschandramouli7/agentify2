@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 env:
-  ALB: "k8s-agentify-agentify-e5e5d95182-1161371101.ap-southeast-2.elb.amazonaws.com"
+  ALB: "k8s-agentify-e730ed90f6-802032332.ap-southeast-2.elb.amazonaws.com"
 
 jobs:
   payment-test:
