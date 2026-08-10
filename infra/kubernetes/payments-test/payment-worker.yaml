@@ -19,12 +19,16 @@ spec:
       serviceAccountName: payment-worker
       initContainers:
       - name: vault-cert-init
-        image: ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/agentify/log-test-base/alpine:3.18-tools
+        # Stock Docker Hub image — see payment-service.yaml's identical
+        # comment: this account has a NAT gateway, so no ECR-mirrored
+        # "-tools" tag is needed.
+        image: alpine:3.18
         command:
         - sh
         - -c
         - |
           set -e
+          apk add --no-cache curl jq
           VAULT="http://vault.vault.svc.cluster.local:8200"
           JWT=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
           curl -sf -XPOST "$VAULT/v1/auth/kubernetes/login" \
@@ -58,7 +62,7 @@ spec:
             cpu: "200m"
       containers:
       - name: worker
-        image: ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/agentify/log-test-base/alpine:3.19
+        image: alpine:3.19
         command:
         - /bin/sh
         - -c

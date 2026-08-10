@@ -186,10 +186,12 @@ jobs:
           TAG=${{ env.IMAGE_TAG }}
 
           # 1. Replace the ACCOUNT_ID placeholder with the actual ECR registry host.
+          # payments-test manifests are NOT in this list — they pull stock
+          # Docker Hub images directly (this account has a NAT gateway, so
+          # ADR 0021's original no-NAT ECR-mirror workaround doesn't apply
+          # here; see the images themselves for the full explanation).
           for f in infra/kubernetes/backend.yaml infra/kubernetes/agent.yaml \
-                   infra/kubernetes/discovery.yaml \
-                   infra/kubernetes/payments-test/payment-api.yaml infra/kubernetes/payments-test/payment-worker.yaml \
-                   infra/kubernetes/payments-test/payment-service.yaml; do
+                   infra/kubernetes/discovery.yaml; do
             sed -i "s|ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com|${REGISTRY}|g" "$f"
           done
 

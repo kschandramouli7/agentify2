@@ -52,15 +52,10 @@ jobs:
       - name: "Phase 1 — Deploy payments namespace + healthy service"
         run: |
           echo "━━━ PHASE 1: Healthy baseline ━━━"
-          # payment-service.yaml/payment-worker.yaml pull base images from the
-          # log-test ECR mirror (see infra/terraform/aws/logging.tf) — the
-          # 'payments' namespace's Fargate profile has no NAT/internet route,
-          # so Docker Hub pulls there time out (ADR 0021).
-          REGISTRY=${{ secrets.ECR_REGISTRY }}
-          sed -i "s|ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com|${REGISTRY}|g" \
-            infra/kubernetes/payments-test/payment-service.yaml \
-            infra/kubernetes/payments-test/payment-worker.yaml
-
+          # payment-service.yaml/payment-worker.yaml pull stock Docker Hub
+          # images directly — this account has a NAT gateway on the payments
+          # namespace's subnet, unlike ADR 0021's original no-NAT Fargate
+          # assumption, so no ECR mirror step is needed here.
           kubectl apply -f infra/kubernetes/payments-test/namespace.yaml
           kubectl apply -f infra/kubernetes/payments-test/payment-service.yaml
 
@@ -113,11 +108,10 @@ jobs:
           echo "━━━ PHASE 2: Deploy event ━━━"
           # Bump image from nginx:1.25-alpine → nginx:1.26-alpine to trigger a rollout.
           # agentify-discovery's deployment watch (watch.py) will emit a
-          # k8fy.events 'deploy' event.
-          # Uses the same log-test ECR mirror as Phase 1 (Docker Hub isn't
-          # reachable from the 'payments' namespace's Fargate profile).
-          REGISTRY=${{ secrets.ECR_REGISTRY }}
-          kubectl set image deployment/payment payment=${REGISTRY}/agentify/log-test-base/nginx:1.26-alpine -n payments
+          # k8fy.events 'deploy' event. Stock Docker Hub tag, same reasoning
+          # as Phase 1 — this account's NAT gateway makes the ECR mirror step
+          # unnecessary.
+          kubectl set image deployment/payment payment=nginx:1.26-alpine -n payments
           kubectl rollout status deployment/payment -n payments --timeout=120s
           echo "✅ Rollout complete — deploy event should be emitted within 30s"
           sleep 35
