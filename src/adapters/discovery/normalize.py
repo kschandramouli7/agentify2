@@ -226,12 +226,18 @@ async def push_event(event: Dict[str, Any], backend_url: str, collector_token: s
     a failed push is logged and swallowed, never raises — same convention as
     every other push_* function in this package, and matches the retired
     adapter's Emitter (a failed POST must never crash a watch/scan loop)."""
+    # Omit the header entirely when unset — httpx raises a local
+    # (client-side, never-sent) error on a "Bearer " value with an empty
+    # token, and an absent credential is exactly what the Hub's
+    # resolveTenantContext already tolerates for /api/ingest (defaults to
+    # DefaultTenantID) for a single-cluster deployment.
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/ingest",
                 json=event,
-                headers={"Authorization": f"Bearer {collector_token}"},
+                headers=headers,
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:

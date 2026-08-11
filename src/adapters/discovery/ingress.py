@@ -104,12 +104,15 @@ async def push_ingress(entries: List[Dict[str, str]], backend_url: str, collecto
     cluster_ingress_endpoints for this (tenant, cluster) entirely, so a
     removed Ingress/Route disappears on the next push, not linger."""
     payload = {"entries": entries}
+    # Omit the header entirely when unset — see push_inventory's identical
+    # comment (inventory.py) for why.
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/cluster-ingress",
                 json=payload,
-                headers={"Authorization": f"Bearer {collector_token}"},
+                headers=headers,
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:

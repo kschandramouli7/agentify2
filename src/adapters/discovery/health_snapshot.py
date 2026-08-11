@@ -20,12 +20,15 @@ async def push_health(k8s_version: str, pods_total: int, pods_ready: int, backen
     cluster's single cluster_health_snapshots row in place (not a set of
     rows) — always reflects the most recent scan cycle, not history."""
     payload = {"k8s_version": k8s_version, "pods_total": pods_total, "pods_ready": pods_ready}
+    # Omit the header entirely when unset — see push_inventory's identical
+    # comment (inventory.py) for why.
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/cluster-health",
                 json=payload,
-                headers={"Authorization": f"Bearer {collector_token}"},
+                headers=headers,
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:

@@ -54,12 +54,15 @@ async def push_dependency(
     ingest endpoint. Best-effort: any failure is logged and swallowed — one
     dropped scan cycle never blocks the next.
     """
+    # Omit the header entirely when unset — see push_inventory's identical
+    # comment (inventory.py) for why.
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/service-dependencies",
                 json={"namespace": namespace, "from_service": from_service, "to_service": to_service},
-                headers={"Authorization": f"Bearer {collector_token}"},
+                headers=headers,
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:

@@ -35,12 +35,17 @@ async def push_inventory(namespace_services: Dict[str, List[str]], backend_url: 
             for namespace, services in namespace_services.items()
         ]
     }
+    # Omit the header entirely when unset — httpx raises a local (never-sent)
+    # error on a "Bearer " value with an empty token. This endpoint requires
+    # a valid CollectorToken (unlike /api/ingest), so an omitted header still
+    # correctly gets a clean 401 from the Hub rather than a client-side crash.
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/cluster-inventory",
                 json=payload,
-                headers={"Authorization": f"Bearer {collector_token}"},
+                headers=headers,
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:
