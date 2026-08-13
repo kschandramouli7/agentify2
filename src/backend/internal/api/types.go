@@ -174,7 +174,6 @@ type IntegrationStore interface {
 type IntegrationResponse struct {
 	ID                string    `json:"id"`
 	Name              string    `json:"name"`
-	AdapterURL        string    `json:"adapter_url"`
 	Namespaces        []string  `json:"namespaces"`
 	Status            string    `json:"status"`
 	HasToken          bool      `json:"has_token"`
@@ -189,7 +188,6 @@ func integrationToResponse(in pgstore.Integration) IntegrationResponse {
 	return IntegrationResponse{
 		ID:                in.ID,
 		Name:              in.Name,
-		AdapterURL:        in.AdapterURL,
 		Namespaces:        in.Namespaces,
 		Status:            in.Status,
 		HasToken:          in.Token != "" || in.TokenSecretARN != "",

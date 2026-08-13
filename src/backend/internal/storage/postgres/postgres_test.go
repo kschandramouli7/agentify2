@@ -173,7 +173,6 @@ func TestPostgresStores(t *testing.T) {
 		in := &Integration{
 			ID:         uuid.New().String(),
 			Name:       "tenancy-test",
-			AdapterURL: "http://example.invalid",
 			Namespaces: []string{},
 			Status:     "inactive",
 		}
@@ -195,7 +194,7 @@ func TestPostgresStores(t *testing.T) {
 	t.Run("UpdateIntegrationNamespaces overwrites only namespaces, leaving other fields untouched", func(t *testing.T) {
 		id := uuid.New().String()
 		in := &Integration{
-			ID: id, Name: "cluster-a", AdapterURL: "http://adapter", Namespaces: []string{"old-ns"},
+			ID: id, Name: "cluster-a", Namespaces: []string{"old-ns"},
 			Status: "active", CollectorToken: "collector-secret",
 		}
 		if err := client.CreateIntegration(ctx, in); err != nil {
@@ -213,15 +212,15 @@ func TestPostgresStores(t *testing.T) {
 		if len(got.Namespaces) != 2 || got.Namespaces[0] != "payments" || got.Namespaces[1] != "checkout" {
 			t.Errorf("namespaces: want [payments checkout], got %v", got.Namespaces)
 		}
-		if got.Name != "cluster-a" || got.AdapterURL != "http://adapter" {
-			t.Errorf("unrelated fields should be untouched: got name=%q adapter_url=%q", got.Name, got.AdapterURL)
+		if got.Name != "cluster-a" {
+			t.Errorf("unrelated fields should be untouched: got name=%q", got.Name)
 		}
 	})
 
 	t.Run("ADR 0025: Token and TokenSecretARN are mutually exclusive across updates", func(t *testing.T) {
 		id := uuid.New().String()
 		in := &Integration{
-			ID: id, Name: "secrets-test", AdapterURL: "http://adapter", Namespaces: []string{},
+			ID: id, Name: "secrets-test", Namespaces: []string{},
 			Status: "active", Token: "plaintext-token",
 		}
 		if err := client.CreateIntegration(ctx, in); err != nil {
@@ -255,7 +254,7 @@ func TestPostgresStores(t *testing.T) {
 		}
 
 		// An update with both empty must preserve the current (ARN) state.
-		unrelated := &Integration{ID: id, Name: "secrets-test", AdapterURL: "http://adapter", Namespaces: []string{}, Status: "active"}
+		unrelated := &Integration{ID: id, Name: "secrets-test", Namespaces: []string{}, Status: "active"}
 		if err := client.UpdateIntegration(ctx, unrelated); err != nil {
 			t.Fatalf("no-op credential update: %v", err)
 		}
@@ -563,8 +562,8 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
 
-	clusterA := &Integration{ID: uuid.New().String(), Name: "cluster-a", AdapterURL: "http://a.invalid", Namespaces: []string{}, Status: "inactive", TenantID: tenantA}
-	clusterB := &Integration{ID: uuid.New().String(), Name: "cluster-b", AdapterURL: "http://b.invalid", Namespaces: []string{}, Status: "inactive", TenantID: tenantB}
+	clusterA := &Integration{ID: uuid.New().String(), Name: "cluster-a", Namespaces: []string{}, Status: "inactive", TenantID: tenantA}
+	clusterB := &Integration{ID: uuid.New().String(), Name: "cluster-b", Namespaces: []string{}, Status: "inactive", TenantID: tenantB}
 	// CreateIntegration doesn't write tenant_id itself (phase 1's deliberate
 	// scope) — set it directly after creation so this test controls it, not
 	// relying on the DB default (which would put both under the same tenant).

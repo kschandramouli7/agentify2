@@ -148,17 +148,21 @@ func (c *Client) initSchema(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_traces_intent  ON traces(intent);
 
-	-- Admin integrations: configured K8s adapter connections.
+	-- Admin integrations: configured K8s fleet-collector connections.
 	CREATE TABLE IF NOT EXISTS integrations (
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL,
-		adapter_url TEXT NOT NULL,
 		namespaces JSONB NOT NULL DEFAULT '[]',
 		status TEXT NOT NULL DEFAULT 'inactive',
 		token TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP DEFAULT NOW(),
 		updated_at TIMESTAMP DEFAULT NOW()
 	);
+	-- adapter_url: dropped — was the Hub's outbound URL for calling the
+	-- retired k8fy-adapter's log-server directly (ADR 0027 retired that
+	-- whole path; live_get_pod_logs/agentify-discovery's relay replaced it).
+	-- Nothing has read this column since.
+	ALTER TABLE IF EXISTS integrations DROP COLUMN IF EXISTS adapter_url;
 	-- token_secret_arn (ADR 0025): when set, the real credential lives in AWS
 	-- Secrets Manager and the token column is left empty; when unset, token
 	-- still carries the plaintext value (today's behavior, unchanged).
@@ -838,7 +842,6 @@ func (c *Client) GetTracesSummary(ctx context.Context) (*TracesSummary, error) {
 type Integration struct {
 	ID             string
 	Name           string
-	AdapterURL     string
 	Namespaces     []string
 	Status         string
 	Token          string // outbound: this backend calling OUT to the adapter
@@ -853,7 +856,7 @@ type Integration struct {
 // ListIntegrations returns all integrations ordered by creation time.
 func (c *Client) ListIntegrations(ctx context.Context) ([]Integration, error) {
 	rows, err := c.db.QueryContext(ctx,
-		`SELECT id, name, adapter_url, namespaces, status, token, token_secret_arn, collector_token, tenant_id, COALESCE(cluster_id, ''), created_at, updated_at
+		`SELECT id, name, namespaces, status, token, token_secret_arn, collector_token, tenant_id, COALESCE(cluster_id, ''), created_at, updated_at
 		 FROM integrations ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list integrations: %w", err)
@@ -864,7 +867,7 @@ func (c *Client) ListIntegrations(ctx context.Context) ([]Integration, error) {
 	for rows.Next() {
 		var in Integration
 		var nsJSON []byte
-		if err := rows.Scan(&in.ID, &in.Name, &in.AdapterURL, &nsJSON, &in.Status, &in.Token, &in.TokenSecretARN, &in.CollectorToken, &in.TenantID, &in.ClusterID, &in.CreatedAt, &in.UpdatedAt); err != nil {
+		if err := rows.Scan(&in.ID, &in.Name, &nsJSON, &in.Status, &in.Token, &in.TokenSecretARN, &in.CollectorToken, &in.TenantID, &in.ClusterID, &in.CreatedAt, &in.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan integration: %w", err)
 		}
 		if err := json.Unmarshal(nsJSON, &in.Namespaces); err != nil {
@@ -880,9 +883,9 @@ func (c *Client) GetIntegration(ctx context.Context, id string) (*Integration, e
 	var in Integration
 	var nsJSON []byte
 	err := c.db.QueryRowContext(ctx,
-		`SELECT id, name, adapter_url, namespaces, status, token, token_secret_arn, collector_token, tenant_id, COALESCE(cluster_id, ''), created_at, updated_at
+		`SELECT id, name, namespaces, status, token, token_secret_arn, collector_token, tenant_id, COALESCE(cluster_id, ''), created_at, updated_at
 		 FROM integrations WHERE id = $1`, id).
-		Scan(&in.ID, &in.Name, &in.AdapterURL, &nsJSON, &in.Status, &in.Token, &in.TokenSecretARN, &in.CollectorToken, &in.TenantID, &in.ClusterID, &in.CreatedAt, &in.UpdatedAt)
+		Scan(&in.ID, &in.Name, &nsJSON, &in.Status, &in.Token, &in.TokenSecretARN, &in.CollectorToken, &in.TenantID, &in.ClusterID, &in.CreatedAt, &in.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -899,9 +902,9 @@ func (c *Client) GetIntegrationByCollectorToken(ctx context.Context, token strin
 	var in Integration
 	var nsJSON []byte
 	err := c.db.QueryRowContext(ctx,
-		`SELECT id, name, adapter_url, namespaces, status, token, token_secret_arn, collector_token, tenant_id, COALESCE(cluster_id, ''), created_at, updated_at
+		`SELECT id, name, namespaces, status, token, token_secret_arn, collector_token, tenant_id, COALESCE(cluster_id, ''), created_at, updated_at
 		 FROM integrations WHERE collector_token = $1 AND collector_token != ''`, token).
-		Scan(&in.ID, &in.Name, &in.AdapterURL, &nsJSON, &in.Status, &in.Token, &in.TokenSecretARN, &in.CollectorToken, &in.TenantID, &in.ClusterID, &in.CreatedAt, &in.UpdatedAt)
+		Scan(&in.ID, &in.Name, &nsJSON, &in.Status, &in.Token, &in.TokenSecretARN, &in.CollectorToken, &in.TenantID, &in.ClusterID, &in.CreatedAt, &in.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -918,9 +921,9 @@ func (c *Client) CreateIntegration(ctx context.Context, in *Integration) error {
 		return fmt.Errorf("marshal namespaces: %w", err)
 	}
 	_, err = c.db.ExecContext(ctx,
-		`INSERT INTO integrations (id, name, adapter_url, namespaces, status, token, token_secret_arn, collector_token, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
-		in.ID, in.Name, in.AdapterURL, nsJSON, in.Status, in.Token, in.TokenSecretARN, in.CollectorToken)
+		`INSERT INTO integrations (id, name, namespaces, status, token, token_secret_arn, collector_token, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`,
+		in.ID, in.Name, nsJSON, in.Status, in.Token, in.TokenSecretARN, in.CollectorToken)
 	return err
 }
 
@@ -942,13 +945,13 @@ func (c *Client) UpdateIntegration(ctx context.Context, in *Integration) error {
 	}
 	_, err = c.db.ExecContext(ctx,
 		`UPDATE integrations SET
-		   name=$1, adapter_url=$2, namespaces=$3, status=$4,
-		   token = CASE WHEN $6 != '' THEN '' WHEN $5 = '' THEN token ELSE $5 END,
-		   token_secret_arn = CASE WHEN $5 != '' THEN '' WHEN $6 = '' THEN token_secret_arn ELSE $6 END,
-		   collector_token = CASE WHEN $7 = '' THEN collector_token ELSE $7 END,
+		   name=$1, namespaces=$2, status=$3,
+		   token = CASE WHEN $5 != '' THEN '' WHEN $4 = '' THEN token ELSE $4 END,
+		   token_secret_arn = CASE WHEN $4 != '' THEN '' WHEN $5 = '' THEN token_secret_arn ELSE $5 END,
+		   collector_token = CASE WHEN $6 = '' THEN collector_token ELSE $6 END,
 		   updated_at=NOW()
-		 WHERE id=$8`,
-		in.Name, in.AdapterURL, nsJSON, in.Status, in.Token, in.TokenSecretARN, in.CollectorToken, in.ID)
+		 WHERE id=$7`,
+		in.Name, nsJSON, in.Status, in.Token, in.TokenSecretARN, in.CollectorToken, in.ID)
 	return err
 }
 
@@ -963,7 +966,7 @@ func (c *Client) DeleteIntegration(ctx context.Context, id string) error {
 // ROADMAP P18 use case #1) to auto-populate Namespaces from what the
 // collector actually sees in its own cluster, distinct from
 // UpdateIntegration's full-row admin-form replace (the collector never knows
-// Name/AdapterURL/etc., only namespaces).
+// Name/etc., only namespaces).
 func (c *Client) UpdateIntegrationNamespaces(ctx context.Context, id string, namespaces []string) error {
 	nsJSON, err := json.Marshal(namespaces)
 	if err != nil {

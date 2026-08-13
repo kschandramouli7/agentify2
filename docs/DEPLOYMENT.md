@@ -4,6 +4,12 @@ Architecture: all workloads (backend, agent, discovery) run on a single EKS clus
 The frontend is a static Vite build served from S3 + CloudFront.
 See [ADR 0017](../context-mesh/decisions/0017-all-on-eks-topology.md).
 
+**Deploying this stack into a second/different AWS account?** Read
+[NEW_ACCOUNT_MIGRATION.md](NEW_ACCOUNT_MIGRATION.md) first — it documents
+every account-portability variable this guide's steps rely on, plus the
+full set of gotchas (hardcoded values, apply-ordering races, SCP/NAT
+interactions, credential-chain quirks) hit the last time this was done.
+
 ## Authentication model
 
 | Who/what needs AWS access | How |

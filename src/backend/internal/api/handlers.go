@@ -479,7 +479,6 @@ func (h *Handler) HandleIntegrationGet(w http.ResponseWriter, r *http.Request) {
 // integrationCreateRequest is the body accepted by POST /admin/integrations.
 type integrationCreateRequest struct {
 	Name           string   `json:"name"`
-	AdapterURL     string   `json:"adapter_url"`
 	Namespaces     []string `json:"namespaces"`
 	Token          string   `json:"token"`
 	CollectorToken string   `json:"collector_token"` // ADR 0022 — a collector's inbound push credential
@@ -496,8 +495,8 @@ func (h *Handler) HandleIntegrationCreate(w http.ResponseWriter, r *http.Request
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.Name == "" || req.AdapterURL == "" {
-		http.Error(w, "name and adapter_url are required", http.StatusBadRequest)
+	if req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
 	if req.Namespaces == nil {
@@ -508,7 +507,6 @@ func (h *Handler) HandleIntegrationCreate(w http.ResponseWriter, r *http.Request
 	row := &pgstore.Integration{
 		ID:             id,
 		Name:           req.Name,
-		AdapterURL:     req.AdapterURL,
 		Namespaces:     req.Namespaces,
 		Status:         "inactive",
 		Token:          req.Token,
@@ -543,7 +541,6 @@ func (h *Handler) HandleIntegrationCreate(w http.ResponseWriter, r *http.Request
 // integrationUpdateRequest is the body accepted by PUT /admin/integrations/{id}.
 type integrationUpdateRequest struct {
 	Name           string   `json:"name"`
-	AdapterURL     string   `json:"adapter_url"`
 	Namespaces     []string `json:"namespaces"`
 	Status         string   `json:"status"`
 	Token          string   `json:"token"`           // empty = keep existing token
@@ -566,8 +563,8 @@ func (h *Handler) HandleIntegrationUpdate(w http.ResponseWriter, r *http.Request
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.Name == "" || req.AdapterURL == "" {
-		http.Error(w, "name and adapter_url are required", http.StatusBadRequest)
+	if req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
 	if req.Namespaces == nil {
@@ -581,7 +578,6 @@ func (h *Handler) HandleIntegrationUpdate(w http.ResponseWriter, r *http.Request
 	row := &pgstore.Integration{
 		ID:             id,
 		Name:           req.Name,
-		AdapterURL:     req.AdapterURL,
 		Namespaces:     req.Namespaces,
 		Status:         status,
 		Token:          req.Token,

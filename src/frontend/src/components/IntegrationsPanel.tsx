@@ -106,7 +106,7 @@ function NamespacesField({
 
 // ── Integration form (create + edit) ─────────────────────────────────────────
 
-const BLANK: IntegrationInput = { name: "", adapter_url: "", namespaces: [], token: "", status: "inactive" };
+const BLANK: IntegrationInput = { name: "", namespaces: [], token: "", status: "inactive" };
 
 function IntegrationForm({
   initial,
@@ -124,7 +124,7 @@ function IntegrationForm({
   const [form, setForm] = useState<IntegrationInput>(
     initial
       ? {
-          name: initial.name, adapter_url: initial.adapter_url, namespaces: initial.namespaces, token: "",
+          name: initial.name, namespaces: initial.namespaces, token: "",
           status: initial.status,
         }
       : BLANK
@@ -148,16 +148,6 @@ function IntegrationForm({
           value={form.name}
           onChange={e => set("name", e.target.value)}
           placeholder="Production cluster"
-          required
-        />
-      </label>
-      <label className="int-field">
-        <span>Discovery URL *</span>
-        <input
-          type="url"
-          value={form.adapter_url}
-          onChange={e => set("adapter_url", e.target.value)}
-          placeholder="http://agentify-discovery:8300"
           required
         />
       </label>
@@ -220,7 +210,6 @@ function IntegrationRow({
           <span className="int-row__token-dot" title="bearer token configured">🔑</span>
         )}
       </div>
-      <div className="int-row__url">{integration.adapter_url}</div>
       <div className="int-row__watching">
         <span className="int-row__watching-label">
           {integration.namespaces.length > 0 ? "Namespaces:" : "No namespaces assigned yet"}

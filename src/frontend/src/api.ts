@@ -305,7 +305,6 @@ export function listPods(): Promise<Pod[]> {
 export interface Integration {
   id: string;
   name: string;
-  adapter_url: string;
   namespaces: string[];
   status: "active" | "inactive" | "error";
   has_token: boolean;
@@ -315,7 +314,6 @@ export interface Integration {
 
 export interface IntegrationInput {
   name: string;
-  adapter_url: string;
   namespaces: string[];
   token?: string;
   status?: string;
