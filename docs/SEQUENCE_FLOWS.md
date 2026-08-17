@@ -274,12 +274,12 @@ sequenceDiagram
     end
 
     Note over Agent,Disc: On-demand relay (as many times as needed, over the one open connection) — Agent only ever talks to the Hub
-    Agent->>Hub: POST /api/live-fetch {cluster_id, tool: "live_list_pods", args}
+    Agent->>Hub: POST /api/live-fetch — cluster_id, tool=live_list_pods, args
     Hub->>Hub: liveFetchAllowedTools[tool]? then CollectorHub.RequestLive(cluster_id, ...)
-    Hub->>Disc: {"id": "...", "type": "request", "tool": "live_list_pods", "args": {...}}<br/>(over the already-open connection)
+    Hub->>Disc: relay request — id, type=request, tool=live_list_pods, args<br/>(over the already-open connection)
     Disc->>Disc: live_tools.dispatch(tool, args)<br/>— reads its OWN cluster's K8s API directly, own RBAC only
-    Disc-->>Hub: {"id": "...", "type": "response", "result": {...}}
-    Hub-->>Agent: 200 {result}
+    Disc-->>Hub: relay response — id, type=response, result
+    Hub-->>Agent: 200 — result
 
     Note over Hub: If no connection is registered for cluster_id,<br/>or Discovery doesn't answer within 15s,<br/>Hub returns 502/504 immediately — never blocks indefinitely
 ```
