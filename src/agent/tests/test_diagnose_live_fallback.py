@@ -94,6 +94,38 @@ async def test_prefetch_never_resolves_without_a_service_name(monkeypatch):
     skill = DiagnoseSkill()
     # No service_name in context -> resolution never runs, same as the other
     # service_name-gated prefetch steps (service_health, similar_incidents).
-    await skill._prefetch({}, {"namespace": "payments"})
+    prefetched = await skill._prefetch({}, {"namespace": "payments"})
 
     assert resolve_called is False
+    assert "similar_incidents" not in prefetched
+
+
+@pytest.mark.asyncio
+async def test_prefetch_adds_similar_incidents_task_when_service_name_present(monkeypatch):
+    calls = []
+
+    async def fake_resolve(namespace, service, backend_url):
+        return []
+
+    async def fake_fetch(self, tool_name, args):
+        calls.append((tool_name, dict(args)))
+        return {"similar_incidents": [{"summary": "past OOMKill"}]}
+
+    async def fake_fetch_deps(namespace, backend_url):
+        return []
+
+    monkeypatch.setattr(diagnose_module, "resolve_service_clusters", fake_resolve)
+    monkeypatch.setattr(diagnose_module, "fetch_service_dependencies", fake_fetch_deps)
+    monkeypatch.setattr(DiagnoseSkill, "_fetch", fake_fetch)
+
+    skill = DiagnoseSkill()
+    prefetched = await skill._prefetch({}, {"namespace": "payments", "service_name": "payment-api"})
+
+    assert prefetched["similar_incidents"] == {"similar_incidents": [{"summary": "past OOMKill"}]}
+    similar_call_args = [args for name, args in calls if name == "get_similar_incidents"]
+    assert similar_call_args == [{
+        "namespace": "payments",
+        "service": "payment-api",
+        "description": "service health issues in payments/payment-api",
+        "limit": 3,
+    }]

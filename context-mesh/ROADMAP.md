@@ -406,7 +406,17 @@ piece is the test dataset and CI step.
 
 ---
 
-## P8 — RAG + Semantic Memory (pgvector)
+## P8 — RAG + Semantic Memory (pgvector) ✅ Done (2026-08-18)
+
+Shipped: `incident_embeddings` (pgvector `vector(512)`, ivfflat cosine index),
+the agent's `/embed` route (Voyage AI, `available=false` fallback when no
+key), `get_similar_incidents` wired into `DiagnoseSkill._prefetch()`. The
+2026-08-18 date marks when this was verified end-to-end and given direct
+test coverage (`TestIncidentEmbeddings` in `postgres_test.go`;
+`test_embed_endpoint.py`, `test_similar_incidents.py`, and the
+`similar_incidents` case in `test_diagnose_live_fallback.py` on the agent
+side) — the feature itself shipped earlier, in the commit implementing
+this section (`git log -S embedAndStoreIncident`).
 
 **Hard truth:** RAG is explicitly listed as a required production LLM pattern in
 evaluation criteria. Agentify deferred pgvector as YAGNI (ADR 0010). That decision

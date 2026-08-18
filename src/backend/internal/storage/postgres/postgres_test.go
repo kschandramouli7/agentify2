@@ -843,6 +843,126 @@ func TestRemediationProposals(t *testing.T) {
 
 }
 
+// TestIncidentEmbeddings covers the keyword-fallback path of P8's semantic
+// memory layer. embedded-postgres (used here) doesn't ship pgvector, so the
+// `embedding` column is never added by initSchema (see the DO $$ ...
+// EXCEPTION block) — exactly the "pgvector unavailable" condition
+// FindSimilarIncidents is documented to fall back from. The vector-search
+// path (queryVec non-empty, embedding <-> ordering) needs a real Postgres
+// with pgvector installed and isn't exercised by this suite.
+func TestIncidentEmbeddings(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+
+	// incident_embeddings.trace_id REFERENCES traces(id) — seed one first.
+	seedTrace := func(id string) {
+		t.Helper()
+		if err := client.InsertTrace(ctx, TraceRecord{
+			ID: id, TraceID: id, Question: "why is it crashing", Intent: "diagnose",
+			Namespace: "payments", Tier: "tier2", Status: "answered", Confidence: 0.8,
+		}); err != nil {
+			t.Fatalf("seed trace %s: %v", id, err)
+		}
+	}
+
+	t.Run("insert without embedding, then upsert updates the summary in place", func(t *testing.T) {
+		seedTrace("trace-a")
+		e := IncidentEmbedding{
+			ID: uuid.New().String(), TraceID: "trace-a",
+			Namespace: "payments", Service: "payment-worker",
+			Summary: "OOMKilled, restarted",
+		}
+		if err := client.InsertIncidentEmbedding(ctx, e); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		e.Summary = "OOMKilled, restarted — root cause: memory leak in v1.4"
+		if err := client.InsertIncidentEmbedding(ctx, e); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+
+		found, err := client.FindSimilarIncidents(ctx, "payments", "payment-worker", nil, 10)
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		var got *IncidentEmbedding
+		for i := range found {
+			if found[i].ID == e.ID {
+				got = &found[i]
+			}
+		}
+		if got == nil {
+			t.Fatal("upserted row not found via FindSimilarIncidents fallback")
+		}
+		if got.Summary != e.Summary {
+			t.Errorf("upsert did not update summary in place: got %q", got.Summary)
+		}
+		if got.TenantID == "" {
+			t.Error("tenant_id should default to the single-tenant placeholder, got empty")
+		}
+	})
+
+	t.Run("fallback search scopes by namespace+service and orders most-recent-first", func(t *testing.T) {
+		seedTrace("trace-b")
+		seedTrace("trace-c")
+		seedTrace("trace-d")
+
+		older := IncidentEmbedding{ID: uuid.New().String(), TraceID: "trace-b", Namespace: "checkout", Service: "checkout-api", Summary: "older incident"}
+		if err := client.InsertIncidentEmbedding(ctx, older); err != nil {
+			t.Fatalf("insert older: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond) // force a distinct created_at for ordering
+		newer := IncidentEmbedding{ID: uuid.New().String(), TraceID: "trace-c", Namespace: "checkout", Service: "checkout-api", Summary: "newer incident"}
+		if err := client.InsertIncidentEmbedding(ctx, newer); err != nil {
+			t.Fatalf("insert newer: %v", err)
+		}
+		other := IncidentEmbedding{ID: uuid.New().String(), TraceID: "trace-d", Namespace: "checkout", Service: "other-service", Summary: "different service, must not match"}
+		if err := client.InsertIncidentEmbedding(ctx, other); err != nil {
+			t.Fatalf("insert other-service: %v", err)
+		}
+
+		found, err := client.FindSimilarIncidents(ctx, "checkout", "checkout-api", nil, 10)
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		if len(found) != 2 {
+			t.Fatalf("want 2 rows scoped to checkout/checkout-api, got %d", len(found))
+		}
+		if found[0].ID != newer.ID {
+			t.Errorf("want most-recent-first ordering, got %q first", found[0].Summary)
+		}
+
+		t.Run("limit caps the result count", func(t *testing.T) {
+			capped, err := client.FindSimilarIncidents(ctx, "checkout", "checkout-api", nil, 1)
+			if err != nil {
+				t.Fatalf("find: %v", err)
+			}
+			if len(capped) != 1 {
+				t.Fatalf("want 1 row (limit=1), got %d", len(capped))
+			}
+		})
+
+		t.Run("limit<=0 defaults to 3", func(t *testing.T) {
+			defaulted, err := client.FindSimilarIncidents(ctx, "checkout", "checkout-api", nil, 0)
+			if err != nil {
+				t.Fatalf("find: %v", err)
+			}
+			if len(defaulted) != 2 { // only 2 rows exist in scope — default cap of 3 doesn't truncate them
+				t.Fatalf("want 2 rows (below the default limit of 3), got %d", len(defaulted))
+			}
+		})
+	})
+
+	t.Run("empty namespace/service filters match everything", func(t *testing.T) {
+		found, err := client.FindSimilarIncidents(ctx, "", "", nil, 100)
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		if len(found) < 3 { // at least the 3 rows inserted by the earlier subtests
+			t.Fatalf("want at least 3 rows across all namespaces/services, got %d", len(found))
+		}
+	})
+}
+
 func mustTime(t *testing.T, s string) time.Time {
 	t.Helper()
 	ts, err := time.Parse(time.RFC3339, s)
