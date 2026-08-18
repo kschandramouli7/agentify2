@@ -260,7 +260,7 @@ sequenceDiagram
     participant Hub  as Hub<br/>(the one Go backend process — CollectorHub lives here)
     participant Agent as Python agent<br/>(DiagnoseSkill/HealthSkill/CertAuditSkill)
 
-    Note over Disc,Hub: Connection setup — Discovery always dials out; Hub never dials in (once, reconnects with backoff on drop)
+    Note over Disc,Hub: Connection setup — Discovery always dials out, Hub never dials in (once, reconnects with backoff on drop)
     Disc->>Hub: GET /api/collector/connect<br/>Authorization: Bearer {COLLECTOR_TOKEN}
     Hub->>Hub: resolveTenantContext(token) → (tenant_id, cluster_id)
     Hub-->>Disc: 101 Switching Protocols (WebSocket upgrade)
