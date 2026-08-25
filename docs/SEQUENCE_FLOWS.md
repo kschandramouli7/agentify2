@@ -253,6 +253,9 @@ requests over that connection rather than ever dialing into a cluster
 (which usually isn't reachable from the Hub — NAT, private VPC, firewall).
 **Everything in this diagram happens either inside the cluster (Discovery)
 or inside the one central process (Hub)** — there's no third location.
+**This is not the only path a live diagnostic tool call can take** — see
+Diagram 7 for the shorter one the Chat UI's "Run" buttons actually use, and
+the one field (`cluster_id`) that decides between them.
 
 ```mermaid
 sequenceDiagram
@@ -288,6 +291,49 @@ sequenceDiagram
 POST — it already worked and didn't need the persistent channel. Only
 on-demand request/response traffic uses the WebSocket. See the ADR 0022
 amendment (2026-08-03) for why these weren't unified onto one connection.
+
+---
+
+## 7. Chat "Run" button — direct live-tool-call (no collector relay)
+
+No LLM anywhere in this diagram either, and — unlike Diagram 6 — **no
+Discovery collector, no WebSocket, no `cluster_id`.** This is the path a
+recommended action's "Run" button takes: three plain HTTP hops, ending in
+the agent pod calling the Kubernetes API of the *cluster it itself runs
+in*. It exists because the chat-structuring prompt that builds recommended
+actions (`CHAT_STRUCTURE_PROMPT`, `src/agent/k8fy/prompts.py`) only ever
+fills in `namespace`/`pod` — never `cluster_id` — so this passthrough never
+has a reason to resolve or relay to a different cluster.
+
+```mermaid
+sequenceDiagram
+    participant FE  as Frontend<br/>(DiagnosisReport's "Run" button)
+    participant Hub as Hub<br/>(the one Go backend process)
+    participant Agent as Python agent<br/>(same in-cluster pod as the Hub talks to)
+    participant K8s as Kubernetes API<br/>(the agent pod's OWN cluster)
+
+    FE->>Hub: POST /api/live-query — tool=live_list_pods, arguments
+    Hub->>Hub: HandleLiveToolCall: liveDiagnosticTools[tool]? (2nd, Hub-local allow-list)
+    Hub->>Agent: POST /live-tool-call — tool, arguments (plain HTTP proxy, unchanged)
+    Agent->>Agent: process_tool_call → _dispatch_live_diagnostic<br/>arguments has no cluster_id → stay local
+    Agent->>K8s: GET /api/v1/namespaces/{ns}/pods<br/>(agent pod's own service-account token)
+    K8s-->>Agent: pod list / logs / events
+    Agent-->>Hub: 200 — result
+    Hub-->>FE: 200 — result
+
+    Note over Hub: liveDiagnosticTools deliberately excludes live_get_certificates —<br/>that tool has no local implementation and always requires cluster_id (see Diagram 6)
+```
+
+**Why this shape:** the Chat UI's recommended actions are meant for
+quick, no-LLM confirmation of what a diagnosis already found — adding
+fleet-cluster resolution here would cost a `resolve_service_clusters` round
+trip for the common case (single-cluster deployments, or a query about the
+same cluster the agent already runs in) where it can only ever be a no-op.
+`DiagnoseSkill`'s own prefetch (Diagram 4) is the one caller that resolves
+`cluster_id` and can hand it to `_dispatch_live_diagnostic` — a hand-built
+`arguments` dict with `cluster_id` set would also take Diagram 6's relay
+path through this exact same function, but no code path from the Chat "Run"
+button constructs one today.
 
 ---
 
