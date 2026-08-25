@@ -292,6 +292,16 @@ POST — it already worked and didn't need the persistent channel. Only
 on-demand request/response traffic uses the WebSocket. See the ADR 0022
 amendment (2026-08-03) for why these weren't unified onto one connection.
 
+**Code references**
+
+| Hop | File | What it does |
+|-----|------|---------------|
+| Connection setup | [`handlers.go:2096`](../src/backend/internal/api/handlers.go#L2096) `HandleCollectorConnect` | Upgrades to WebSocket, registers the connection under `cluster_id` |
+| Connection setup | [`live_relay.py:71`](../src/adapters/discovery/live_relay.py#L71) `run_forever` | Dials out, reconnects with capped backoff on drop |
+| Agent → Hub | [`handlers.go:2155`](../src/backend/internal/api/handlers.go#L2155) `HandleLiveFetch` | Requires `cluster_id`; checks `liveFetchAllowedTools` |
+| Hub → Discovery | [`collector_hub.go:152`](../src/backend/internal/api/collector_hub.go#L152) `CollectorHub.RequestLive` | Writes a WS frame over the already-open connection, awaits the matching response by `id` |
+| Discovery execution | [`live_tools.py:64`](../src/adapters/discovery/live_tools.py#L64) `dispatch()` | K8s API call against Discovery's own cluster, own RBAC |
+
 ---
 
 ## 7. Chat "Run" button — direct live-tool-call (no collector relay)
@@ -300,10 +310,14 @@ No LLM anywhere in this diagram either, and — unlike Diagram 6 — **no
 Discovery collector, no WebSocket, no `cluster_id`.** This is the path a
 recommended action's "Run" button takes: three plain HTTP hops, ending in
 the agent pod calling the Kubernetes API of the *cluster it itself runs
-in*. It exists because the chat-structuring prompt that builds recommended
-actions (`CHAT_STRUCTURE_PROMPT`, `src/agent/k8fy/prompts.py`) only ever
-fills in `namespace`/`pod` — never `cluster_id` — so this passthrough never
-has a reason to resolve or relay to a different cluster.
+in*.
+
+> [!TIP]
+> **What actually runs when you click "Run":** Frontend → Hub (thin proxy)
+> → Agent's own in-cluster K8s call. The Discovery collector and its
+> persistent WebSocket (Diagram 6) are never touched — that path only
+> activates when a query names a `cluster_id`, which recommended actions
+> built by the chat-structuring prompt never populate.
 
 ```mermaid
 sequenceDiagram
@@ -334,6 +348,28 @@ same cluster the agent already runs in) where it can only ever be a no-op.
 `arguments` dict with `cluster_id` set would also take Diagram 6's relay
 path through this exact same function, but no code path from the Chat "Run"
 button constructs one today.
+
+**Code references**
+
+| Hop | File | What it does |
+|-----|------|---------------|
+| Frontend → Hub | [`api.ts:169`](../src/frontend/src/api.ts#L169) `runLiveTool()` | POSTs to `/api/live-query` |
+| Hub proxy | [`handlers.go:1466`](../src/backend/internal/api/handlers.go#L1466) `HandleLiveToolCall` | Allow-list check (`liveDiagnosticTools`), then forwards as-is |
+| Hub → Agent | [`agent_client.go:108`](../src/backend/internal/api/agent_client.go#L108) `AgentClient.LiveToolCall` | Plain HTTP POST — no `cluster_id` added |
+| Agent dispatch | [`tools.py:578`](../src/agent/k8fy/tools.py#L578) `_dispatch_live_diagnostic` | Branches on whether `cluster_id` is in `arguments` |
+| Recommended-action arguments | [`prompts.py:395`](../src/agent/k8fy/prompts.py#L395) `CHAT_STRUCTURE_PROMPT` | Only ever fills `namespace`/`pod` — never `cluster_id` |
+| Local execution | [`live_diagnostics.py`](../src/agent/k8fy/live_diagnostics.py) | Direct in-cluster K8s API call, agent pod's own service account |
+
+### Diagram 6 vs. Diagram 7 — which one actually runs
+
+| | Diagram 6 — fleet relay | Diagram 7 — direct |
+|---|---|---|
+| **Trigger** | `cluster_id` present in `arguments` | `cluster_id` absent |
+| **Caller** | `DiagnoseSkill`'s fleet fan-out (ADR 0023/0024) | Chat UI's "Run" button on a recommended action |
+| **Hops** | Agent → Hub → Discovery → K8s API (a *different* cluster) | Frontend → Hub → Agent → K8s API (the *same* cluster the agent runs in) |
+| **Connection** | Persistent WebSocket, opened once (`/api/collector/connect`) | Plain HTTP, one request per call |
+| **Allow-lists** | `liveFetchAllowedTools` (Hub) + `live_tools.LIVE_TOOLS` (Discovery) | `liveDiagnosticTools` (Hub) + `LIVE_DIAGNOSTIC_TOOLS` (Agent) |
+| **`live_get_certificates`** | Supported — the only path it has | Not supported (no local implementation) |
 
 ---
 
