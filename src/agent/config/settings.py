@@ -95,6 +95,15 @@ class Settings(BaseSettings):
     athena_database: str = Field(default="", validation_alias=AliasChoices("ATHENA_DATABASE"))
     athena_table: str = Field(default="", validation_alias=AliasChoices("ATHENA_TABLE"))
 
+    # Glue-based dependency mining (ADR 0029, ROADMAP P15/P18 use case #2) —
+    # a periodic background task, gated on the same athena_* config above
+    # (skips itself when unconfigured). Default matches Glue's hour-level
+    # partition granularity (_partition_predicate) so each cycle scans
+    # exactly the newly-landed partition rather than re-scanning old data.
+    dependency_mining_interval_seconds: int = Field(
+        default=3600, validation_alias=AliasChoices("DEPENDENCY_MINING_INTERVAL_SECONDS")
+    )
+
     # Langfuse prompt management (optional — falls back to local strings if not set)
     # Keys are resolved from LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars,
     # or fetched from AWS Secrets Manager using langfuse_secret_name below.

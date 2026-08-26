@@ -47,6 +47,29 @@ async def test_push_inventory_sends_bearer_token_and_namespace_services(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_push_inventory_carries_each_service_selector(monkeypatch):
+    # ADR 0029: main.py's _namespace_services now hands push_inventory the
+    # richer {"name": ..., "selector": {...}} shape, not bare names.
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await inventory.push_inventory(
+        {"payments": [{"name": "payment-api", "selector": {"app": "payment-api"}}]},
+        "http://backend", "secret-token",
+    )
+
+    body = json.loads(seen["body"])
+    assert body["namespaces"] == [
+        {"name": "payments", "services": [{"name": "payment-api", "selector": {"app": "payment-api"}}]},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_push_inventory_degrades_silently_on_error(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")

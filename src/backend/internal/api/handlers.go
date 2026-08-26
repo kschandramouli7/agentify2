@@ -1697,16 +1697,27 @@ func (h *Handler) resolveTenantContext(r *http.Request) (tenantID, clusterID str
 }
 
 // serviceDependencyUpsertRequest is the body accepted by POST /api/service-dependencies.
+// ClusterID is ADR 0029's trusted-internal-caller override — see below.
 type serviceDependencyUpsertRequest struct {
 	Namespace   string `json:"namespace"`
 	FromService string `json:"from_service"`
 	ToService   string `json:"to_service"`
+	ClusterID   string `json:"cluster_id,omitempty"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
 // from->to service call edge (see k8fy/service_topology.py). Best-effort from
 // the agent's side — a failure here just means one piece of evidence is lost,
 // never surfaces as a diagnosis error.
+//
+// ADR 0029: req.ClusterID is honored only as a fallback, when
+// resolveTenantContext resolved no clusterID of its own (i.e. the caller
+// presented no CollectorToken) — the Glue-based dependency miner runs
+// centrally in the Agent process, over the same trusted, unauthenticated
+// boundary the Agent already calls every other Hub endpoint over, and has no
+// per-cluster credential to authenticate as. A real Discovery collector's own
+// CollectorToken-derived clusterID always wins over anything in the body, so
+// a stray cluster_id field in a genuine collector's push is never honored.
 func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1735,6 +1746,9 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 		http.Error(w, "namespace, from_service, and to_service are required", http.StatusBadRequest)
 		return
 	}
+	if clusterID == "" && req.ClusterID != "" {
+		clusterID = req.ClusterID
+	}
 	id := uuid.New().String()
 	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
@@ -1745,12 +1759,40 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 }
 
 // namespaceInventory is one namespace's entry in the fleet collector's
-// inventory push — the namespace name plus its known service names (ROADMAP
+// inventory push — the namespace name plus its known services (ROADMAP
 // P16 / ADR 0023: the collector already fetches these to decide "active",
 // this just stops discarding them after the check).
 type namespaceInventory struct {
-	Name     string   `json:"name"`
-	Services []string `json:"services"`
+	Name     string                  `json:"name"`
+	Services []serviceInventoryEntry `json:"services"`
+}
+
+// serviceInventoryEntry is one Service in a namespaceInventory entry: its
+// name plus its K8s selector (ADR 0029 — Discovery already fetches this on
+// every scan for its own live from_service matching; carrying it here lets
+// a centralized Glue-based dependency miner replicate the same matching
+// against stored data instead of a live K8s read). Accepts the legacy
+// bare-string wire shape too (Selector omitted/empty) via UnmarshalJSON,
+// so an older Discovery build pushing plain service names doesn't break.
+type serviceInventoryEntry struct {
+	Name     string            `json:"name"`
+	Selector map[string]string `json:"selector,omitempty"`
+}
+
+func (s *serviceInventoryEntry) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err == nil {
+		s.Name = name
+		s.Selector = nil
+		return nil
+	}
+	type alias serviceInventoryEntry
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*s = serviceInventoryEntry(a)
+	return nil
 }
 
 // clusterInventoryUpsertRequest is the body accepted by POST /api/cluster-inventory.
@@ -1801,10 +1843,14 @@ func (h *Handler) HandleClusterInventoryUpsert(w http.ResponseWriter, r *http.Re
 	}
 
 	namespaces := make([]string, 0, len(req.Namespaces))
-	byNamespace := make(map[string][]string, len(req.Namespaces))
+	byNamespace := make(map[string][]pgstore.ServiceEntry, len(req.Namespaces))
 	for _, ns := range req.Namespaces {
 		namespaces = append(namespaces, ns.Name)
-		byNamespace[ns.Name] = ns.Services
+		entries := make([]pgstore.ServiceEntry, 0, len(ns.Services))
+		for _, svc := range ns.Services {
+			entries = append(entries, pgstore.ServiceEntry{Name: svc.Name, Selector: svc.Selector})
+		}
+		byNamespace[ns.Name] = entries
 	}
 
 	if err := h.integrationStore.UpdateIntegrationNamespaces(r.Context(), clusterID, namespaces); err != nil {
@@ -2084,6 +2130,53 @@ func (h *Handler) HandleResolveCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resolveClusterResponse{ClusterIDs: clusterIDs})
+}
+
+// clusterServiceSelectorsResponse is the body returned by
+// GET /api/cluster-service-selectors.
+type clusterServiceSelectorsResponse struct {
+	Selectors map[string]map[string]string `json:"selectors"` // service name -> selector
+}
+
+// HandleClusterServiceSelectors answers "what's this specific cluster's
+// namespace's Service->selector map?" (ADR 0029, P18 use case #2's Glue
+// extension) — read from the cluster_services registry's selector column,
+// which HandleClusterInventoryUpsert now also populates. Unlike
+// HandleResolveCluster/GET /api/service-dependencies, this requires an
+// explicit cluster_id — a service name can mean a different Service, with a
+// different selector, in each cluster, so there is no cross-cluster merge
+// here that would make sense. Same unauthenticated trust boundary as every
+// other Agent-to-Hub call (the Glue-based miner, this endpoint's only
+// caller, has no per-cluster credential of its own). Returns an empty map
+// (200), never an error, when nothing matches.
+func (h *Handler) HandleClusterServiceSelectors(w http.ResponseWriter, r *http.Request) {
+	clusterID := r.URL.Query().Get("cluster_id")
+	namespace := r.URL.Query().Get("namespace")
+	if clusterID == "" || namespace == "" {
+		http.Error(w, "cluster_id and namespace are required", http.StatusBadRequest)
+		return
+	}
+	if h.clusterServiceStore == nil {
+		writeJSON(w, http.StatusOK, clusterServiceSelectorsResponse{Selectors: map[string]map[string]string{}})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	selectors, err := h.clusterServiceStore.ListClusterServiceSelectors(r.Context(), tenantID, clusterID, namespace)
+	if err != nil {
+		h.logger.Warn("failed to list cluster service selectors", "cluster_id", clusterID, "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, clusterServiceSelectorsResponse{Selectors: map[string]map[string]string{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, clusterServiceSelectorsResponse{Selectors: selectors})
 }
 
 // HandleCollectorConnect upgrades to a persistent outbound WebSocket

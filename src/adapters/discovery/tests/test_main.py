@@ -1,10 +1,11 @@
-"""Tests for main.py's _service_for_pod and _namespace_service_names — new
+"""Tests for main.py's _service_for_pod and _namespace_services — new
 logic (not copied from src/agent), so it gets its own coverage.
 _service_for_pod matches a pod to the Service that selects it via the same
 label-selector semantics K8s itself uses to build Service endpoints.
-_namespace_service_names decides which namespaces ROADMAP P18 use case #1's
-inventory push considers "active", and (ROADMAP P16 / ADR 0023) carries the
-real service names through for the service->cluster registry.
+_namespace_services decides which namespaces ROADMAP P18 use case #1's
+inventory push considers "active", and carries each service's name (ROADMAP
+P16 / ADR 0023) and selector (ADR 0029) through for the service->cluster
+registry and the Glue-based dependency miner respectively.
 """
 
 import pytest
@@ -12,7 +13,7 @@ import pytest
 from discovery import k8s_client, main
 from discovery.config import Config
 from discovery.main import (
-    _namespace_service_names, _scan_certificates, _scan_health, _scan_ingress, _scan_metrics, _service_for_pod,
+    _namespace_services, _scan_certificates, _scan_health, _scan_ingress, _scan_metrics, _service_for_pod,
 )
 
 
@@ -45,7 +46,7 @@ def test_picks_first_matching_service_among_several():
     assert _service_for_pod({"app": "payment-backend"}, services) == "payment-backend"
 
 
-# ── _namespace_service_names ─────────────────────────────────────────────────
+# ── _namespace_services ───────────────────────────────────────────────────────
 
 async def _empty(namespace):
     return []
@@ -56,7 +57,7 @@ async def _nonempty(namespace):
 
 
 @pytest.mark.asyncio
-async def test_namespace_active_via_services_returns_their_names(monkeypatch):
+async def test_namespace_active_via_services_returns_name_and_selector(monkeypatch):
     async def services(namespace):
         return [{"name": "payment-api", "selector": {"app": "payment-api"}}, {"name": "payment-worker", "selector": {}}]
 
@@ -64,7 +65,10 @@ async def test_namespace_active_via_services_returns_their_names(monkeypatch):
     monkeypatch.setattr(k8s_client, "list_deployments", _empty)
     monkeypatch.setattr(k8s_client, "list_statefulsets", _empty)
     monkeypatch.setattr(k8s_client, "list_daemonsets", _empty)
-    assert await _namespace_service_names("payments") == ["payment-api", "payment-worker"]
+    assert await _namespace_services("payments") == [
+        {"name": "payment-api", "selector": {"app": "payment-api"}},
+        {"name": "payment-worker", "selector": {}},
+    ]
 
 
 @pytest.mark.asyncio
@@ -74,7 +78,7 @@ async def test_namespace_active_via_daemonset_only_returns_empty_list(monkeypatc
     monkeypatch.setattr(k8s_client, "list_statefulsets", _empty)
     monkeypatch.setattr(k8s_client, "list_daemonsets", _nonempty)
     # Active (has a workload) but no Service fronts it -> empty list, not None.
-    assert await _namespace_service_names("kube-monitoring") == []
+    assert await _namespace_services("kube-monitoring") == []
 
 
 @pytest.mark.asyncio
@@ -83,7 +87,7 @@ async def test_namespace_inactive_with_no_workloads_returns_none(monkeypatch):
     monkeypatch.setattr(k8s_client, "list_deployments", _empty)
     monkeypatch.setattr(k8s_client, "list_statefulsets", _empty)
     monkeypatch.setattr(k8s_client, "list_daemonsets", _empty)
-    assert await _namespace_service_names("empty-ns") is None
+    assert await _namespace_services("empty-ns") is None
 
 
 # ── _scan_ingress (ROADMAP P18 use case #3) ──────────────────────────────────

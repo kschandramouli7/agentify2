@@ -1,8 +1,9 @@
 """Tool definitions for the K8fy agent (Claude can call these)."""
 
+import asyncio
 import logging
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
 
@@ -575,10 +576,70 @@ async def _remote_live_fetch(backend_url: str, cluster_id: str, tool_name: str, 
         return {"error": f"live-fetch to cluster {cluster_id} failed: {e}"}
 
 
+# Tool -> the field in its result dict holding the list to merge across
+# clusters (ADR 0028). Only tools that can run at namespace/service scope
+# without a specific pod appear here — live_get_pod_logs/live_describe_pod
+# always require `pod`, which is already cluster-specific, so callers never
+# attach `cluster_ids` (plural) for those (see agent.py's _structure_chat_answer).
+_FANOUT_LIST_FIELD = {
+    "live_list_pods": "pods",
+    "live_get_events": "events",
+    "live_get_certificates": "certificates",
+}
+
+
+def _merge_fanout_results(
+    tool_name: str, cluster_ids: List[str], results: List[Any]
+) -> Dict[str, Any]:
+    """Deterministically merge one live-diagnostic tool's per-cluster results
+    into a single tagged, concatenated response — no LLM involved (Diagram 7/8
+    are deliberately no-LLM; see ADR 0028 vs. correlation.md's LLM-synthesis
+    precedent for signals *within* one cluster). Each item in the merged list
+    gets a `cluster_id` field so the operator can tell which cluster it came
+    from. A cluster that errored or timed out is surfaced in `clusters_failed`
+    rather than silently dropped (correlation.md's "surface, don't silently
+    resolve" principle, extended to partial fan-out failure).
+    """
+    list_field = _FANOUT_LIST_FIELD.get(tool_name, "items")
+    merged: List[Any] = []
+    clusters_queried: List[str] = []
+    clusters_failed: List[Dict[str, str]] = []
+
+    for cluster_id, result in zip(cluster_ids, results):
+        if isinstance(result, BaseException):
+            clusters_failed.append({"cluster_id": cluster_id, "error": str(result)})
+            continue
+        if not isinstance(result, dict):
+            clusters_failed.append({"cluster_id": cluster_id, "error": "unexpected result shape"})
+            continue
+        if result.get("error"):
+            clusters_failed.append({"cluster_id": cluster_id, "error": result["error"]})
+            continue
+        clusters_queried.append(cluster_id)
+        for item in result.get(list_field, []):
+            merged.append({**item, "cluster_id": cluster_id})
+
+    return {
+        list_field: merged,
+        "clusters_queried": clusters_queried,
+        "clusters_failed": clusters_failed,
+    }
+
+
 async def _dispatch_live_diagnostic(tool_name: str, arguments: Dict[str, Any], backend_url: str) -> Dict[str, Any]:
     """Dispatch to the live_diagnostics function matching a LIVE_DIAGNOSTIC_TOOLS
-    name — locally (this agent pod's own cluster) unless `cluster_id` is
-    present, in which case it's relayed to that fleet cluster's collector."""
+    name — locally (this agent pod's own cluster) unless `cluster_id`/
+    `cluster_ids` is present, in which case it's relayed to that fleet
+    cluster's collector (singular) or fanned out and merged across several
+    (plural, ADR 0028)."""
+    cluster_ids = arguments.get("cluster_ids")
+    if cluster_ids:
+        fanout_args = {k: v for k, v in arguments.items() if k not in ("cluster_id", "cluster_ids")}
+        results = await asyncio.gather(
+            *[_remote_live_fetch(backend_url, cid, tool_name, {**fanout_args, "cluster_id": cid}) for cid in cluster_ids],
+            return_exceptions=True,
+        )
+        return _merge_fanout_results(tool_name, cluster_ids, list(results))
     cluster_id = arguments.get("cluster_id")
     if cluster_id:
         return await _remote_live_fetch(backend_url, cluster_id, tool_name, arguments)

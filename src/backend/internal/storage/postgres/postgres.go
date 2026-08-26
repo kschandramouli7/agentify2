@@ -367,6 +367,15 @@ func (c *Client) initSchema(ctx context.Context) error {
 		PRIMARY KEY (tenant_id, cluster_id, namespace, service)
 	);
 	CREATE INDEX IF NOT EXISTS idx_cluster_services_lookup ON cluster_services(tenant_id, namespace, service);
+	-- ADR 0029 (P18 use case #2's Glue extension): each Service's K8s
+	-- selector, alongside its name. Discovery already fetches this on every
+	-- scan (main.py's list_services, used for its own live from_service
+	-- matching) — this just stops discarding it after that check, same
+	-- rationale namespaceInventory's comment already gives for Services
+	-- themselves. Lets a centralized Glue-based miner (which has no live
+	-- cluster access) replicate the same selector-to-pod-label matching
+	-- against stored data instead of a live K8s read.
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS selector JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 	ALTER TABLE IF EXISTS cluster_services ENABLE ROW LEVEL SECURITY;
 	ALTER TABLE IF EXISTS cluster_services FORCE ROW LEVEL SECURITY;
@@ -1741,13 +1750,24 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 
 // ── Service->cluster registry (ROADMAP P16 / ADR 0023) ──────────────────────
 
+// ServiceEntry is one Service known to a cluster's Discovery collector: its
+// name plus its K8s selector (ADR 0029 — lets a centralized Glue-based
+// dependency miner, which has no live cluster access, replicate the same
+// selector-to-pod-label matching main.go's _service_for_pod does live).
+// Selector is nil/empty for a Service with no selector (e.g. manually-managed
+// Endpoints) — never matches any pod, same as live matching's behavior.
+type ServiceEntry struct {
+	Name     string
+	Selector map[string]string
+}
+
 // UpsertClusterServices replaces the full known-service set for one
 // (tenantID, clusterID) — a full delete-then-insert per push, matching
 // UpdateIntegrationNamespaces's "reflects live cluster truth" semantics
 // rather than an incremental diff: a service that disappeared from the
 // collector's scan should disappear from the registry on the next push, not
-// linger. byNamespace maps namespace -> that namespace's service names.
-func (c *Client) UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]string) error {
+// linger. byNamespace maps namespace -> that namespace's services.
+func (c *Client) UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]ServiceEntry) error {
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -1764,11 +1784,15 @@ func (c *Client) UpsertClusterServices(ctx context.Context, tenantID, clusterID 
 	}
 	for namespace, services := range byNamespace {
 		for _, service := range services {
+			selectorJSON, err := json.Marshal(service.Selector)
+			if err != nil {
+				return fmt.Errorf("marshal selector for %s/%s: %w", namespace, service.Name, err)
+			}
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO cluster_services (tenant_id, cluster_id, namespace, service, updated_at)
-				 VALUES ($1, $2, $3, $4, NOW())`,
-				tenantID, clusterID, namespace, service); err != nil {
-				return fmt.Errorf("insert cluster service %s/%s: %w", namespace, service, err)
+				`INSERT INTO cluster_services (tenant_id, cluster_id, namespace, service, selector, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, NOW())`,
+				tenantID, clusterID, namespace, service.Name, selectorJSON); err != nil {
+				return fmt.Errorf("insert cluster service %s/%s: %w", namespace, service.Name, err)
 			}
 		}
 	}
@@ -1842,6 +1866,49 @@ func (c *Client) ListClusterServices(ctx context.Context, tenantID string) (map[
 			return nil, err
 		}
 		result[namespace] = append(result[namespace], service)
+	}
+	return result, rows.Err()
+}
+
+// ListClusterServiceSelectors returns one specific cluster's known services
+// in one namespace as a service-name -> selector map (ADR 0029). Unlike
+// ResolveServiceClusters/ListClusterServices above, this filters by
+// clusterID explicitly — the caller (a centralized Glue-based miner) needs
+// exactly one cluster's own selector definitions to match against that
+// cluster's own log rows, not a cross-cluster merge (a service name could
+// mean a different Service, with a different selector, in each cluster).
+func (c *Client) ListClusterServiceSelectors(ctx context.Context, tenantID, clusterID, namespace string) (map[string]map[string]string, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT service, selector FROM cluster_services WHERE cluster_id = $1 AND namespace = $2`,
+		clusterID, namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := map[string]map[string]string{}
+	for rows.Next() {
+		var service string
+		var selectorJSON []byte
+		if err := rows.Scan(&service, &selectorJSON); err != nil {
+			return nil, err
+		}
+		selector := map[string]string{}
+		if len(selectorJSON) > 0 {
+			if err := json.Unmarshal(selectorJSON, &selector); err != nil {
+				return nil, fmt.Errorf("unmarshal selector for service %s: %w", service, err)
+			}
+		}
+		result[service] = selector
 	}
 	return result, rows.Err()
 }

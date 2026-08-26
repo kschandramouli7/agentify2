@@ -14,17 +14,30 @@
 # Prerequisites:
 #   • terraform apply -var enable_log_platform_test=true already run
 #   • aws CLI + kubectl in PATH, authenticated (aws sso login, or CloudShell)
+#   • this cluster already registered as an Integration via the Hub's admin
+#     API (ADR 0022) — you need its Integration.ID for <cluster-id> below
 #
 # Usage:
-#   scripts/onboard_cluster_logging.sh <cluster-key>
+#   scripts/onboard_cluster_logging.sh <cluster-key> <cluster-id>
 #
 # <cluster-key> is a key in the `clusters` Terraform variable/output
 # (e.g. "agentify_dev" — the default entry for the cluster this root module
 # manages; add more entries to `variable "clusters"` for additional clusters).
+#
+# <cluster-id> is that cluster's Hub Integration.ID (NOT the Terraform
+# cluster-key and NOT the K8s cluster's own name) — stamped onto every log
+# record so a centralized Glue-based dependency miner spanning multiple
+# clusters can tell which cluster each row came from (ADR 0029). Deliberately
+# not auto-looked-up from the Hub's admin API here: Integration.Name is a
+# free-text label with no guaranteed correspondence to this Terraform
+# cluster-key, so guessing it would be more fragile than requiring the
+# operator to supply the ID they already used to mint this cluster's
+# CollectorToken.
 
 set -euo pipefail
 
-CLUSTER_KEY="${1:?Usage: $0 <cluster-key> (e.g. agentify_dev)}"
+CLUSTER_KEY="${1:?Usage: $0 <cluster-key> <cluster-id> (e.g. agentify_dev 3f9c2e1a-...)}"
+CLUSTER_ID="${2:?Usage: $0 <cluster-key> <cluster-id> (e.g. agentify_dev 3f9c2e1a-...)}"
 TF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../infra/terraform/aws" && pwd)"
 TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../infra/kubernetes/fargate-logging" && pwd)/aws-observability-configmap.yaml.tpl"
 
@@ -50,10 +63,10 @@ fi
 echo "Onboarding cluster '${CLUSTER_KEY}' (${CLUSTER_NAME}) to Firehose stream '${FIREHOSE_STREAM_NAME}'..."
 aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
 
-# sed, not envsubst — only two known placeholders, not worth a gettext
+# sed, not envsubst — only a few known placeholders, not worth a gettext
 # dependency (envsubst isn't installed by default on macOS, and Homebrew
 # isn't always reachable from every network).
-sed -e "s|\${aws_region}|${AWS_REGION}|g" -e "s|\${firehose_stream_name}|${FIREHOSE_STREAM_NAME}|g" "$TEMPLATE" | kubectl apply -f -
+sed -e "s|\${aws_region}|${AWS_REGION}|g" -e "s|\${firehose_stream_name}|${FIREHOSE_STREAM_NAME}|g" -e "s|\${cluster_id}|${CLUSTER_ID}|g" "$TEMPLATE" | kubectl apply -f -
 
 echo "Done. Fargate pods scheduled after this point in the target namespace(s)"
 echo "will get the log router sidecar injected automatically — restart any"

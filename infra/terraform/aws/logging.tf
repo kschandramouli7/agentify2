@@ -392,6 +392,18 @@ resource "aws_glue_catalog_table" "logs" {
       name = "log"
       type = "string"
     }
+    # ADR 0029 (P18 use case #2's Glue extension): stamped by the Fargate
+    # logging ConfigMap's record_modifier filter
+    # (infra/kubernetes/fargate-logging/aws-observability-configmap.yaml.tpl),
+    # one static value per onboarded cluster — this cluster's own Hub
+    # Integration.ID, never a human-readable name. Absent on any row captured
+    # before that filter was added (existing test-harness rows predate it;
+    # acceptable, same "reflects state going forward" convention as this
+    # project's other inventory-style pushes).
+    columns {
+      name = "cluster_id"
+      type = "string"
+    }
   }
 }
 

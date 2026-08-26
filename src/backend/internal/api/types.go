@@ -106,8 +106,12 @@ type PricingStore interface {
 
 // ServiceDependencyStore is the mined-service-graph interface implemented by
 // the Postgres client — see k8fy/service_topology.py for how edges are mined.
-// tenantID/clusterID come from Handler.resolveTenantContext, never directly
-// from client input (ADR 0022 phase 2).
+// tenantID always comes from Handler.resolveTenantContext, never client
+// input (ADR 0022 phase 2). clusterID does too, EXCEPT when
+// resolveTenantContext resolved no clusterID of its own (no CollectorToken
+// presented) — HandleServiceDependencyUpsert then honors an explicit
+// cluster_id from the request body instead (ADR 0029's trusted-internal-
+// caller override, for the Glue-based dependency miner).
 type ServiceDependencyStore interface {
 	UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService string) error
 	ListServiceDependencies(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceDependency, error)
@@ -118,9 +122,14 @@ type ServiceDependencyStore interface {
 // consulted by the resolver the agent uses to auto-route live-fetch and
 // DiagnoseSkill requests to the right fleet cluster.
 type ClusterServiceStore interface {
-	UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]string) error
+	UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]pgstore.ServiceEntry) error
 	ResolveServiceClusters(ctx context.Context, tenantID, namespace, service string) ([]string, error)
 	ListClusterServices(ctx context.Context, tenantID string) (map[string][]string, error)
+	// ListClusterServiceSelectors returns one specific cluster's known
+	// services in one namespace as a service-name -> selector map (ADR
+	// 0029) — consulted by the Glue-based dependency miner, which has no
+	// live cluster access of its own.
+	ListClusterServiceSelectors(ctx context.Context, tenantID, clusterID, namespace string) (map[string]map[string]string, error)
 }
 
 // NamespaceEntry is one discovered namespace, returned by the namespace-sync

@@ -7,6 +7,17 @@ using the conversation's real one — since RBAC (agent-live-diagnostics) only
 grants access within the actual namespace, a wrong guess fails with 403 at
 click-time. The fix never trusts the model for this field; the conversation's
 own context always wins.
+
+ADR 0028 extends the same distrust to cluster routing: CHAT_REASONING_SCHEMA
+doesn't even allow the model to emit cluster_id/cluster_ids, so
+_structure_chat_answer resolves it deterministically via
+resolve_service_clusters (ADR 0023) and injects it — 0 resolved (or no
+service in context) leaves arguments untouched (today's local-cluster
+fallback, correct for non-fleet deployments); exactly 1 resolved -> singular
+cluster_id; 2+ resolved and no pod in arguments -> cluster_ids (plural,
+triggers tools.py's fan-out); 2+ resolved and pod present -> best-effort
+singular cluster_id (a pod name is already cluster-specific, so fan-out
+can't disambiguate it).
 """
 
 import json
@@ -43,8 +54,22 @@ def _base_payload(**overrides):
     return payload
 
 
+def _patch_resolve(monkeypatch, clusters):
+    """Stub resolve_service_clusters and return a call tracker (list of
+    (namespace, service) tuples it was called with)."""
+    calls = []
+
+    async def fake_resolve(namespace, service, backend_url):
+        calls.append((namespace, service))
+        return clusters
+
+    monkeypatch.setattr("k8fy.service_topology.resolve_service_clusters", fake_resolve)
+    return calls
+
+
 @pytest.mark.asyncio
 async def test_structure_chat_answer_overrides_hallucinated_namespace(monkeypatch):
+    _patch_resolve(monkeypatch, [])
     agent = K8fyAgent()
     payload = _base_payload(recommended_actions=[{
         "label": "Verify live pod status for payment-worker",
@@ -71,6 +96,7 @@ async def test_structure_chat_answer_overrides_hallucinated_namespace(monkeypatc
 
 @pytest.mark.asyncio
 async def test_structure_chat_answer_keeps_other_arguments(monkeypatch):
+    _patch_resolve(monkeypatch, [])
     agent = K8fyAgent()
     payload = _base_payload(recommended_actions=[{
         "label": "Check payment-worker logs",
@@ -94,6 +120,7 @@ async def test_structure_chat_answer_keeps_other_arguments(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_structure_chat_answer_no_context_namespace_leaves_model_value(monkeypatch):
+    _patch_resolve(monkeypatch, [])
     agent = K8fyAgent()
     payload = _base_payload(recommended_actions=[{
         "label": "Verify live pod status",
@@ -129,6 +156,7 @@ async def test_structure_chat_answer_empty_text_short_circuits(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_structure_chat_answer_degrades_on_api_error(monkeypatch):
+    _patch_resolve(monkeypatch, [])
     agent = K8fyAgent()
 
     async def fake_create(**kwargs):
@@ -139,3 +167,128 @@ async def test_structure_chat_answer_degrades_on_api_error(monkeypatch):
     details, usage = await agent._structure_chat_answer("some answer", {"namespace": "payments"})
     assert details == {}
     assert usage == (0, 0, 0, 0)
+
+
+# ── ADR 0028: cluster-routing injection ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_injects_singular_cluster_id_when_one_resolves(monkeypatch):
+    _patch_resolve(monkeypatch, ["cluster-a"])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "List payment-worker pods",
+        "tool": "live_list_pods",
+        "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": None, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer(
+        "answer", {"namespace": "payments", "service": "payment-worker"},
+    )
+
+    assert details["recommended_actions"][0]["arguments"] == {
+        "namespace": "payments", "cluster_id": "cluster-a",
+    }
+
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_injects_cluster_ids_when_multiple_resolve_and_no_pod(monkeypatch):
+    _patch_resolve(monkeypatch, ["cluster-a", "cluster-b"])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "List payment-worker pods",
+        "tool": "live_list_pods",
+        "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": None, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer(
+        "answer", {"namespace": "payments", "service": "payment-worker"},
+    )
+
+    args = details["recommended_actions"][0]["arguments"]
+    assert args["cluster_ids"] == ["cluster-a", "cluster-b"]
+    assert "cluster_id" not in args
+
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_uses_best_effort_single_cluster_when_pod_present(monkeypatch):
+    _patch_resolve(monkeypatch, ["cluster-a", "cluster-b"])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "Check payment-worker logs",
+        "tool": "live_get_pod_logs",
+        "arguments": {"namespace": "default", "pod": "payment-worker-abc", "container": None, "tail_lines": 100, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer(
+        "answer", {"namespace": "payments", "service": "payment-worker"},
+    )
+
+    args = details["recommended_actions"][0]["arguments"]
+    # A pod name is already cluster-specific — fan-out can't disambiguate it,
+    # so this takes the best-effort first-resolved-cluster path (ADR 0028),
+    # never cluster_ids.
+    assert args["cluster_id"] == "cluster-a"
+    assert "cluster_ids" not in args
+
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_skips_resolution_without_service_in_context(monkeypatch):
+    calls = _patch_resolve(monkeypatch, ["cluster-a"])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "List payment-worker pods",
+        "tool": "live_list_pods",
+        "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": None, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    # namespace present, but no service — resolution requires both.
+    details, _ = await agent._structure_chat_answer("answer", {"namespace": "payments"})
+
+    assert calls == []
+    args = details["recommended_actions"][0]["arguments"]
+    assert "cluster_id" not in args
+    assert "cluster_ids" not in args
+
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_no_clusters_resolved_leaves_arguments_unchanged(monkeypatch):
+    _patch_resolve(monkeypatch, [])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "List payment-worker pods",
+        "tool": "live_list_pods",
+        "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": None, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer(
+        "answer", {"namespace": "payments", "service": "payment-worker"},
+    )
+
+    # 0 resolved clusters -> single-cluster/non-fleet deployment -> today's
+    # local-execution fallback stays correct, arguments unchanged.
+    assert details["recommended_actions"][0]["arguments"] == {"namespace": "payments"}

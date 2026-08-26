@@ -16,11 +16,12 @@ import (
 type fakeClusterServiceStore struct {
 	lastTenantID  string
 	lastClusterID string
-	lastUpsert    map[string][]string
-	resolved      map[string][]string // "namespace/service" -> cluster ids
+	lastUpsert    map[string][]pgstore.ServiceEntry
+	resolved      map[string][]string                     // "namespace/service" -> cluster ids
+	selectors     map[string]map[string]map[string]string // "cluster_id/namespace" -> service -> selector
 }
 
-func (f *fakeClusterServiceStore) UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]string) error {
+func (f *fakeClusterServiceStore) UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]pgstore.ServiceEntry) error {
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
 	f.lastUpsert = byNamespace
@@ -38,7 +39,20 @@ func (f *fakeClusterServiceStore) ListClusterServices(ctx context.Context, tenan
 	if f.lastUpsert == nil {
 		return map[string][]string{}, nil
 	}
-	return f.lastUpsert, nil
+	names := map[string][]string{}
+	for ns, entries := range f.lastUpsert {
+		for _, e := range entries {
+			names[ns] = append(names[ns], e.Name)
+		}
+	}
+	return names, nil
+}
+
+func (f *fakeClusterServiceStore) ListClusterServiceSelectors(ctx context.Context, tenantID, clusterID, namespace string) (map[string]map[string]string, error) {
+	if f.selectors == nil {
+		return map[string]map[string]string{}, nil
+	}
+	return f.selectors[clusterID+"/"+namespace], nil
 }
 
 // TestHandleClusterInventoryUpsert exercises the fleet collector's inventory

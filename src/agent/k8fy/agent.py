@@ -828,6 +828,21 @@ class K8fyAgent:
         }
         if parsed.recommended_actions:
             actions = []
+            # Resolve once per response (ADR 0023's fleet registry), reused
+            # across every action below — never trust the model to supply
+            # cluster_id itself (CHAT_REASONING_SCHEMA doesn't even allow it),
+            # same distrust already applied to namespace two lines down.
+            # Degrades to None (skip resolution) when context lacks either
+            # field; resolve_service_clusters itself degrades to [] on any
+            # backend/network failure — both cases leave args untouched,
+            # which is the correct today's-behavior fallback for a
+            # single-cluster deployment with no registered fleet clusters.
+            resolved_clusters: Optional[List[str]] = None
+            if context.get("namespace") and context.get("service"):
+                from k8fy.service_topology import resolve_service_clusters
+                resolved_clusters = await resolve_service_clusters(
+                    context["namespace"], context["service"], self.backend_url
+                )
             for a in parsed.recommended_actions:
                 args = {k: v for k, v in a.arguments.items() if v is not None}
                 # Never trust the model's own namespace guess (seen defaulting
@@ -838,6 +853,18 @@ class K8fyAgent:
                 # only grants access within that one namespace anyway.
                 if context.get("namespace"):
                     args["namespace"] = context["namespace"]
+                if resolved_clusters:
+                    if args.get("pod"):
+                        # A pod name is already cluster-specific — fan-out
+                        # can't disambiguate which cluster it's in. Best-
+                        # effort: relay to the first resolved cluster rather
+                        # than ever falling back to the (possibly wrong)
+                        # local one. Known limitation — see ADR 0028.
+                        args["cluster_id"] = resolved_clusters[0]
+                    elif len(resolved_clusters) == 1:
+                        args["cluster_id"] = resolved_clusters[0]
+                    else:
+                        args["cluster_ids"] = resolved_clusters  # triggers fan-out, see tools.py's _dispatch_live_diagnostic
                 actions.append({"label": a.label, "tool": a.tool, "arguments": args})
             details["recommended_actions"] = actions
         return details, usage

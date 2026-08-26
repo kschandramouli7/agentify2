@@ -319,13 +319,20 @@ func TestPostgresStores(t *testing.T) {
 	t.Run("cluster_services registry: resolve by (namespace, service), including ambiguous multi-cluster matches", func(t *testing.T) {
 		tenantID := uuid.New().String()
 
-		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]string{
-			"payments": {"payment-api", "payment-worker"},
+		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]ServiceEntry{
+			"payments": {
+				{Name: "payment-api", Selector: map[string]string{"app": "payment-api"}},
+				{Name: "payment-worker", Selector: map[string]string{"app": "payment-worker"}},
+			},
 		}); err != nil {
 			t.Fatalf("upsert cluster-a: %v", err)
 		}
-		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-b", map[string][]string{
-			"payments": {"payment-api"}, // same service name, a different cluster -> ambiguous
+		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-b", map[string][]ServiceEntry{
+			// same service name, a different cluster -> ambiguous; deliberately a
+			// DIFFERENT selector than cluster-a's payment-api, so a test relying
+			// on cluster-a's selector by name alone (rather than by cluster_id)
+			// would get the wrong answer.
+			"payments": {{Name: "payment-api", Selector: map[string]string{"app": "payment-api-b"}}},
 		}); err != nil {
 			t.Fatalf("upsert cluster-b: %v", err)
 		}
@@ -370,10 +377,31 @@ func TestPostgresStores(t *testing.T) {
 			t.Errorf("nonexistent clusters: want empty, got %v", clusters)
 		}
 
+		// ListClusterServiceSelectors (ADR 0029) — one specific cluster's own
+		// selectors, not merged across clusters: cluster-a and cluster-b both
+		// have a "payment-api" service, but with different selectors.
+		selectorsA, err := client.ListClusterServiceSelectors(ctx, tenantID, "cluster-a", "payments")
+		if err != nil {
+			t.Fatalf("list selectors cluster-a: %v", err)
+		}
+		if got := selectorsA["payment-api"]["app"]; got != "payment-api" {
+			t.Errorf("cluster-a payment-api selector: want app=payment-api, got %v", selectorsA["payment-api"])
+		}
+		selectorsB, err := client.ListClusterServiceSelectors(ctx, tenantID, "cluster-b", "payments")
+		if err != nil {
+			t.Fatalf("list selectors cluster-b: %v", err)
+		}
+		if got := selectorsB["payment-api"]["app"]; got != "payment-api-b" {
+			t.Errorf("cluster-b payment-api selector: want app=payment-api-b, got %v", selectorsB["payment-api"])
+		}
+		if _, ok := selectorsB["payment-worker"]; ok {
+			t.Errorf("cluster-b should not have payment-worker (only cluster-a does), got %v", selectorsB)
+		}
+
 		// A second push to cluster-a fully replaces its prior service set —
 		// payment-worker should disappear once cluster-a stops reporting it.
-		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]string{
-			"payments": {"payment-api"},
+		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]ServiceEntry{
+			"payments": {{Name: "payment-api", Selector: map[string]string{"app": "payment-api"}}},
 		}); err != nil {
 			t.Fatalf("re-upsert cluster-a: %v", err)
 		}

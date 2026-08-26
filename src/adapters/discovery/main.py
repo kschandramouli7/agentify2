@@ -79,28 +79,32 @@ async def _scan_namespace(ns: str, cfg: Config) -> None:
             await push_dependency(ns, from_service, to_service, cfg.backend_url, cfg.collector_token)
 
 
-async def _namespace_service_names(ns: str) -> Optional[List[str]]:
-    """This namespace's service names if it's "active" — has at least one
-    Service, Deployment, StatefulSet, or DaemonSet — else None (excludes
-    empty namespaces the ServiceAccount can merely list). ROADMAP P18 use
-    case #1 only needed the active/inactive bool; ROADMAP P16 / ADR 0023's
-    service->cluster registry needs the real names too, which this same scan
-    already has on hand via list_services — nothing extra to fetch.
+async def _namespace_services(ns: str) -> Optional[List[Dict[str, Any]]]:
+    """This namespace's services (name + selector) if it's "active" — has at
+    least one Service, Deployment, StatefulSet, or DaemonSet — else None
+    (excludes empty namespaces the ServiceAccount can merely list). ROADMAP
+    P18 use case #1 only needed the active/inactive bool; ROADMAP P16 / ADR
+    0023's service->cluster registry needs the real names too, and ADR
+    0029 (Glue-based dependency mining) needs each one's selector on top of
+    that — all three already on hand via this one list_services call
+    (main.py's own _service_for_pod already matches against the exact same
+    selector dicts for its live from_service resolution), nothing extra to
+    fetch.
     """
     services = await k8s_client.list_services(ns)
     if services:
-        return [s["name"] for s in services]
+        return services  # [{"name": ..., "selector": {...}}, ...] already
     if await k8s_client.list_deployments(ns) or await k8s_client.list_statefulsets(ns) or await k8s_client.list_daemonsets(ns):
         return []  # active (has workloads) but no Service fronts them
     return None  # inactive
 
 
 async def _scan_inventory(namespaces: List[str], cfg: Config) -> None:
-    namespace_services: Dict[str, List[str]] = {}
+    namespace_services: Dict[str, List[Dict[str, Any]]] = {}
     for ns in namespaces:
-        names = await _namespace_service_names(ns)
-        if names is not None:
-            namespace_services[ns] = names
+        services = await _namespace_services(ns)
+        if services is not None:
+            namespace_services[ns] = services
     if namespace_services:
         await push_inventory(namespace_services, cfg.backend_url, cfg.collector_token)
 

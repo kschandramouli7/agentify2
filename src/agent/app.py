@@ -1,5 +1,6 @@
 """FastAPI application setup for the agent service."""
 
+import asyncio
 from fastapi import FastAPI, HTTPException, Response
 import logging
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 
 import metrics
 from config.settings import get_settings
+from k8fy import dependency_miner
 from k8fy.agent import get_chat_agent, refresh_pricing_from_backend
 from k8fy.live_diagnostics import LIVE_DIAGNOSTIC_TOOLS
 from k8fy.skills.router import get_skill_router
@@ -22,6 +24,12 @@ settings = get_settings()
 
 # Create FastAPI app
 app = FastAPI(title="agentify-agent", version="0.1.0")
+
+# Glue-based dependency miner (ADR 0029) — a periodic background task, not a
+# request handler; module-level so the shutdown hook below can signal and
+# await the same task the startup hook created.
+_dependency_miner_shutdown = asyncio.Event()
+_dependency_miner_task: Optional[asyncio.Task] = None
 
 
 class ChatRequest(BaseModel):
@@ -39,6 +47,28 @@ async def startup_event():
     get_skill_router()
     get_chat_agent()  # warm the chat agent singleton
     logger.info(f"Skill router initialized with model: {settings.claude_model}")
+
+    global _dependency_miner_task
+    athena_config = {
+        "workgroup": settings.athena_workgroup,
+        "database": settings.athena_database,
+        "table": settings.athena_table,
+    }
+    _dependency_miner_task = asyncio.create_task(
+        dependency_miner.run_forever(
+            settings.backend_url, athena_config, settings.dependency_mining_interval_seconds, _dependency_miner_shutdown,
+        )
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Signal the dependency miner's background task to stop and wait for
+    its current cycle (if any) to finish — same graceful-shutdown
+    convention as agentify-discovery's own SIGTERM handling."""
+    _dependency_miner_shutdown.set()
+    if _dependency_miner_task is not None:
+        await _dependency_miner_task
 
 
 @app.get("/health")

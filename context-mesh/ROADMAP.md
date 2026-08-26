@@ -43,7 +43,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P15** | Pull-based log-platform connector (Splunk first, Elasticsearch/OpenSearch second) — replaces direct-cluster log fetch with a query-time read against wherever logs already land | Test harness (Fargate+Firehose+S3/Athena) built 2026-07-21/22 — connector code itself not started | [spec 008](specs/008-on-demand-pod-logs.md), [ADR 0014](decisions/0014-on-demand-ephemeral-log-fetch.md) (extends, does not revisit), [ADR 0021](decisions/0021-log-platform-test-infra.md) |
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
-| **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/backend/internal/api/collector_hub.go` |
+| **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029); use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
 
 ---
 
@@ -1112,6 +1112,19 @@ work across every K8s distribution, not just EKS. This item is the concrete
    UI yet) and the `agentify-discovery-secret`/Secrets Manager wiring for
    the CI deploy pipeline — both flagged as manual follow-ups, not
    blocking.
+
+   **Glue-based extension — shipped 2026-08-18, see
+   [ADR 0029](decisions/0029-glue-based-dependency-mining.md):** a second,
+   complementary miner (`src/agent/k8fy/dependency_miner.py`) runs
+   centrally in the Agent process, reusing the same `extract_service_mentions`
+   logic against the P15 Athena/Glue log source instead of live per-cluster
+   reads — covers clusters/windows the live scan missed, at the cost of an
+   hourly (not ~60s) cadence. Required two supporting changes: the Glue
+   pipeline now tags every log row with its source cluster's `Integration.ID`
+   (it previously had no cluster-identifying column at all), and
+   `POST /api/service-dependencies` now accepts an explicit `cluster_id`
+   from a trusted, unauthenticated internal caller (the miner has no
+   per-cluster `CollectorToken` of its own to authenticate as).
 3. **Ingress/entry-point mapping — shipped 2026-08-04** (Discovery:
    `k8s_client.py`'s `list_ingresses`/`list_gateways`/`list_httproutes`/
    `list_routes` + `discover_api_capabilities`'s new group-probing,

@@ -307,17 +307,22 @@ amendment (2026-08-03) for why these weren't unified onto one connection.
 ## 7. Chat "Run" button — direct live-tool-call (no collector relay)
 
 No LLM anywhere in this diagram either, and — unlike Diagram 6 — **no
-Discovery collector, no WebSocket, no `cluster_id`.** This is the path a
-recommended action's "Run" button takes: three plain HTTP hops, ending in
-the agent pod calling the Kubernetes API of the *cluster it itself runs
-in*.
+Discovery collector, no WebSocket.** This is the path a recommended
+action's "Run" button takes *when the discussed service resolves to no
+fleet cluster* (a single-cluster deployment, or nothing registered yet):
+three plain HTTP hops, ending in the agent pod calling the Kubernetes API
+of the *cluster it itself runs in*. See Diagram 8 for what happens instead
+when the service **does** resolve to one or more fleet clusters — ADR 0028
+closed the gap this diagram originally documented (recommended actions
+never carrying a `cluster_id` at all).
 
 > [!TIP]
-> **What actually runs when you click "Run":** Frontend → Hub (thin proxy)
-> → Agent's own in-cluster K8s call. The Discovery collector and its
-> persistent WebSocket (Diagram 6) are never touched — that path only
-> activates when a query names a `cluster_id`, which recommended actions
-> built by the chat-structuring prompt never populate.
+> **This is the fallback path, not the default one (as of ADR 0028).**
+> `_structure_chat_answer` now resolves the discussed service's fleet
+> cluster(s) before building each Run button. Zero resolved → this diagram
+> (local, unchanged). One resolved → Diagram 6's relay, targeted. Two or
+> more resolved → Diagram 8's fan-out. Only the first case reaches this
+> diagram's local K8s call.
 
 ```mermaid
 sequenceDiagram
@@ -339,15 +344,16 @@ sequenceDiagram
 ```
 
 **Why this shape:** the Chat UI's recommended actions are meant for
-quick, no-LLM confirmation of what a diagnosis already found — adding
-fleet-cluster resolution here would cost a `resolve_service_clusters` round
-trip for the common case (single-cluster deployments, or a query about the
-same cluster the agent already runs in) where it can only ever be a no-op.
-`DiagnoseSkill`'s own prefetch (Diagram 4) is the one caller that resolves
-`cluster_id` and can hand it to `_dispatch_live_diagnostic` — a hand-built
-`arguments` dict with `cluster_id` set would also take Diagram 6's relay
-path through this exact same function, but no code path from the Chat "Run"
-button constructs one today.
+quick, no-LLM confirmation of what a diagnosis already found. Before ADR
+0028, adding fleet-cluster resolution here would have cost a
+`resolve_service_clusters` round trip on every response regardless of
+whether it could ever matter — so it was skipped, and this diagram was
+the *only* path, correct only by accident for single-cluster deployments.
+ADR 0028 pays that round trip once per response (not per action) and only
+when the response actually produced a recommended action *and* `context`
+carries both `namespace` and `service` — this diagram is now specifically
+the **zero-clusters-resolved** outcome of that lookup, not the only
+outcome.
 
 **Code references**
 
@@ -356,20 +362,82 @@ button constructs one today.
 | Frontend → Hub | [`api.ts:169`](../src/frontend/src/api.ts#L169) `runLiveTool()` | POSTs to `/api/live-query` |
 | Hub proxy | [`handlers.go:1466`](../src/backend/internal/api/handlers.go#L1466) `HandleLiveToolCall` | Allow-list check (`liveDiagnosticTools`), then forwards as-is |
 | Hub → Agent | [`agent_client.go:108`](../src/backend/internal/api/agent_client.go#L108) `AgentClient.LiveToolCall` | Plain HTTP POST — no `cluster_id` added |
-| Agent dispatch | [`tools.py:578`](../src/agent/k8fy/tools.py#L578) `_dispatch_live_diagnostic` | Branches on whether `cluster_id` is in `arguments` |
-| Recommended-action arguments | [`prompts.py:395`](../src/agent/k8fy/prompts.py#L395) `CHAT_STRUCTURE_PROMPT` | Only ever fills `namespace`/`pod` — never `cluster_id` |
+| Agent dispatch | [`tools.py:629`](../src/agent/k8fy/tools.py#L629) `_dispatch_live_diagnostic` | Branches on `cluster_ids` (fan-out, Diagram 8) → `cluster_id` (relay, Diagram 6) → local (this diagram) |
+| Cluster resolution (ADR 0028) | [`agent.py:829`](../src/agent/k8fy/agent.py#L829) `_structure_chat_answer` | Calls `resolve_service_clusters` once per response, injects `cluster_id`/`cluster_ids` per action |
 | Local execution | [`live_diagnostics.py`](../src/agent/k8fy/live_diagnostics.py) | Direct in-cluster K8s API call, agent pod's own service account |
 
-### Diagram 6 vs. Diagram 7 — which one actually runs
+### Diagram 6 vs. 7 vs. 8 — which one actually runs
 
-| | Diagram 6 — fleet relay | Diagram 7 — direct |
-|---|---|---|
-| **Trigger** | `cluster_id` present in `arguments` | `cluster_id` absent |
-| **Caller** | `DiagnoseSkill`'s fleet fan-out (ADR 0023/0024) | Chat UI's "Run" button on a recommended action |
-| **Hops** | Agent → Hub → Discovery → K8s API (a *different* cluster) | Frontend → Hub → Agent → K8s API (the *same* cluster the agent runs in) |
-| **Connection** | Persistent WebSocket, opened once (`/api/collector/connect`) | Plain HTTP, one request per call |
-| **Allow-lists** | `liveFetchAllowedTools` (Hub) + `live_tools.LIVE_TOOLS` (Discovery) | `liveDiagnosticTools` (Hub) + `LIVE_DIAGNOSTIC_TOOLS` (Agent) |
-| **`live_get_certificates`** | Supported — the only path it has | Not supported (no local implementation) |
+| | Diagram 6 — fleet relay | Diagram 7 — direct (this one) | Diagram 8 — fan-out |
+|---|---|---|---|
+| **Trigger** | Exactly 1 cluster resolved (or a pod-specific action with 2+, best-effort — ADR 0028) | 0 clusters resolved, or `service` missing from context | 2+ clusters resolved and the action has no `pod` |
+| **Caller** | `DiagnoseSkill`'s fleet fan-out (ADR 0023/0024), or a resolved Run-button action (ADR 0028) | Chat UI's "Run" button, resolution found nothing | Chat UI's "Run" button, resolution found several |
+| **Hops** | Agent → Hub → Discovery → K8s API (a *different* cluster) | Frontend → Hub → Agent → K8s API (the *same* cluster the agent runs in) | Agent → Hub → Discovery, **N times in parallel**, merged in the Agent |
+| **Connection** | Persistent WebSocket, opened once (`/api/collector/connect`) | Plain HTTP, one request per call | N persistent WebSockets, each already open (Diagram 6) |
+| **Merge** | N/A — single result | N/A — single result | Deterministic concatenate + tag by `cluster_id` (`_merge_fanout_results`) — no LLM |
+| **`live_get_certificates`** | Supported — the only path it has | Not supported (no local implementation) | Supported |
+
+---
+
+## 8. Chat "Run" button — fan-out across multiple fleet clusters (ADR 0028)
+
+No LLM anywhere in this diagram either. This is what happens when the
+service a recommended action targets resolves to **more than one** fleet
+cluster and the action isn't pod-specific — a dependency that spans
+clusters, not just namespaces. Diagram 6's per-cluster relay runs
+**N times concurrently**, one per resolved cluster, all over connections
+that are already open; the Agent merges the results before anything
+reaches the operator.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend<br/>(DiagnosisReport's "Run" button)
+    participant Hub as Hub<br/>(the one Go backend process)
+    participant Agent as Python agent
+    participant DiscA as Discovery A<br/>(cluster-a's collector)
+    participant DiscB as Discovery B<br/>(cluster-b's collector)
+
+    FE->>Hub: POST /api/live-query — tool=live_list_pods, arguments (cluster_ids=[cluster-a, cluster-b])
+    Hub->>Agent: POST /live-tool-call — tool, arguments (plain HTTP proxy, unchanged)
+    Agent->>Agent: process_tool_call → _dispatch_live_diagnostic<br/>arguments has cluster_ids → fan out (ADR 0028)
+
+    par Relayed concurrently — asyncio.gather
+        Agent->>Hub: POST /api/live-fetch — cluster_id=cluster-a, tool, args
+        Hub->>DiscA: relay over cluster-a's already-open connection (Diagram 6)
+        DiscA-->>Hub: relay response — result
+        Hub-->>Agent: 200 — result (cluster-a)
+    and
+        Agent->>Hub: POST /api/live-fetch — cluster_id=cluster-b, tool, args
+        Hub->>DiscB: relay over cluster-b's already-open connection (Diagram 6)
+        DiscB-->>Hub: relay response — result
+        Hub-->>Agent: 200 — result (cluster-b)
+    end
+
+    Agent->>Agent: _merge_fanout_results — tag each item with its cluster_id, concatenate<br/>no LLM involved
+    Agent-->>Hub: 200 — merged result (clusters_queried, clusters_failed)
+    Hub-->>FE: 200 — merged result
+
+    Note over Agent: A cluster that errors or times out (502/504, Diagram 6)<br/>lands in clusters_failed — the other cluster's data is never dropped
+```
+
+**Why this shape:** the merge stays deterministic on purpose — Diagram
+7/8's whole reason to exist is a fast, no-LLM re-check, so combining three
+clusters' pod lists into one tagged list is a plain code operation, not a
+second Claude call (`context-mesh/policies/correlation.md`'s LLM-synthesis
+guidance is for combining a service's *own* signals before a diagnostic
+call, a different problem). Pod-specific actions (`live_get_pod_logs`,
+`live_describe_pod`) never take this path — a pod name is already
+cluster-specific, so there's nothing to fan out to; those get a
+best-effort single `cluster_id` instead (see ADR 0028).
+
+**Code references**
+
+| Hop | File | What it does |
+|-----|------|---------------|
+| Fan-out trigger | [`tools.py:629`](../src/agent/k8fy/tools.py#L629) `_dispatch_live_diagnostic` | Sees `cluster_ids`, calls `_remote_live_fetch` once per cluster via `asyncio.gather` |
+| Per-cluster relay | [`tools.py:560`](../src/agent/k8fy/tools.py#L560) `_remote_live_fetch` | Unchanged — same function Diagram 6's single-cluster case already uses |
+| Merge | [`tools.py`](../src/agent/k8fy/tools.py) `_merge_fanout_results` | Tags each item with `cluster_id`, concatenates, surfaces `clusters_failed` |
+| Cluster resolution | [`agent.py:829`](../src/agent/k8fy/agent.py#L829) `_structure_chat_answer` | Attaches `cluster_ids` (plural) only when 2+ resolve and no `pod` is set |
 
 ---
 

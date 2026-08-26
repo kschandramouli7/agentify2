@@ -94,6 +94,11 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	// cluster_services registry POST /api/cluster-inventory populates.
 	mux.HandleFunc("GET /api/resolve-cluster", h.HandleResolveCluster)
 
+	// One specific cluster's Service->selector map (ADR 0029, P18 use case
+	// #2's Glue extension) — consulted by the Glue-based dependency miner,
+	// which has no live cluster access of its own.
+	mux.HandleFunc("GET /api/cluster-service-selectors", h.HandleClusterServiceSelectors)
+
 	// Admin: on-demand cert renewal — issues from Vault PKI + updates K8s Secret
 	mux.HandleFunc("POST /admin/certs/renew", h.HandleCertRenew)
 
