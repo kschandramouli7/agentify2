@@ -41,6 +41,9 @@ prescriptive-guidance.pdf
 *.tfstate.backup
 .terraform/
 .terraform.lock.hcl.bak
+# Saved plan files (terraform plan -out=...) are local, session-specific
+# binaries — same rationale as tfstate, never meant to be version-controlled.
+tfplan*
 *.auto.tfvars
 *.tfvars
 !*.tfvars.example

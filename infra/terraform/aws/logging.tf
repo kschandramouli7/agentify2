@@ -51,7 +51,13 @@ locals {
     }
   ]...)
 
-  log_bucket_name = "${local.name}-log-test"
+  # Account-suffixed: S3 bucket names are unique across *all* AWS accounts,
+  # not just this one — "${local.name}-log-test" alone collided with a
+  # bucket already held by another account (confirmed via `aws s3api
+  # list-buckets` showing this account doesn't own it) the first time this
+  # was applied against a freshly-migrated account. Same fix already
+  # applied to the tfstate bucket (random-suffixed) for the same reason.
+  log_bucket_name = "${local.name}-log-test-${data.aws_caller_identity.this.account_id}"
   glue_db_name    = replace("${local.name}_logs", "-", "_")
   glue_table_name = "pod_logs"
 }

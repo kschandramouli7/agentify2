@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bufio"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -18,6 +21,24 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack passes through to the underlying ResponseWriter's http.Hijacker.
+// Wrapping http.ResponseWriter in a struct — even via embedding — does not
+// promote Hijack(): http.ResponseWriter's interface doesn't declare it, so
+// only the wrapper's own explicit methods are visible to a type assertion
+// against http.Hijacker. Without this, every request through this
+// middleware silently loses the ability to hijack the connection, breaking
+// any WebSocket upgrade (HandleCollectorConnect's gorilla/websocket.Upgrade)
+// with "response does not implement http.Hijacker" — confirmed live
+// (2026-08-29) via the first real Discovery collector connection attempt
+// against this middleware.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+	}
+	return hj.Hijack()
 }
 
 // Middleware wraps the HTTP handler with logging and metrics.
