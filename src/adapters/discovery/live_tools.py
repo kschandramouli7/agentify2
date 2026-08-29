@@ -46,6 +46,14 @@ LIVE_TOOLS = frozenset({
 
 async def live_list_pods(namespace: str) -> Dict[str, Any]:
     """List pods in a namespace with a compact live status summary."""
+    if not namespace:
+        # An empty namespace segment (e.g. /api/v1/namespaces//pods) gets
+        # treated by the K8s API server as a CLUSTER-scoped list request —
+        # this collector's ServiceAccount only holds a namespace-scoped
+        # Role, so that always 403s with a confusing "at the cluster scope"
+        # message instead of the actual problem (no namespace was
+        # supplied). Fail clearly here instead.
+        return {"error": "namespace is required"}
     resp = await k8s_client._k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods")
     if resp.status_code != 200:
         return {"error": f"list pods failed ({resp.status_code}): {resp.text[:300]}"}
@@ -75,6 +83,8 @@ async def live_get_pod_logs(
     previous: bool = False,
 ) -> Dict[str, Any]:
     """Fetch a live, bounded, redacted tail of a pod's current logs."""
+    if not namespace or not pod:
+        return {"error": "namespace and pod are required"}
     params: Dict[str, str] = {"tailLines": str(max(1, min(tail_lines, 1000)))}
     if container:
         params["container"] = container
@@ -96,6 +106,8 @@ async def live_get_pod_logs(
 
 async def live_get_events(namespace: str, pod: Optional[str] = None) -> Dict[str, Any]:
     """List recent live events in a namespace, optionally filtered to one pod."""
+    if not namespace:
+        return {"error": "namespace is required"}
     params: Dict[str, str] = {}
     if pod:
         params["fieldSelector"] = f"involvedObject.name={pod}"
@@ -119,6 +131,8 @@ async def live_get_events(namespace: str, pod: Optional[str] = None) -> Dict[str
 
 async def live_describe_pod(namespace: str, pod: str) -> Dict[str, Any]:
     """Approximate `kubectl describe pod` — pod spec/status summary + its recent events."""
+    if not namespace or not pod:
+        return {"error": "namespace and pod are required"}
     pod_resp = await k8s_client._k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}")
     if pod_resp.status_code != 200:
         return {"error": f"get pod failed ({pod_resp.status_code}): {pod_resp.text[:300]}"}
@@ -188,6 +202,8 @@ async def live_get_certificates(namespace: str) -> Dict[str, Any]:
     only ever builds this summary dict, nothing else touches the decoded
     secret data.
     """
+    if not namespace:
+        return {"error": "namespace is required"}
     secrets = await k8s_client.list_tls_secrets(namespace)
     certificates = []
     for secret in secrets:

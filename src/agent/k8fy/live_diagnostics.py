@@ -63,6 +63,14 @@ async def _k8s_get(path: str, params: Optional[Dict[str, str]] = None) -> httpx.
 
 async def live_list_pods(namespace: str) -> Dict[str, Any]:
     """List pods in a namespace with a compact live status summary."""
+    if not namespace:
+        # An empty namespace segment (e.g. /api/v1/namespaces//pods) gets
+        # treated by the K8s API server as a CLUSTER-scoped list request —
+        # this agent's ServiceAccount only holds a namespace-scoped Role, so
+        # that always 403s with a confusing "at the cluster scope" message
+        # instead of the actual problem (no namespace was supplied). Fail
+        # clearly here instead.
+        return {"error": "namespace is required"}
     try:
         resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods")
     except RuntimeError as e:
@@ -95,6 +103,8 @@ async def live_get_pod_logs(
     previous: bool = False,
 ) -> Dict[str, Any]:
     """Fetch a live, bounded, redacted tail of a pod's current logs."""
+    if not namespace or not pod:
+        return {"error": "namespace and pod are required"}
     params: Dict[str, str] = {"tailLines": str(max(1, min(tail_lines, 1000)))}
     if container:
         params["container"] = container
@@ -119,6 +129,8 @@ async def live_get_pod_logs(
 
 async def live_get_events(namespace: str, pod: Optional[str] = None) -> Dict[str, Any]:
     """List recent live events in a namespace, optionally filtered to one pod."""
+    if not namespace:
+        return {"error": "namespace is required"}
     params: Dict[str, str] = {}
     if pod:
         params["fieldSelector"] = f"involvedObject.name={pod}"
@@ -145,6 +157,8 @@ async def live_get_events(namespace: str, pod: Optional[str] = None) -> Dict[str
 
 async def live_describe_pod(namespace: str, pod: str) -> Dict[str, Any]:
     """Approximate `kubectl describe pod` — pod spec/status summary + its recent events."""
+    if not namespace or not pod:
+        return {"error": "namespace and pod are required"}
     try:
         pod_resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}")
     except RuntimeError as e:

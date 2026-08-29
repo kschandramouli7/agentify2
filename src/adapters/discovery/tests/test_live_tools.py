@@ -222,3 +222,37 @@ async def test_dispatch_routes_to_live_get_certificates(sa_token, monkeypatch):
 async def test_dispatch_raises_on_unrecognized_tool():
     with pytest.raises(KeyError):
         await live_tools.dispatch("rotate_vault_cert", {})
+
+
+# ── Missing-namespace/pod guards ──────────────────────────────────────────────
+# An empty namespace segment (e.g. /api/v1/namespaces//pods) gets treated by
+# the K8s API server as a CLUSTER-scoped request, which this collector's
+# namespace-scoped RBAC Role always 403s on with a confusing
+# "at the cluster scope" message. These functions must reject an empty
+# namespace/pod before ever reaching the K8s API, not after.
+
+@pytest.mark.asyncio
+async def test_live_list_pods_rejects_empty_namespace():
+    assert await live_tools.live_list_pods("") == {"error": "namespace is required"}
+
+
+@pytest.mark.asyncio
+async def test_live_get_pod_logs_rejects_empty_namespace_or_pod():
+    assert await live_tools.live_get_pod_logs("", "pod-x") == {"error": "namespace and pod are required"}
+    assert await live_tools.live_get_pod_logs("payments", "") == {"error": "namespace and pod are required"}
+
+
+@pytest.mark.asyncio
+async def test_live_get_events_rejects_empty_namespace():
+    assert await live_tools.live_get_events("") == {"error": "namespace is required"}
+
+
+@pytest.mark.asyncio
+async def test_live_describe_pod_rejects_empty_namespace_or_pod():
+    assert await live_tools.live_describe_pod("", "pod-x") == {"error": "namespace and pod are required"}
+    assert await live_tools.live_describe_pod("payments", "") == {"error": "namespace and pod are required"}
+
+
+@pytest.mark.asyncio
+async def test_live_get_certificates_rejects_empty_namespace():
+    assert await live_tools.live_get_certificates("") == {"error": "namespace is required"}

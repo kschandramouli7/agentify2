@@ -853,6 +853,20 @@ class K8fyAgent:
                 # only grants access within that one namespace anyway.
                 if context.get("namespace"):
                     args["namespace"] = context["namespace"]
+                # Every live_* tool requires namespace; live_get_pod_logs/
+                # live_describe_pod also require pod. Neither context nor the
+                # model is guaranteed to supply these (seen: both omitted,
+                # which used to silently reach live_list_pods(namespace="")
+                # — the K8s API server treats an empty namespace segment as a
+                # CLUSTER-scoped request, which the agent's namespace-scoped
+                # RBAC Role always 403s on with a confusing error). A button
+                # that's guaranteed to fail this way is worse than no button.
+                if not args.get("namespace"):
+                    logger.warning("dropping recommended action %r: no namespace available", a.tool)
+                    continue
+                if a.tool in ("live_get_pod_logs", "live_describe_pod") and not args.get("pod"):
+                    logger.warning("dropping recommended action %r: no pod available", a.tool)
+                    continue
                 if resolved_clusters:
                     if args.get("pod"):
                         # A pod name is already cluster-specific — fan-out

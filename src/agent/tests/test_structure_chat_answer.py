@@ -141,6 +141,82 @@ async def test_structure_chat_answer_no_context_namespace_leaves_model_value(mon
 
 
 @pytest.mark.asyncio
+async def test_structure_chat_answer_drops_action_with_no_namespace_anywhere(monkeypatch):
+    # Neither context nor the model supplied a namespace — offering this
+    # button would always 403 the K8s API server as a cluster-scoped
+    # request (RBAC is namespace-scoped). Drop it rather than offer a
+    # guaranteed-broken Run button.
+    _patch_resolve(monkeypatch, [])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "Verify live pod status",
+        "tool": "live_list_pods",
+        "arguments": {"namespace": None, "pod": None, "container": None, "tail_lines": None, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer("answer", {})
+
+    assert details["recommended_actions"] == []
+
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_drops_pod_specific_action_with_no_pod(monkeypatch):
+    _patch_resolve(monkeypatch, [])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[{
+        "label": "Check payment-worker logs",
+        "tool": "live_get_pod_logs",
+        "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": 100, "previous": None},
+    }])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer(
+        "answer", {"namespace": "payments", "service": "payment-worker"},
+    )
+
+    assert details["recommended_actions"] == []
+
+
+@pytest.mark.asyncio
+async def test_structure_chat_answer_keeps_valid_actions_and_drops_only_broken_ones(monkeypatch):
+    _patch_resolve(monkeypatch, [])
+    agent = K8fyAgent()
+    payload = _base_payload(recommended_actions=[
+        {
+            "label": "List pods",
+            "tool": "live_list_pods",
+            "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": None, "previous": None},
+        },
+        {
+            "label": "Check logs with no pod",
+            "tool": "live_get_pod_logs",
+            "arguments": {"namespace": "default", "pod": None, "container": None, "tail_lines": 100, "previous": None},
+        },
+    ])
+
+    async def fake_create(**kwargs):
+        return _fake_response(payload)
+
+    monkeypatch.setattr(agent.client.messages, "create", fake_create)
+
+    details, _ = await agent._structure_chat_answer(
+        "answer", {"namespace": "payments", "service": "payment-worker"},
+    )
+
+    assert len(details["recommended_actions"]) == 1
+    assert details["recommended_actions"][0]["label"] == "List pods"
+
+
+@pytest.mark.asyncio
 async def test_structure_chat_answer_empty_text_short_circuits(monkeypatch):
     agent = K8fyAgent()
 
