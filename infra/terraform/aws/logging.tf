@@ -460,8 +460,12 @@ resource "aws_iam_role_policy" "log_query_access" {
         ]
       },
       {
+        # GetBucketLocation is bucket-level, not object-level — Athena calls
+        # it to verify the output bucket before every query and fails with
+        # "Unable to verify/create output bucket" (confirmed live, 2026-08-30)
+        # without it, even though GetObject/ListBucket were already granted.
         Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Action   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
         Resource = [aws_s3_bucket.logs[0].arn, "${aws_s3_bucket.logs[0].arn}/*"]
       },
       {
