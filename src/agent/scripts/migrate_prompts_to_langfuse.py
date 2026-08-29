@@ -4,7 +4,7 @@ Run after setting credentials:
 
     export LANGFUSE_PUBLIC_KEY=pk-lf-...
     export LANGFUSE_SECRET_KEY=sk-lf-...
-    export LANGFUSE_BASE_URL=https://cloud.langfuse.com   # or your self-hosted URL
+    export LANGFUSE_BASE_URL=https://us.cloud.langfuse.com  # MUST match the agent's
 
     cd src/agent
     python scripts/migrate_prompts_to_langfuse.py            # seed only what's missing
@@ -27,6 +27,7 @@ ROADMAP P19 gap A).
 """
 
 import argparse
+import logging
 import os
 import sys
 
@@ -51,13 +52,37 @@ def _connect(public_key: str, secret_key: str, base_url: str) -> Langfuse:
         return Langfuse(host=base_url, **creds)
 
 
+class SeedError(RuntimeError):
+    """A failure that must abort the run rather than be treated as 'absent'."""
+
+
 def _exists(lf: Langfuse, name: str) -> bool:
-    """True if *name* already has a version carrying the production label."""
+    """True if *name* already has a version carrying the production label.
+
+    Only a genuine not-found counts as absent. Any other failure (auth, wrong
+    host, network) is raised: treating it as "absent" would make the run fall
+    through to create_prompt and move the production label — creating a
+    duplicate version and clobbering the Langfuse-side copy, which is exactly
+    what seed-only-if-absent exists to prevent. Seen live 2026-08-30: a 401 from
+    a wrong-region host was read as "absent" for all 11 prompts.
+    """
+    # A miss is the expected case when seeding, but the SDK logs it at ERROR
+    # ("Error while fetching prompt ... 404"), which makes a successful seed read
+    # like a failure. Quieten the SDK for the probe only; genuine problems are
+    # still raised below and reported by the caller.
+    lf_log = logging.getLogger("langfuse")
+    prior = lf_log.level
+    lf_log.setLevel(logging.CRITICAL)
     try:
         lf.get_prompt(name, label=PRODUCTION_LABEL, cache_ttl_seconds=0)
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        text = str(exc).lower()
+        if "not found" in text or "404" in text:
+            return False
+        raise SeedError(f"could not determine whether {name!r} exists: {exc}") from exc
+    finally:
+        lf_log.setLevel(prior)
 
 
 def main() -> None:
@@ -73,7 +98,11 @@ def main() -> None:
 
     public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
     secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "")
-    base_url   = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+    # Default must track config/settings.py's langfuse_base_url. They disagreed
+    # until 2026-08-30 (this script defaulted to the EU host, the agent to US),
+    # which seeds prompts into a different region than the agent reads from and
+    # surfaces as a confusing 401 rather than an obvious misconfiguration.
+    base_url   = os.environ.get("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com")
 
     if not public_key or not secret_key:
         print(
@@ -91,15 +120,44 @@ def main() -> None:
             sys.exit(1)
 
     lf = _connect(public_key, secret_key, base_url)
+
+    # Verify before touching anything: the common failure is valid keys sent to
+    # the wrong data region, which every subsequent call reports as a 401.
+    try:
+        ok = lf.auth_check()
+    except Exception as exc:
+        ok = False
+        print(f"  auth_check raised: {exc}", file=sys.stderr)
+    if not ok:
+        print(
+            f"ERROR: Langfuse rejected these credentials at {base_url}\n"
+            "       The keys are usually right and the HOST wrong — projects are\n"
+            "       region-scoped. Set LANGFUSE_BASE_URL to the region holding your\n"
+            "       project, and make sure it matches the agent's\n"
+            "       config/settings.py langfuse_base_url:\n"
+            "         US  https://us.cloud.langfuse.com\n"
+            "         EU  https://cloud.langfuse.com\n"
+            "         or your self-hosted URL",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(f"Connected to Langfuse at {base_url}")
     print(f"Mode: {'FORCE re-push' if args.force else 'seed only if absent'}\n")
 
     created = skipped = failed = 0
     for name, content in selected:
-        if not args.force and _exists(lf, name):
-            print(f"  SKIP {name}  (already in Langfuse)")
-            skipped += 1
-            continue
+        if not args.force:
+            try:
+                present = _exists(lf, name)
+            except SeedError as exc:
+                print(f"\nABORTED: {exc}", file=sys.stderr)
+                print("         Nothing was created. Fix the connection and re-run.", file=sys.stderr)
+                sys.exit(1)
+            if present:
+                print(f"  SKIP {name}  (already in Langfuse)")
+                skipped += 1
+                continue
         try:
             prompt = lf.create_prompt(
                 name=name,
