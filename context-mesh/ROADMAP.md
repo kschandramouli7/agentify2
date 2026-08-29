@@ -44,7 +44,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029); use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
-| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 4 smaller gaps. A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert) and C (no prompt provenance on `traces`) are closed; D (eval gate blind to label promotion) stays open as part of P19 step 3 — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
+| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 4 smaller gaps. A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert) and C (no prompt provenance on `traces`) are closed; D (a prompt change still reaches production through a gate-less path) stays open as part of P19 step 3, reframed 2026-08-30 to gate-before-promote and split into D1 (version-pinned evaluation — the real blocker, useful independently of P19) and D2 (webhook → `repository_dispatch` → `experiment-action` wiring) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 
 ---
 
@@ -1399,15 +1399,89 @@ plumbed the same way `estimated_cost_usd` already was: Python `AgentResponse` �
 Covered by `TestTracePromptProvenance` against real Postgres, which also closes
 the previously untested `scanTrace` path.
 
-**D — the P7 eval gate is blind to label promotion.** *(still open — belongs to
-P19 step 3 below.)* `run_evals.py` runs only
-from `02-deploy.yml` (`workflow_dispatch` / merge to main) — i.e. on *code*
-deploys. Promoting a prompt label in the Langfuse UI reshapes 100% of live
-traffic with no regression run at all. Tolerable while prompt edits are rare
-and manual; not tolerable once P19 makes new prompt versions routine. The fix
-belongs in P19's ADR: a label promotion triggers `run_evals.py` against that
-specific version, and auto-reverts the label if the score falls below
-[ADR 0019](decisions/0019-eval-harness-as-ci-gate.md)'s threshold.
+**D — a prompt change reaches production through a gate-less path.** *(still
+open. Split into D1/D2 below — D1 is the real work and is independently
+useful; D2 is a few hours once D1 exists.)*
+
+agentify has two independent ways to change how it behaves, and only one is
+gated:
+
+| Change surface | How it ships | Eval gate today |
+|---|---|---|
+| Code (skills, pre-fetch, routing) | git push → `02-deploy.yml` → `run_evals.py --pass-threshold 0.85` | **yes** ([ADR 0019](decisions/0019-eval-harness-as-ci-gate.md)) |
+| Prompt text | move the `production` label in the Langfuse UI | **none — nothing fires** |
+
+`02-deploy.yml` triggers on `workflow_dispatch` and on pushes to `main` under
+`src/**`, `infra/kubernetes/**`, or the workflow file. A label move touches **no
+git object**, so there is no workflow to run. Tolerable while prompt edits are
+rare and manual; not tolerable once P19 makes new prompt versions routine.
+
+**Closing gap B sharpened this**, and that is worth stating plainly: a label
+move now reaches live traffic within ~60 s, where before it needed a pod
+restart that tended to coincide with a deploy. Making promotion work as
+documented also made an ungated promotion effective immediately.
+
+**Design correction (2026-08-30).** This item previously read: "a label
+promotion triggers `run_evals.py` against that specific version, and
+auto-reverts the label if the score falls below threshold." That is
+promote-then-revert, and it is the wrong shape — a bad prompt still reaches
+100 % of live traffic for the duration of the eval run (currently minutes, as a
+deploy-job step). Langfuse's own documented prompt-CI/CD pattern inverts it:
+the candidate carries a `staging` label, CI validates *that* label, and only
+then does an approver move `production`. **Gate before promote.** Auto-revert
+is the backstop for what slips past, not the primary control.
+
+**D1 — version-pinned evaluation (the blocker, and not visible from the CI
+layer).** `run_evals.py` POSTs to `{backend_url}/api/query`, i.e. it measures
+the **live deployed system** and has no concept of a prompt version: it can
+only ever score "whatever `production` currently points at". So "evaluate the
+candidate version" is *not expressible with today's harness*, and D is not the
+CI-plumbing task it looks like — it needs a product change first. Two shapes:
+
+  - **(a) Version override on the query path** — `/api/query` accepts an
+    optional prompt label/version, threaded through to `resolve()`. Cleanest
+    for evals, but it adds a "make the agent use arbitrary prompt X" lever to a
+    live API surface; per [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md)'s
+    reasoning about prompt-injection routes to unattended action, that lever
+    wants bearer auth and probably a non-prod-only guard.
+  - **(b) Out-of-band harness** — construct the skills in-process against the
+    candidate prompt, bypassing `/api/query`. Adds no production surface, but
+    stops exercising the real deployed path, which was ADR 0019's entire point.
+
+  Decide this in P19's ADR. Note D1 is **worth building regardless of P19**: a
+  prompt A/B test, a canary, and per-version quality comparison all need the
+  same capability.
+
+**D2 — the wiring (straightforward once D1 exists).** Langfuse ships every
+primitive; nothing bespoke is needed:
+
+  - **Webhooks on prompt-version events** (`created` / `updated` / `deleted`).
+    `updated` **fires on label changes**, emitting two events — one for the
+    version gaining the label, one for the version losing it — which is both
+    the promotion trigger and a rollback audit signal. Payloads are
+    HMAC-SHA256 signed (`x-langfuse-signature`); the handler must be idempotent
+    and return 2xx, as Langfuse retries with exponential backoff.
+  - **GitHub `repository_dispatch`** from that webhook, so a `prompt-gate.yml`
+    workflow runs without anyone leaving the Langfuse UI.
+  - **`langfuse/experiment-action`** (v1.0.6 as of July 2026) — runs an
+    experiment script against a named dataset, posts scores as a PR comment,
+    fails the job on regression. Point it at the existing `k8fy-regression`
+    dataset rather than building a second one.
+  - **Protected labels** — admins/owners can mark `production` so `member` /
+    `viewer` roles cannot move it. This is what makes P19's "a human approves"
+    structurally enforced rather than a convention.
+
+**Costs and dependencies to know before committing:**
+  - **Protected labels are a paid tier** (Pro + Teams add-on, Enterprise, or
+    self-hosted EE). Without it, "only approvers move `production`" is
+    honour-system only. Audit logs (who moved which label, with before/after
+    state) are Enterprise / self-hosted-EE.
+  - Langfuse ships **no built-in approval workflow and no traffic splitting**
+    (as of July 2026). A stage-4 canary would be percentage logic in our own
+    code.
+  - Firing a full eval run on every prompt-version creation is a recurring
+    bill in both money and minutes — the same tunable-knob problem P19 already
+    flags for judge sampling, not a new one.
 
 **Sequencing (agreed 2026-08-29):**
 
@@ -1440,8 +1514,12 @@ specific version, and auto-reverts the label if the score falls below
    in this design — a miscalibrated judge emits confidently-wrong PRs and
    prompt versions, which is *worse* than today's silence because it arrives
    looking reviewed.
-3. **Wire the two promotion paths** (Langfuse prompt version; GitHub PR), plus
-   gap D's eval-on-promotion gate.
+3. **Wire the two promotion paths** (Langfuse prompt version → `staging` label;
+   GitHub PR for pre-fetch/code changes), then close **D1 before D2** — the
+   version-pinned eval capability first, the webhook →
+   `repository_dispatch` → `experiment-action` gate second. Gate before
+   promote: the Evaluator Agent labels candidates `staging` and never touches
+   `production`.
 4. **Write the ADR at this point**, not before — same pattern P15/P18 followed.
    It should cover the sampling/judge design, the dry-run→live gate in step 2,
    and gap D's promotion trigger. The prompt-loading migration the original
