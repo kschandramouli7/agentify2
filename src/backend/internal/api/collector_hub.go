@@ -82,8 +82,10 @@ func NewCollectorHub() *CollectorHub {
 // the calling goroutine for the connection's lifetime — callers (the HTTP
 // handler that just upgraded the request) should call this directly rather
 // than backgrounding it, since the underlying request context ends when the
-// handler returns.
-func (h *CollectorHub) Register(clusterID string, conn *websocket.Conn) {
+// handler returns. Returns the error that ended the read loop (nil is not
+// possible — ReadJSON only returns on error) so the caller can log *why* a
+// connection dropped, since that's otherwise invisible.
+func (h *CollectorHub) Register(clusterID string, conn *websocket.Conn) error {
 	cc := &collectorConn{conn: conn, pending: map[string]chan liveFrame{}}
 
 	h.mu.Lock()
@@ -129,7 +131,7 @@ func (h *CollectorHub) Register(clusterID string, conn *websocket.Conn) {
 	for {
 		var f liveFrame
 		if err := conn.ReadJSON(&f); err != nil {
-			return // disconnect — the deferred cleanup above unregisters this connection
+			return err // disconnect — the deferred cleanup above unregisters this connection
 		}
 		if f.Type != "response" {
 			continue // the collector never sends "request" — ignore anything unexpected

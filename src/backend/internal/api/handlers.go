@@ -2215,8 +2215,8 @@ func (h *Handler) HandleCollectorConnect(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	h.logger.Info("collector connected", "cluster_id", clusterID)
-	h.collectorHub.Register(clusterID, conn) // blocks until disconnect
-	h.logger.Info("collector disconnected", "cluster_id", clusterID)
+	disconnectErr := h.collectorHub.Register(clusterID, conn) // blocks until disconnect
+	h.logger.Info("collector disconnected", "cluster_id", clusterID, "error", disconnectErr)
 }
 
 // liveFetchAllowedTools mirrors LIVE_DIAGNOSTIC_TOOLS in
