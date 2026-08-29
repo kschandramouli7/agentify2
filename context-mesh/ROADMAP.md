@@ -44,6 +44,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029); use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
+| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Not started — blocked on two prerequisites (skills loading prompts from Langfuse; `traces` recording which prompt version answered a query)** — see below | — |
 
 ---
 
@@ -1243,6 +1244,96 @@ k8fy-adapter/collector consolidation ADR 0022 Decision #9 flagged is
 [ADR 0027](../decisions/0027-merge-k8fy-adapter-into-discovery.md).
 
 **Not started** — this is a design item, not yet a plan or code.
+
+---
+
+## P19 — Self-improving agent: an Evaluator Agent that reviews and upgrades prompts/skills (proposed 2026-08-29)
+
+**Hard truth:** every skill's system prompt and pre-fetch signal list is
+hand-tuned once and then static — nothing in agentify today looks back at
+what past conversations actually got wrong and closes that loop. This is
+the step that turns agentify from "an AI assistant that answers questions"
+into "an organizational intelligence system that gets better at answering
+them." Recurring shape: an agent reviews prior agent conversations,
+identifies what could have been done better or what context should have
+been available earlier, and uses that to improve a skill's prompt or
+pre-fetch signals — so every *future* conversation benefits, not just the
+one being reviewed.
+
+```
+Human → Agent → Answer → Conversation recorded → Evaluator Agent
+   → identify failure → improve prompt / pre-fetch signal → new version
+   → future agents become better
+```
+
+**This is not P7.** P7 (Eval Harness as CI Gate) runs a static golden
+dataset in CI before a deploy — regression testing. This item mines *live*
+production traffic after the fact, on a schedule, looking for failures P7's
+fixed dataset was never written to catch. Complementary, not overlapping.
+
+**Confirmed direction (brainstormed 2026-08-29):**
+1. **Failure signal: sampled LLM-judge re-review**, not just mining
+   already-low-confidence/`status=error` traces. A judge call (cheap tier —
+   Haiku, same cost class as P8's embedding calls) re-grades a sampled
+   cross-section of recent traces against their own recorded evidence
+   (`traces.sources`/`tool_calls`), checking: was the answer actually
+   supported by what was fetched, was there a signal that would have helped
+   but wasn't in the pre-fetch, was the confidence well-calibrated. This
+   catches confidently-wrong answers a pure low-confidence filter would
+   miss — at the cost of an ongoing per-sample judge-call bill, so the
+   sample rate is a tunable knob, not a fixed design commitment.
+2. **Improvement scope: prompt text *and* pre-fetch signal selection** —
+   two different kinds of proposals, promoted through two different
+   *existing* mechanisms rather than a new bespoke approval console:
+   - **Prompt wording** → promoted through **Langfuse's own prompt
+     versioning** (versions + labels like `production`/`staging`, already a
+     built-in Langfuse feature). The Evaluator Agent pushes a new prompt
+     *version* carrying the evidence/rationale in its commit message but
+     never touches the `production` label itself — a human reviews the
+     diff and evidence in Langfuse's UI and promotes the label when
+     satisfied. No new Hub-side proposal/approval table needed.
+   - **Pre-fetch signal gaps** (e.g. "`DiagnoseSkill` should also fetch
+     `get_metrics_history` when X pattern shows up") are a *code* change —
+     proposed as an actual GitHub PR (diff + the evidence trace(s) linked
+     in the description), reviewed like any other PR. Once
+     [P9](#p9--pr-review-agent-second-domain-use-case) (PR Review Agent)
+     ships, it gives this specific class of PR a first automated pass
+     before the human review — a natural second use for that agent, not a
+     new one.
+3. **Never auto-apply, in either path** — same rule ADR 0020 already
+   established for Phase-3 remediation, carried over unchanged and for a
+   stronger reason: a prompt/skill change is *higher* blast radius than a
+   single pod restart, since it silently reshapes every future query for
+   every tenant, indefinitely, not one pod once. "Propose, evidence
+   attached, human approves" is non-negotiable here, not a v1 shortcut to
+   revisit later.
+
+**Prerequisites — not yet true today, both block this item from starting:**
+- **Skills don't load prompts from Langfuse at all.** `_DEFAULT_SYSTEM_PROMPT`,
+  `CHAT_STRUCTURE_PROMPT`, and every other skill prompt
+  (`src/agent/k8fy/agent.py`, `prompts.py`) are hardcoded Python string
+  constants today — Langfuse is wired for tracing/scoring only. Wiring
+  skills to fetch a labeled prompt version from Langfuse at request time
+  (with the current hardcoded string kept as the fallback/seed content, not
+  deleted) is foundational work this item depends on, not an optional
+  nice-to-have.
+- **`traces` doesn't record which prompt version answered a query.** Without
+  a `prompt_version`/`prompt_name` column, a proposed prompt fix has no way
+  to point back at "this version produced this failure" — needed for the
+  Evaluator Agent's evidence to mean anything.
+
+**Explicitly deferred, tune during rollout rather than block on:** exact
+sample rate, judge model choice, and a cost cap per evaluation cycle — real
+decisions, but tuning knobs, not architecture. Also deferred: any notion of
+the Evaluator Agent proposing changes to *code* beyond pre-fetch signal
+selection (e.g. rewriting a skill's Python control flow) — out of scope
+until the two narrower proposal types above are proven out.
+
+**Not started** — this is a design item, not yet a plan or code. Write an
+ADR when someone picks this up to implement (same pattern P15/P18 followed:
+ADR written at implementation time, not at proposal time), covering at
+minimum the Langfuse prompt-loading migration and the sampling/judge
+design above.
 
 ---
 
