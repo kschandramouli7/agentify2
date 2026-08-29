@@ -70,9 +70,14 @@ def _build_query(database: str, table: str, namespace: str, pod: Optional[str], 
     )
 
 
-def _run_query_sync(query: str, workgroup: str, database: str) -> Dict[str, Any]:
-    """Synchronous start->poll->fetch — always called via asyncio.to_thread."""
-    client = boto3.client("athena")
+def _run_query_sync(query: str, workgroup: str, database: str, region: str) -> Dict[str, Any]:
+    """Synchronous start->poll->fetch — always called via asyncio.to_thread.
+    region is passed explicitly (not left to boto3's default resolution)
+    because this deployment sets AWS_REGION, not AWS_DEFAULT_REGION — the
+    only env var this botocore version's region provider chain reads —
+    confirmed live (2026-08-30) via a bare boto3.client("athena") raising
+    NoRegionError despite AWS_REGION being set in the pod."""
+    client = boto3.client("athena", region_name=region)
     start = client.start_query_execution(
         QueryString=query,
         QueryExecutionContext={"Database": database},
@@ -129,6 +134,7 @@ async def query_athena_logs(
     workgroup = athena_config.get("workgroup", "")
     database = athena_config.get("database", "")
     table = athena_config.get("table", "")
+    region = athena_config.get("region", "")
     if not (workgroup and database and table):
         return {"error": "Athena log platform is not configured (missing workgroup/database/table)"}
 
@@ -136,7 +142,7 @@ async def query_athena_logs(
     query = _build_query(database, table, namespace, pod, hours_back, limit)
 
     try:
-        result = await asyncio.to_thread(_run_query_sync, query, workgroup, database)
+        result = await asyncio.to_thread(_run_query_sync, query, workgroup, database, region)
     except Exception as e:  # noqa: BLE001 — boto3 raises many distinct exception types
         logger.warning("athena query failed: %s", e)
         return {"error": f"Athena query failed: {e}"}

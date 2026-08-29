@@ -44,6 +44,7 @@ async def get_logs(
             "workgroup": settings.athena_workgroup,
             "database": settings.athena_database,
             "table": settings.athena_table,
+            "region": settings.aws_region,
         }
         result = await query_athena_logs(namespace, pod, athena_config, tail_lines=tail_lines)
         if "error" in result:

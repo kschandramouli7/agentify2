@@ -54,7 +54,7 @@ async def test_query_athena_logs_success(monkeypatch):
         ["payment-worker-abc", "worker", "line one"],
         ["payment-worker-abc", "worker", "line two"],
     ])
-    monkeypatch.setattr(lp.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(lp.boto3, "client", lambda service, region_name=None: fake_client)
 
     result = await lp.query_athena_logs(
         "payments", "payment-worker-abc",
@@ -74,7 +74,7 @@ async def test_query_athena_logs_success(monkeypatch):
 @pytest.mark.asyncio
 async def test_query_athena_logs_empty_results(monkeypatch):
     fake_client = _FakeAthenaClient(rows=[])
-    monkeypatch.setattr(lp.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(lp.boto3, "client", lambda service, region_name=None: fake_client)
 
     result = await lp.query_athena_logs("payments", None, {"workgroup": "wg", "database": "db", "table": "tbl"})
     assert result == {"namespace": "payments", "pod": None, "logs": ""}
@@ -83,7 +83,7 @@ async def test_query_athena_logs_empty_results(monkeypatch):
 @pytest.mark.asyncio
 async def test_query_athena_logs_query_failed(monkeypatch):
     fake_client = _FakeAthenaClient(query_state="FAILED", reason="table not found")
-    monkeypatch.setattr(lp.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(lp.boto3, "client", lambda service, region_name=None: fake_client)
 
     result = await lp.query_athena_logs("payments", None, {"workgroup": "wg", "database": "db", "table": "tbl"})
     assert "error" in result
@@ -92,7 +92,7 @@ async def test_query_athena_logs_query_failed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_query_athena_logs_boto3_exception(monkeypatch):
-    def raise_error(service):
+    def raise_error(service, region_name=None):
         raise RuntimeError("no credentials")
     monkeypatch.setattr(lp.boto3, "client", raise_error)
 

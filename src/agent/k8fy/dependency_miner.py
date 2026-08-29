@@ -109,11 +109,14 @@ def _build_query(database: str, table: str, cluster_id: str, namespace: str, hou
     )
 
 
-def _run_query_sync(query: str, workgroup: str, database: str) -> Dict[str, Any]:
+def _run_query_sync(query: str, workgroup: str, database: str, region: str) -> Dict[str, Any]:
     """Synchronous start->poll->fetch — always called via asyncio.to_thread.
     Same shape as log_platform.py's _run_query_sync (a separate copy, not
-    imported, for the same reason _partition_predicate is above)."""
-    client = boto3.client("athena")
+    imported, for the same reason _partition_predicate is above). region is
+    passed explicitly because this deployment's botocore version only reads
+    AWS_DEFAULT_REGION, not the AWS_REGION env var the pod actually sets —
+    confirmed live (2026-08-30) via NoRegionError despite AWS_REGION being set."""
+    client = boto3.client("athena", region_name=region)
     start = client.start_query_execution(
         QueryString=query,
         QueryExecutionContext={"Database": database},
@@ -220,10 +223,11 @@ async def _mine_namespace(
     workgroup = athena_config.get("workgroup", "")
     database = athena_config.get("database", "")
     table = athena_config.get("table", "")
+    region = athena_config.get("region", "")
     query = _build_query(database, table, cluster_id, namespace, hours_back, _MAX_ROWS)
 
     try:
-        result = await asyncio.to_thread(_run_query_sync, query, workgroup, database)
+        result = await asyncio.to_thread(_run_query_sync, query, workgroup, database, region)
     except Exception as e:  # noqa: BLE001 — boto3 raises many distinct exception types
         logger.warning("dependency_miner: Athena query failed for cluster=%s namespace=%s: %s", cluster_id, namespace, e)
         return

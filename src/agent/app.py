@@ -53,6 +53,7 @@ async def startup_event():
         "workgroup": settings.athena_workgroup,
         "database": settings.athena_database,
         "table": settings.athena_table,
+        "region": settings.aws_region,
     }
     _dependency_miner_task = asyncio.create_task(
         dependency_miner.run_forever(

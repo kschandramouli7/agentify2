@@ -183,7 +183,7 @@ async def test_mine_namespace_end_to_end(monkeypatch):
         ["payment-worker-abc", "{app=payment-worker}", "2026-07-24T22:22:26Z stdout F GET payment-api.payments.svc.cluster.local"],
     ])
     monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
-    monkeypatch.setattr(dm.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
 
     pushed = []
 
@@ -212,7 +212,7 @@ async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatc
         ["payment-worker-abc", "{app=payment-worker}", "2026-07-24T22:22:27Z stdout F GET payment-api.payments.svc.cluster.local"],
     ])
     monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
-    monkeypatch.setattr(dm.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
 
     pushed = []
 
@@ -233,7 +233,7 @@ async def test_mine_namespace_skips_when_no_selectors(monkeypatch):
 
     called = {"athena": False}
 
-    def fail_if_called(service):
+    def fail_if_called(service, region_name=None):
         called["athena"] = True
         raise AssertionError("should not query Athena with no known services")
 
@@ -255,7 +255,7 @@ async def test_mine_namespace_unmatched_pod_labels_are_skipped(monkeypatch):
         ["unknown-pod-abc", "{app=some-other-app}", "2026-07-24T22:22:26Z stdout F GET payment-api.payments.svc.cluster.local"],
     ])
     monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
-    monkeypatch.setattr(dm.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
 
     pushed = []
 
@@ -276,7 +276,7 @@ async def test_mine_namespace_athena_query_failure_does_not_raise(monkeypatch):
 
     fake_client = _FakeAthenaClient(query_state="FAILED", reason="table not found")
     monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
-    monkeypatch.setattr(dm.boto3, "client", lambda service: fake_client)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
 
     # Must not raise.
     await dm._mine_namespace("http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2)

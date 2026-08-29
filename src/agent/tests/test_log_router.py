@@ -14,8 +14,10 @@ import pytest
 from k8fy import log_router as lr
 
 
-def _settings(workgroup="wg", database="db", table="tbl"):
-    return SimpleNamespace(athena_workgroup=workgroup, athena_database=database, athena_table=table)
+def _settings(workgroup="wg", database="db", table="tbl", region="ap-southeast-2"):
+    return SimpleNamespace(
+        athena_workgroup=workgroup, athena_database=database, athena_table=table, aws_region=region,
+    )
 
 
 @pytest.mark.asyncio
@@ -40,7 +42,9 @@ async def test_get_logs_uses_athena_when_configured_and_has_data(monkeypatch):
     assert result["logs"] == "athena logs here"
     assert captured["namespace"] == "payments"
     assert captured["pod"] == "payment-worker-abc"
-    assert captured["athena_config"] == {"workgroup": "wg", "database": "db", "table": "tbl"}
+    assert captured["athena_config"] == {
+        "workgroup": "wg", "database": "db", "table": "tbl", "region": "ap-southeast-2",
+    }
 
 
 @pytest.mark.asyncio
