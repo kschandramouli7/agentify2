@@ -1432,7 +1432,11 @@ then does an approver move `production`. **Gate before promote.** Auto-revert
 is the backstop for what slips past, not the primary control.
 
 **D1 — version-pinned evaluation (the blocker, and not visible from the CI
-layer).** `run_evals.py` POSTs to `{backend_url}/api/query`, i.e. it measures
+layer).** **Design decided 2026-08-30 in its own ADR:
+[ADR 0030](decisions/0030-version-pinned-prompt-evaluation.md)** — a dedicated
+bearer-authenticated `POST /admin/eval/query` that reuses the real deployed
+handler and differs only in which prompt version the agent resolves; the
+unauthenticated `/api/query` gains nothing. Proposed, not built. `run_evals.py` POSTs to `{backend_url}/api/query`, i.e. it measures
 the **live deployed system** and has no concept of a prompt version: it can
 only ever score "whatever `production` currently points at". So "evaluate the
 candidate version" is *not expressible with today's harness*, and D is not the
@@ -1448,9 +1452,16 @@ CI-plumbing task it looks like — it needs a product change first. Two shapes:
     candidate prompt, bypassing `/api/query`. Adds no production surface, but
     stops exercising the real deployed path, which was ADR 0019's entire point.
 
-  Decide this in P19's ADR. Note D1 is **worth building regardless of P19**: a
-  prompt A/B test, a canary, and per-version quality comparison all need the
-  same capability.
+  ADR 0030 chose **neither verbatim**: (a) is rejected for putting a
+  behaviour-substitution lever on an unauthenticated endpoint (ADR 0020 rule 5),
+  (b) for dropping routing/tiering/governance out of coverage — which is the
+  property ADR 0019 exists to have. The decision is (a)'s "reuse the real
+  deployed path" with (b)'s "add no public surface", via a separate
+  authenticated route. It also records a trap worth knowing: eval traffic must
+  be flagged and **excluded from P19's sampler**, or the Evaluator Agent judges
+  its own synthetic traffic and partly learns from its own test set. Note D1 is
+  **worth building regardless of P19**: a prompt A/B test, a canary, and
+  per-version quality comparison all need the same capability.
 
 **D2 — the wiring (straightforward once D1 exists).** Langfuse ships every
 primitive; nothing bespoke is needed:
