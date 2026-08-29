@@ -400,3 +400,29 @@ recommended_actions with live-diagnostic tool calls (namespace/pod must \
 be real values already discussed above, e.g. from context); leave it \
 empty if nothing there would help.
 """
+
+# ---------------------------------------------------------------------------
+# Canonical prompt registry
+# ---------------------------------------------------------------------------
+# Every prompt name fetched from Langfuse at runtime, paired with the local
+# fallback above. Single source of truth for startup prefetch (app.py) and for
+# seeding (scripts/migrate_prompts_to_langfuse.py).
+#
+# A name used by a skill but missing here runs on its fallback forever and can
+# never be versioned in Langfuse — which is exactly how k8fy/vault-cert,
+# k8fy/incident-responder and k8fy/deployment-guardian went unseeded until
+# 2026-08-29 (ROADMAP P19 gap A). Add new skill prompts here, not just in the
+# skill.
+ALL_PROMPTS = [
+    ("k8fy/system",              SYSTEM_PROMPT),
+    ("k8fy/health-check",        HEALTH_SKILL_PROMPT),
+    ("k8fy/cert-audit",          CERT_AUDIT_PROMPT),
+    ("k8fy/change-history",      CHANGE_HISTORY_PROMPT),
+    ("k8fy/restart-trend",       RESTART_TREND_PROMPT),
+    ("k8fy/diagnose",            DIAGNOSE_PROMPT),
+    ("k8fy/vault-cert",          VAULT_CERT_PROMPT),
+    ("k8fy/incident-responder",  INCIDENT_RESPONDER_PROMPT),
+    ("k8fy/deployment-guardian", DEPLOYMENT_GUARDIAN_PROMPT),
+    ("k8fy/chat",                CHAT_SYSTEM_PROMPT),
+    ("k8fy/chat-structure",      CHAT_STRUCTURE_PROMPT),
+]

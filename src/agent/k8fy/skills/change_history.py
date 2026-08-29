@@ -22,7 +22,6 @@ import logging
 from typing import Any, Dict
 
 from k8fy.agent import K8fyAgent
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import CHANGE_HISTORY_PROMPT
 from k8fy.service_topology import resolve_service_clusters
 from k8fy.tools import TOOLS
@@ -38,7 +37,8 @@ class ChangeHistorySkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/change-history", CHANGE_HISTORY_PROMPT),
+            prompt_name="k8fy/change-history",
+            prompt_fallback=CHANGE_HISTORY_PROMPT,
             tools=_TOOLS,
         )
 

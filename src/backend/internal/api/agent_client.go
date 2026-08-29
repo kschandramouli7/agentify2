@@ -53,6 +53,8 @@ type AgentResponse struct {
 	CacheCreationInputTokens int64                  `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64                  `json:"cache_read_input_tokens"`
 	EstimatedCostUSD         float64                `json:"estimated_cost_usd"`
+	PromptName               string                 `json:"prompt_name"`
+	PromptVersion            *int                   `json:"prompt_version"`
 }
 
 // ChatRequest is sent to the agent's /reason-chat endpoint for multi-turn conversation.

@@ -136,13 +136,21 @@ func (c *Client) initSchema(ctx context.Context) error {
 		created_at TIMESTAMP DEFAULT NOW(),
 		input_tokens BIGINT NOT NULL DEFAULT 0,
 		output_tokens BIGINT NOT NULL DEFAULT 0,
-		estimated_cost_usd FLOAT NOT NULL DEFAULT 0
+		estimated_cost_usd FLOAT NOT NULL DEFAULT 0,
+		-- Which Langfuse prompt version produced this answer. prompt_version is
+		-- NULL for Tier-1 (no LLM call) and when the agent used its local
+		-- fallback string, so a proposed prompt fix can tell "this version
+		-- produced this failure" from "there was no version".
+		prompt_name TEXT NOT NULL DEFAULT '',
+		prompt_version INT
 	);
 	-- Idempotent migrations: add new columns to pre-existing tables.
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS input_tokens BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS output_tokens BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS estimated_cost_usd FLOAT NOT NULL DEFAULT 0;
+	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS prompt_name TEXT NOT NULL DEFAULT '';
+	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS prompt_version INT;
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS cache_read_input_tokens BIGINT NOT NULL DEFAULT 0;
 	CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at DESC);
@@ -675,6 +683,8 @@ type TraceRecord struct {
 	CacheCreationInputTokens int64
 	CacheReadInputTokens     int64
 	EstimatedCostUSD         float64
+	PromptName               string
+	PromptVersion            *int // nil = local fallback or no LLM call
 	TenantID                 string
 	ClusterID                string
 }
@@ -702,14 +712,14 @@ func (c *Client) InsertTrace(ctx context.Context, t TraceRecord) error {
 		`INSERT INTO traces (id, trace_id, question, intent, namespace, tier, status,
 		  confidence, sources, tool_calls, latency_ms, started_at, created_at,
 		  input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-		  estimated_cost_usd)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17)
+		  estimated_cost_usd, prompt_name, prompt_version)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19)
 		 ON CONFLICT (id) DO NOTHING`,
 		t.ID, t.TraceID, t.Question, t.Intent, t.Namespace, t.Tier, t.Status,
 		t.Confidence, srcJSON, tcJSON, t.LatencyMs, startedAt,
 		t.InputTokens, t.OutputTokens,
 		t.CacheCreationInputTokens, t.CacheReadInputTokens,
-		t.EstimatedCostUSD)
+		t.EstimatedCostUSD, t.PromptName, t.PromptVersion)
 	return err
 }
 
@@ -720,6 +730,7 @@ const traceSelectCols = `
 	       COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
 	       COALESCE(cache_creation_input_tokens, 0), COALESCE(cache_read_input_tokens, 0),
 	       COALESCE(estimated_cost_usd, 0),
+	       COALESCE(prompt_name, ''), prompt_version,
 	       tenant_id, COALESCE(cluster_id, '')
 	FROM traces`
 
@@ -733,6 +744,7 @@ func scanTrace(row interface{ Scan(...any) error }) (TraceRecord, error) {
 		&t.InputTokens, &t.OutputTokens,
 		&t.CacheCreationInputTokens, &t.CacheReadInputTokens,
 		&t.EstimatedCostUSD,
+		&t.PromptName, &t.PromptVersion,
 		&t.TenantID, &t.ClusterID)
 	if err != nil {
 		return t, err

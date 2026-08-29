@@ -11,7 +11,6 @@ import logging
 from typing import Any, Dict
 
 from k8fy.agent import K8fyAgent, REMEDIATION_REASONING_SCHEMA
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import INCIDENT_RESPONDER_PROMPT
 from k8fy.skills.diagnose import _crashing_pod_ids
 from k8fy.tools import TOOLS
@@ -30,7 +29,8 @@ class IncidentResponderSkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/incident-responder", INCIDENT_RESPONDER_PROMPT),
+            prompt_name="k8fy/incident-responder",
+            prompt_fallback=INCIDENT_RESPONDER_PROMPT,
             tools=_INCIDENT_RESPONDER_TOOLS,
             output_schema=REMEDIATION_REASONING_SCHEMA,
         )

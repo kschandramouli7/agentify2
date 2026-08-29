@@ -726,12 +726,16 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 	latencyMs := time.Since(start).Milliseconds()
 	var inTok, outTok, cacheWriteTok, cacheReadTok int64
 	var cost float64
+	var promptName string
+	var promptVersion *int
 	if agentResp != nil {
 		inTok = agentResp.InputTokens
 		outTok = agentResp.OutputTokens
 		cacheWriteTok = agentResp.CacheCreationInputTokens
 		cacheReadTok = agentResp.CacheReadInputTokens
 		cost = agentResp.EstimatedCostUSD
+		promptName = agentResp.PromptName
+		promptVersion = agentResp.PromptVersion
 	}
 	h.logger.Info("query.trace",
 		"trace_id", traceID,
@@ -749,6 +753,8 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 		"cache_creation_input_tokens", cacheWriteTok,
 		"cache_read_input_tokens", cacheReadTok,
 		"estimated_cost_usd", cost,
+		"prompt_name", promptName,
+		"prompt_version", promptVersion,
 	)
 	if h.traceStore != nil {
 		go func() {
@@ -773,6 +779,8 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 				CacheCreationInputTokens: cacheWriteTok,
 				CacheReadInputTokens:     cacheReadTok,
 				EstimatedCostUSD:         cost,
+				PromptName:               promptName,
+				PromptVersion:            promptVersion,
 			}); err != nil {
 				h.logger.Warn("trace persist failed", "error", err)
 				return

@@ -16,7 +16,6 @@ import logging
 from typing import Any, Dict
 
 from k8fy.agent import K8fyAgent
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import VAULT_CERT_PROMPT
 from k8fy.service_topology import resolve_service_clusters
 from k8fy.tools import TOOLS, process_tool_call
@@ -55,7 +54,8 @@ class VaultCertSkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/vault-cert", VAULT_CERT_PROMPT),
+            prompt_name="k8fy/vault-cert",
+            prompt_fallback=VAULT_CERT_PROMPT,
             tools=_VAULT_TOOLS,
         )
 
