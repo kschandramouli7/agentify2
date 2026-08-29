@@ -557,6 +557,83 @@ jobs:
           LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
           LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
 
+      - name: Verify prompt provenance on traces
+        # Asserts that gap B/C plumbing is live: a Tier-2 answer must record WHICH
+        # prompt produced it (ROADMAP P19 gaps B/C, ADR 0030). The eval gate above
+        # proves queries succeed; it asserts nothing about provenance, so a
+        # regression here — the agent silently losing its prompt attribution —
+        # would pass every existing check.
+        #
+        # Deliberately split: a missing prompt_name FAILS (broken plumbing, our
+        # bug), while a null prompt_version only WARNS (the agent fell back to its
+        # local prompt string, which is the correct behaviour during a Langfuse
+        # outage). Coupling deploy success to a third party's availability would
+        # be a worse failure mode than the one this guards against.
+        run: |
+          kubectl port-forward -n agentify svc/agentify-backend 18080:8080 &
+          PF_PID=$!
+          for i in $(seq 1 4); do
+            sleep 5
+            curl -sf http://localhost:18080/health > /dev/null 2>&1 && break
+            echo "Waiting for port-forward... ($i/4)"
+          done
+
+          # Force a Tier-2 answer: a healthy service takes the Tier-1 fast path
+          # (ADR 0006), makes zero LLM calls, and correctly records no prompt.
+          curl -sS -X POST http://localhost:18080/api/query \
+            -H 'Content-Type: application/json' \
+            -d '{"question":"why is payment-worker crashing?","context":{"namespace":"payments","service":"payment-worker"}}' \
+            -o /tmp/provenance_query.json || true
+
+          curl -sS http://localhost:18080/admin/traces -o /tmp/traces.json || true
+          kill $PF_PID 2>/dev/null || true
+
+          python3 - <<'EOF'
+          import json, sys
+
+          try:
+              with open("/tmp/traces.json") as f:
+                  data = json.load(f)
+          except Exception as exc:
+              print(f"::warning::could not read /admin/traces ({exc}) — provenance not verified")
+              sys.exit(0)
+
+          traces = data if isinstance(data, list) else data.get("traces", data.get("items", []))
+          if not traces:
+              print("::warning::no traces returned — provenance not verified")
+              sys.exit(0)
+
+          # ListTraces returns newest first, so the first tier2 row is the query above.
+          tier2 = [t for t in traces if t.get("tier") == "tier2"]
+          if not tier2:
+              print("::warning::no Tier-2 trace found — provenance not verified")
+              sys.exit(0)
+
+          t = tier2[0]
+          name    = t.get("prompt_name") or ""
+          version = t.get("prompt_version")
+          print(f"newest Tier-2 trace: intent={t.get('intent')} "
+                f"prompt_name={name!r} prompt_version={version}")
+
+          if "prompt_name" not in t:
+              print("::error::traces carry no prompt_name field at all — running an image "
+                    "from before the provenance change, or the column was dropped")
+              sys.exit(1)
+
+          if not name:
+              print("::error::Tier-2 trace has an empty prompt_name — the agent answered "
+                    "without recording which prompt produced it. Prompt provenance is "
+                    "broken (ROADMAP P19 gap C).")
+              sys.exit(1)
+
+          if version is None:
+              print(f"::warning::{name} resolved to its LOCAL FALLBACK (prompt_version is "
+                    "null), so Langfuse is not serving this prompt. Answers are correct but "
+                    "unattributable, and Langfuse prompt edits are not reaching production.")
+          else:
+              print(f"OK — provenance recorded: {name} v{version}")
+          EOF
+
       - name: Validate Voyage AI + semantic memory
         # Smoke-tests the full P8 pipeline: embed endpoint availability,
         # a Tier-2 diagnose query, and confirmation that an embedding row
