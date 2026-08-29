@@ -21,7 +21,6 @@ import logging
 from typing import Any, Dict
 
 from k8fy.agent import K8fyAgent
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import CERT_AUDIT_PROMPT
 from k8fy.service_topology import resolve_service_clusters
 from k8fy.tools import TOOLS
@@ -37,7 +36,8 @@ class CertAuditSkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/cert-audit", CERT_AUDIT_PROMPT),
+            prompt_name="k8fy/cert-audit",
+            prompt_fallback=CERT_AUDIT_PROMPT,
             tools=_CERT_TOOLS,
         )
 

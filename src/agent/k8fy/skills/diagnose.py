@@ -34,7 +34,6 @@ import logging
 from typing import Any, Dict, List
 
 from k8fy.agent import ADVISOR_MODEL, DIAGNOSE_REASONING_SCHEMA, K8fyAgent
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import DIAGNOSE_PROMPT
 from k8fy.service_topology import fetch_service_dependencies, mine_service_dependencies, resolve_service_clusters
 from k8fy.tools import TOOLS
@@ -77,7 +76,8 @@ class DiagnoseSkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/diagnose", DIAGNOSE_PROMPT),
+            prompt_name="k8fy/diagnose",
+            prompt_fallback=DIAGNOSE_PROMPT,
             tools=_DIAGNOSE_TOOLS,
             output_schema=DIAGNOSE_REASONING_SCHEMA,
         )

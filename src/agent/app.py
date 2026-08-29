@@ -11,7 +11,9 @@ import metrics
 from config.settings import get_settings
 from k8fy import dependency_miner
 from k8fy.agent import get_chat_agent, refresh_pricing_from_backend
+from k8fy import prompt_manager
 from k8fy.live_diagnostics import LIVE_DIAGNOSTIC_TOOLS
+from k8fy.prompts import ALL_PROMPTS
 from k8fy.skills.router import get_skill_router
 from k8fy.tools import process_tool_call
 from models.response import AgentResponse, QueryRequest
@@ -46,6 +48,9 @@ async def startup_event():
     refresh_pricing_from_backend(settings.backend_url)
     get_skill_router()
     get_chat_agent()  # warm the chat agent singleton
+    # Warm the Langfuse prompt cache so the first real request never waits on a
+    # cold-cache fetch. Prompts are resolved per request from here on.
+    prompt_manager.prefetch(ALL_PROMPTS)
     logger.info(f"Skill router initialized with model: {settings.claude_model}")
 
     global _dependency_miner_task

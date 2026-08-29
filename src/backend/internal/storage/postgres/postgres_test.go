@@ -1013,3 +1013,88 @@ func mustStore(t *testing.T, cs *CurrentState, pod, entity string, payload map[s
 		t.Fatalf("store %s: %v", entity, err)
 	}
 }
+
+// TestTracePromptProvenance covers the prompt_name / prompt_version columns
+// added for the Evaluator Agent's evidence trail (ROADMAP P19 gap C), and with
+// them the previously untested scanTrace path.
+//
+// The nil case is the one that matters: prompt_version is NULL for Tier-1
+// answers (no LLM call) and whenever the agent fell back to its local prompt
+// string, and it must read back as a nil *int rather than 0 — "no version" and
+// "version 0" mean different things to a proposal that cites a trace as
+// evidence.
+func TestTracePromptProvenance(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+
+	insert := func(id, promptName string, promptVersion *int) {
+		t.Helper()
+		if err := client.InsertTrace(ctx, TraceRecord{
+			ID: id, TraceID: id, Question: "is payment-worker healthy?",
+			Intent: "health_check", Namespace: "payments", Tier: "tier2",
+			Status: "healthy", Confidence: 0.9,
+			PromptName: promptName, PromptVersion: promptVersion,
+		}); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+
+	t.Run("a Langfuse-served prompt round-trips its name and version", func(t *testing.T) {
+		v := 7
+		insert("trace-versioned", "k8fy/health-check", &v)
+
+		got, err := client.GetTrace(ctx, "trace-versioned")
+		if err != nil {
+			t.Fatalf("GetTrace: %v", err)
+		}
+		if got.PromptName != "k8fy/health-check" {
+			t.Errorf("PromptName = %q, want k8fy/health-check", got.PromptName)
+		}
+		if got.PromptVersion == nil {
+			t.Fatal("PromptVersion = nil, want 7")
+		}
+		if *got.PromptVersion != 7 {
+			t.Errorf("PromptVersion = %d, want 7", *got.PromptVersion)
+		}
+	})
+
+	t.Run("a fallback or Tier-1 answer round-trips a NULL version as nil", func(t *testing.T) {
+		insert("trace-fallback", "", nil)
+
+		got, err := client.GetTrace(ctx, "trace-fallback")
+		if err != nil {
+			t.Fatalf("GetTrace: %v", err)
+		}
+		if got.PromptName != "" {
+			t.Errorf("PromptName = %q, want empty", got.PromptName)
+		}
+		if got.PromptVersion != nil {
+			t.Errorf("PromptVersion = %d, want nil", *got.PromptVersion)
+		}
+	})
+
+	t.Run("ListTraces carries provenance too", func(t *testing.T) {
+		found := map[string]*TraceRecord{}
+		traces, err := client.ListTraces(ctx, 100)
+		if err != nil {
+			t.Fatalf("ListTraces: %v", err)
+		}
+		for i := range traces {
+			found[traces[i].ID] = &traces[i]
+		}
+		versioned, ok := found["trace-versioned"]
+		if !ok {
+			t.Fatal("trace-versioned missing from ListTraces")
+		}
+		if versioned.PromptVersion == nil || *versioned.PromptVersion != 7 {
+			t.Errorf("listed PromptVersion = %v, want 7", versioned.PromptVersion)
+		}
+		fallback, ok := found["trace-fallback"]
+		if !ok {
+			t.Fatal("trace-fallback missing from ListTraces")
+		}
+		if fallback.PromptVersion != nil {
+			t.Errorf("listed PromptVersion = %d, want nil", *fallback.PromptVersion)
+		}
+	})
+}

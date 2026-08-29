@@ -1,7 +1,9 @@
 """K8fy agent: Claude-powered Kubernetes operations reasoning."""
 
+import functools
 import json
 import logging
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
@@ -10,16 +12,53 @@ from pydantic import ValidationError
 import metrics
 from config.claude_client import get_claude_client
 from config.settings import get_settings
-from k8fy.prompt_manager import get_prompt
+from k8fy.prompt_manager import ResolvedPrompt
+from k8fy.prompt_manager import resolve as resolve_prompt
 from k8fy.prompts import CHAT_STRUCTURE_PROMPT, CHAT_SYSTEM_PROMPT, SYSTEM_PROMPT
 from k8fy.live_diagnostics import LIVE_DIAGNOSTIC_TOOLS
 from k8fy.tools import TOOLS, process_tool_call
 from models.response import AgentResponse, ReasoningOutput, ToolCall
 
-_DEFAULT_SYSTEM_PROMPT = get_prompt("k8fy/system", SYSTEM_PROMPT)
 _DEFAULT_TOOLS = TOOLS
-_CHAT_SYSTEM_PROMPT = get_prompt("k8fy/chat", CHAT_SYSTEM_PROMPT)
-_CHAT_STRUCTURE_PROMPT = get_prompt("k8fy/chat-structure", CHAT_STRUCTURE_PROMPT)
+
+# Prompts are resolved per request, not here. Resolving at import froze every
+# prompt for the life of the process, so promoting a Langfuse "production" label
+# had no effect until the pod restarted (ROADMAP P19 gap B).
+
+# The prompt resolved for the in-flight request. A ContextVar rather than an
+# attribute on `self` because K8fyAgent instances are process-wide singletons
+# (see SkillRouter): per-request state on the instance would race across
+# concurrent queries.
+_active_prompt: ContextVar[Optional[ResolvedPrompt]] = ContextVar(
+    "k8fy_active_prompt", default=None
+)
+
+
+def _with_system_prompt(method):
+    """Resolve this agent's system prompt for the request, then stamp provenance.
+
+    Wraps the reasoning entry points so that (a) the prompt is fetched once per
+    request — cheap, since the Langfuse SDK serves from a client-side cache and
+    revalidates in the background — and (b) the returned AgentResponse carries
+    the prompt name/version that produced it, which is what lets a trace be
+    attributed to a specific prompt version.
+    """
+
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        rp = self._resolve_system_prompt()
+        token = _active_prompt.set(rp)
+        try:
+            result = await method(self, *args, **kwargs)
+        finally:
+            _active_prompt.reset(token)
+        if isinstance(result, AgentResponse):
+            result.prompt_name = rp.name
+            result.prompt_version = rp.version
+        return result
+
+    return wrapper
+
 
 # Model pair for the advisor/executor strategy.
 # Executor (EXECUTOR_MODEL) is the primary model — handles all tool calls cheaply.
@@ -329,24 +368,54 @@ class K8fyAgent:
 
     def __init__(
         self,
-        system_prompt: str = _DEFAULT_SYSTEM_PROMPT,
+        system_prompt: Optional[str] = None,
         tools: List[Dict[str, Any]] = _DEFAULT_TOOLS,
         advisor_model: Optional[str] = None,
         executor_model: Optional[str] = None,
         output_schema: Optional[Dict[str, Any]] = None,
+        prompt_name: str = "k8fy/system",
+        prompt_fallback: Optional[str] = None,
     ):
+        """Configure the agent.
+
+        Pass `prompt_name` + `prompt_fallback` (the normal case, used by every
+        skill) to resolve that Langfuse prompt on each request, falling back to
+        the local string. Pass `system_prompt` instead to pin an exact string and
+        skip Langfuse entirely — for tests and callers that supply their own text.
+        """
         self.client: AsyncAnthropic = get_claude_client()
         self.model = settings.claude_model
         self.max_tokens = settings.claude_max_tokens
         self.effort = settings.claude_effort
         self.backend_url = settings.backend_url
         self.max_iterations = settings.agent_max_tool_iterations
-        self._system_prompt = system_prompt
+        self._static_system_prompt = system_prompt
+        self._prompt_name = prompt_name
+        self._prompt_fallback = prompt_fallback or SYSTEM_PROMPT
         self._tools = tools
         self._output_schema = output_schema or REASONING_SCHEMA
         # Advisor/executor mode (advisor_model=None → single-model path).
         self.advisor_model = advisor_model
         self.executor_model = executor_model or self.model
+
+    def _resolve_system_prompt(self) -> ResolvedPrompt:
+        """Resolve this agent's system prompt for the current request."""
+        if self._static_system_prompt is not None:
+            # Caller pinned an exact string; there is no Langfuse version to
+            # attribute an answer to.
+            return ResolvedPrompt(name=self._prompt_name, text=self._static_system_prompt)
+        return resolve_prompt(self._prompt_name, self._prompt_fallback)
+
+    def _system_text(self) -> str:
+        """System prompt text for the in-flight request.
+
+        Reads the ContextVar set by @_with_system_prompt; resolves directly if a
+        method is called outside that wrapper (e.g. from a test).
+        """
+        rp = _active_prompt.get()
+        if rp is None:
+            rp = self._resolve_system_prompt()
+        return rp.text
 
     async def reason(
         self, intent: str, data: Dict[str, Any], context: Optional[Dict[str, Any]] = None
@@ -362,6 +431,7 @@ class K8fyAgent:
     # Single-model path (original behaviour, unchanged)
     # ------------------------------------------------------------------
 
+    @_with_system_prompt
     async def _reason_single(
         self, intent: str, data: Dict[str, Any], context: Dict[str, Any]
     ) -> AgentResponse:
@@ -374,7 +444,7 @@ class K8fyAgent:
         # them together (tools render before system). Note: the prompt is small,
         # so on Opus 4.8 (4096-token cache minimum) it may not actually cache
         # until it grows — the markers are correct and cost nothing meanwhile.
-        system = [{"type": "text", "text": self._system_prompt, "cache_control": {"type": "ephemeral"}}]
+        system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
         messages: List[Dict[str, Any]] = [
             {"role": "user", "content": self._build_user_message(intent, data, context)}
         ]
@@ -457,6 +527,7 @@ class K8fyAgent:
     # Advisor/executor path — built-in advisor_20260301 server-side tool
     # ------------------------------------------------------------------
 
+    @_with_system_prompt
     async def _reason_advisor_executor(
         self, intent: str, data: Dict[str, Any], context: Dict[str, Any]
     ) -> AgentResponse:
@@ -481,7 +552,7 @@ class K8fyAgent:
         """
         # Timing guidance must be prepended before the skill prompt so the executor
         # knows when to call the advisor.
-        advisor_system_text = _ADVISOR_TIMING_GUIDANCE + "\n\n" + self._system_prompt
+        advisor_system_text = _ADVISOR_TIMING_GUIDANCE + "\n\n" + self._system_text()
         system = [{"type": "text", "text": advisor_system_text, "cache_control": {"type": "ephemeral"}}]
 
         # Soft-limit on advisor output length (docs: ask for ~80% of true ceiling).
@@ -611,6 +682,7 @@ class K8fyAgent:
         """Call one tool against the backend and return its result dict."""
         return await process_tool_call(tool_name, args, self.backend_url)
 
+    @_with_system_prompt
     async def _reason_pattern_a(
         self,
         intent: str,
@@ -632,7 +704,7 @@ class K8fyAgent:
         Cost profile: N parallel backend fetches + exactly 1 Claude call.
         """
         merged = {**data, **prefetched}
-        system = [{"type": "text", "text": self._system_prompt, "cache_control": {"type": "ephemeral"}}]
+        system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
         # Append a direct instruction so Claude doesn't wait for tool calls
         # that will never come.
         user_content = (
@@ -676,6 +748,7 @@ class K8fyAgent:
     # Multi-turn chat path (free-form, no JSON schema constraint)
     # ------------------------------------------------------------------
 
+    @_with_system_prompt
     async def reason_chat(
         self,
         messages: List[Dict[str, Any]],
@@ -694,7 +767,7 @@ class K8fyAgent:
         if context is None:
             context = {}
 
-        system = [{"type": "text", "text": self._system_prompt, "cache_control": {"type": "ephemeral"}}]
+        system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
         chat_messages = list(messages)  # copy so we can append tool results
         tool_calls_made: List[ToolCall] = []
         total_in_tok = total_out_tok = total_cache_write = total_cache_read = 0
@@ -793,7 +866,11 @@ class K8fyAgent:
             response = await self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
-                system=[{"type": "text", "text": _CHAT_STRUCTURE_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                system=[{
+                    "type": "text",
+                    "text": resolve_prompt("k8fy/chat-structure", CHAT_STRUCTURE_PROMPT).text,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 output_config={"format": {"type": "json_schema", "schema": CHAT_REASONING_SCHEMA}},
                 messages=[{
                     "role": "user",
@@ -1068,5 +1145,7 @@ def get_chat_agent() -> K8fyAgent:
     """Return the agent used for multi-turn chat (chat system prompt, all tools)."""
     global _chat_agent
     if _chat_agent is None:
-        _chat_agent = K8fyAgent(system_prompt=_CHAT_SYSTEM_PROMPT)
+        _chat_agent = K8fyAgent(
+            prompt_name="k8fy/chat", prompt_fallback=CHAT_SYSTEM_PROMPT
+        )
     return _chat_agent

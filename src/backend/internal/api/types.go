@@ -35,6 +35,8 @@ type TraceResponse struct {
 	CacheCreationInputTokens int64     `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64     `json:"cache_read_input_tokens"`
 	EstimatedCostUSD         float64   `json:"estimated_cost_usd"`
+	PromptName               string    `json:"prompt_name"`
+	PromptVersion            *int      `json:"prompt_version"`
 }
 
 // MetricsSummaryResponse is returned by GET /admin/metrics/summary.
@@ -68,6 +70,8 @@ func traceToResponse(t pgstore.TraceRecord) TraceResponse {
 		CacheCreationInputTokens: t.CacheCreationInputTokens,
 		CacheReadInputTokens:     t.CacheReadInputTokens,
 		EstimatedCostUSD:         t.EstimatedCostUSD,
+		PromptName:               t.PromptName,
+		PromptVersion:            t.PromptVersion,
 	}
 }
 

@@ -25,7 +25,6 @@ import logging
 from typing import Any, Dict, List
 
 from k8fy.agent import K8fyAgent, HEALTH_REASONING_SCHEMA
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import HEALTH_SKILL_PROMPT
 from k8fy.service_topology import resolve_service_clusters
 from k8fy.tools import TOOLS
@@ -43,7 +42,8 @@ class HealthSkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/health-check", HEALTH_SKILL_PROMPT),
+            prompt_name="k8fy/health-check",
+            prompt_fallback=HEALTH_SKILL_PROMPT,
             tools=_HEALTH_TOOLS,
             output_schema=HEALTH_REASONING_SCHEMA,
         )

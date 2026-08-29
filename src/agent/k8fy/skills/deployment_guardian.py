@@ -10,7 +10,6 @@ only persists a proposal when the response's `degraded` field is true.
 from typing import Any, Dict
 
 from k8fy.agent import K8fyAgent, REMEDIATION_REASONING_SCHEMA
-from k8fy.prompt_manager import get_prompt
 from k8fy.prompts import DEPLOYMENT_GUARDIAN_PROMPT
 from models.response import AgentResponse
 
@@ -20,7 +19,8 @@ class DeploymentGuardianSkill(K8fyAgent):
 
     def __init__(self) -> None:
         super().__init__(
-            system_prompt=get_prompt("k8fy/deployment-guardian", DEPLOYMENT_GUARDIAN_PROMPT),
+            prompt_name="k8fy/deployment-guardian",
+            prompt_fallback=DEPLOYMENT_GUARDIAN_PROMPT,
             tools=[],
             output_schema=REMEDIATION_REASONING_SCHEMA,
         )

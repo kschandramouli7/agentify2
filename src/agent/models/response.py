@@ -28,6 +28,12 @@ class AgentResponse(BaseModel):
     cache_read_input_tokens: int = 0      # tokens served from prompt cache
     estimated_cost_usd: float = 0.0
 
+    # Which prompt produced this answer (spec 004 provenance, ROADMAP P19 gap C).
+    # prompt_version is None when the local fallback string was used — there is
+    # no Langfuse version to attribute the answer to in that case.
+    prompt_name: Optional[str] = None
+    prompt_version: Optional[int] = None
+
 
 class QueryRequest(BaseModel):
     """Request to the agent for reasoning."""

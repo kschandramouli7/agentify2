@@ -44,7 +44,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029); use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
-| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Not started — blocked on two prerequisites (skills loading prompts from Langfuse; `traces` recording which prompt version answered a query)** — see below | — |
+| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 4 smaller gaps. A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert) and C (no prompt provenance on `traces`) are closed; D (a prompt change still reaches production through a gate-less path) stays open as part of P19 step 3, reframed 2026-08-30 to gate-before-promote and split into D1 (version-pinned evaluation — the real blocker, useful independently of P19) and D2 (webhook → `repository_dispatch` → `experiment-action` wiring) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 
 ---
 
@@ -1308,32 +1308,235 @@ fixed dataset was never written to catch. Complementary, not overlapping.
    attached, human approves" is non-negotiable here, not a v1 shortcut to
    revisit later.
 
-**Prerequisites — not yet true today, both block this item from starting:**
-- **Skills don't load prompts from Langfuse at all.** `_DEFAULT_SYSTEM_PROMPT`,
-  `CHAT_STRUCTURE_PROMPT`, and every other skill prompt
-  (`src/agent/k8fy/agent.py`, `prompts.py`) are hardcoded Python string
-  constants today — Langfuse is wired for tracing/scoring only. Wiring
-  skills to fetch a labeled prompt version from Langfuse at request time
-  (with the current hardcoded string kept as the fallback/seed content, not
-  deleted) is foundational work this item depends on, not an optional
-  nice-to-have.
-- **`traces` doesn't record which prompt version answered a query.** Without
-  a `prompt_version`/`prompt_name` column, a proposed prompt fix has no way
-  to point back at "this version produced this failure" — needed for the
-  Evaluator Agent's evidence to mean anything.
+**Prerequisite re-check against the code (2026-08-29) — the original proposal
+got the first one wrong:**
 
-**Explicitly deferred, tune during rollout rather than block on:** exact
-sample rate, judge model choice, and a cost cap per evaluation cycle — real
-decisions, but tuning knobs, not architecture. Also deferred: any notion of
-the Evaluator Agent proposing changes to *code* beyond pre-fetch signal
-selection (e.g. rewriting a skill's Python control flow) — out of scope
-until the two narrower proposal types above are proven out.
+- ~~**Skills don't load prompts from Langfuse at all.**~~ **Already done — this
+  was never a blocker.** `src/agent/k8fy/prompt_manager.py` implements
+  `get_prompt(name, fallback)` (fetches the `production` label, silently falls
+  back to the local string on any error), and **11** prompt names already route
+  through it: `k8fy/system`, `k8fy/chat`, `k8fy/chat-structure`
+  (`agent.py:19-22`) plus `k8fy/health-check`, `k8fy/cert-audit`,
+  `k8fy/change-history`, `k8fy/restart-trend`, `k8fy/diagnose`,
+  `k8fy/vault-cert`, `k8fy/incident-responder`, `k8fy/deployment-guardian`
+  (each skill's `__init__`). No prompt-loading migration is needed. What the
+  original wording *hid* are four narrower gaps (A-D below).
+- **`traces` doesn't record which prompt version answered a query.** Confirmed
+  still true (`traces` DDL, `postgres.go:123-141`). Now gap C, with a sub-gap
+  the original didn't see.
 
-**Not started** — this is a design item, not yet a plan or code. Write an
-ADR when someone picks this up to implement (same pattern P15/P18 followed:
-ADR written at implementation time, not at proposal time), covering at
-minimum the Langfuse prompt-loading migration and the sampling/judge
-design above.
+**The four real gaps — all small, each blocking for a different reason:**
+
+**A — three fetched prompts are never seeded into Langfuse. ✅ done 2026-08-29.**
+`migrate_prompts_to_langfuse.py`'s `PROMPTS` list covers 8 names, but
+`k8fy/vault-cert`, `k8fy/incident-responder`, and `k8fy/deployment-guardian`
+are fetched at runtime and never published — so those three skills sit on
+permanent silent fallback. Blocking because the Evaluator Agent cannot propose
+a new *version* of a prompt that has no version 1, and whoever creates version
+1 later silently switches those skills off the hardcoded string they have
+actually been running.
+
+*Fixed:* the seeded set is now `k8fy.prompts.ALL_PROMPTS` — one registry that both
+the runtime prefetch (`app.py` startup) and the seeding script read, so a prompt
+cannot be fetched at runtime yet missed by seeding. The three names are in it.
+`migrate_prompts_to_langfuse.py` also **no longer clobbers**: it defaults to
+seed-only-if-absent (it previously re-pushed every prompt and moved the
+`production` label on every run, which would have silently reverted any
+Langfuse-side edit), with `--force` and per-name selection for deliberate
+overwrites.
+
+**B — prompts are frozen at process start, so promoting a label changes
+nothing. ✅ done 2026-08-29.** `get_prompt()` is called exactly once per process: at module import
+for `agent.py`'s three constants, and once inside each skill's `__init__` via
+the process-wide `SkillRouter` singleton (`skills/router.py:64-70`). The
+Langfuse SDK's ~60 s prompt cache is therefore never consulted a second time.
+`prompt_manager.py`'s own docstring claims "updates made in the Langfuse UI are
+picked up without a service restart" — **false as the function is used today**;
+a live code-vs-doc contradiction that exists independently of P19. Blocking
+because P19's whole prompt path assumes a human flipping `production` takes
+effect: today it takes effect on the next pod restart, which makes both
+promotion *and rollback* untrustworthy.
+
+*Fixed:* resolution is now per request. `prompt_manager.resolve()` returns a
+`ResolvedPrompt(name, text, version, is_fallback)`; `K8fyAgent` takes
+`prompt_name` + `prompt_fallback` instead of a pre-resolved string and resolves
+inside a `@_with_system_prompt` wrapper on each reasoning entry point. This is
+cheap because the Langfuse SDK caches client-side with **stale-while-revalidate**
+— a fresh cache returns with no network call; an expired one returns the stale
+value immediately and refreshes in the background (verified against Langfuse's
+caching docs; default TTL 60 s) — and `app.py` prefetches at startup so the first
+request never pays a cold-cache fetch. Per-request state lives in a `ContextVar`,
+not on `self`: agent instances are process-wide singletons via `SkillRouter`, so
+instance state would race across concurrent queries. The false docstring claim is
+gone, replaced by a note recording what the old behaviour actually was.
+
+*One regression the change introduced, found by measuring rather than reasoning,
+and fixed:* per-request resolution means a Langfuse **outage** is paid per
+request, not once at startup — and because `resolve()` is synchronous inside
+async handlers, each failed fetch blocks the event loop for every concurrent
+request. Measured with the API blackholed: **0.9–3.1 s per call**. `resolve()`
+now keeps a short negative cache (`FAILURE_COOLDOWN_SECONDS = 60`, matching the
+SDK's own TTL so recovery and label promotion are still picked up within a
+minute): one attempt per prompt per window, then immediate fallback. Re-measured
+after the fix: 3.2 s once, then 0.0 ms. Side benefit — the agent test suite got
+3.4× faster (27 s → 7.9 s), because CI's placeholder Langfuse creds were
+provoking a failed fetch on every resolve.
+
+**C — no prompt provenance on a trace. ✅ done 2026-08-29.** Add `prompt_name` + `prompt_version`
+to `traces`; also return version metadata from `get_prompt()`, which today
+discards `prompt.version` by returning `.compile()` alone — so the version is
+not even available at the call site to record. Blocking because "this version
+produced this failure" is the entire evidentiary basis of a proposal.
+
+*Fixed:* `traces` gains `prompt_name TEXT` + `prompt_version INT` (nullable) via
+the table's existing idempotent `ALTER ... ADD COLUMN IF NOT EXISTS` pattern,
+plumbed the same way `estimated_cost_usd` already was: Python `AgentResponse` →
+`api.AgentResponse` → `logTrace` → `TraceRecord` → insert, plus
+`traceSelectCols`/`scanTrace` and the `TraceResponse` API surface.
+`prompt_version` is deliberately **nullable, not defaulted to 0** — NULL means
+"Tier-1, or the agent fell back to its local string", a different claim from
+"version 0", and a proposal citing a trace as evidence must tell them apart.
+Covered by `TestTracePromptProvenance` against real Postgres, which also closes
+the previously untested `scanTrace` path.
+
+**D — a prompt change reaches production through a gate-less path.** *(still
+open. Split into D1/D2 below — D1 is the real work and is independently
+useful; D2 is a few hours once D1 exists.)*
+
+agentify has two independent ways to change how it behaves, and only one is
+gated:
+
+| Change surface | How it ships | Eval gate today |
+|---|---|---|
+| Code (skills, pre-fetch, routing) | git push → `02-deploy.yml` → `run_evals.py --pass-threshold 0.85` | **yes** ([ADR 0019](decisions/0019-eval-harness-as-ci-gate.md)) |
+| Prompt text | move the `production` label in the Langfuse UI | **none — nothing fires** |
+
+`02-deploy.yml` triggers on `workflow_dispatch` and on pushes to `main` under
+`src/**`, `infra/kubernetes/**`, or the workflow file. A label move touches **no
+git object**, so there is no workflow to run. Tolerable while prompt edits are
+rare and manual; not tolerable once P19 makes new prompt versions routine.
+
+**Closing gap B sharpened this**, and that is worth stating plainly: a label
+move now reaches live traffic within ~60 s, where before it needed a pod
+restart that tended to coincide with a deploy. Making promotion work as
+documented also made an ungated promotion effective immediately.
+
+**Design correction (2026-08-30).** This item previously read: "a label
+promotion triggers `run_evals.py` against that specific version, and
+auto-reverts the label if the score falls below threshold." That is
+promote-then-revert, and it is the wrong shape — a bad prompt still reaches
+100 % of live traffic for the duration of the eval run (currently minutes, as a
+deploy-job step). Langfuse's own documented prompt-CI/CD pattern inverts it:
+the candidate carries a `staging` label, CI validates *that* label, and only
+then does an approver move `production`. **Gate before promote.** Auto-revert
+is the backstop for what slips past, not the primary control.
+
+**D1 — version-pinned evaluation (the blocker, and not visible from the CI
+layer).** **Design decided 2026-08-30 in its own ADR:
+[ADR 0030](decisions/0030-version-pinned-prompt-evaluation.md)** — a dedicated
+bearer-authenticated `POST /admin/eval/query` that reuses the real deployed
+handler and differs only in which prompt version the agent resolves; the
+unauthenticated `/api/query` gains nothing. Proposed, not built. `run_evals.py` POSTs to `{backend_url}/api/query`, i.e. it measures
+the **live deployed system** and has no concept of a prompt version: it can
+only ever score "whatever `production` currently points at". So "evaluate the
+candidate version" is *not expressible with today's harness*, and D is not the
+CI-plumbing task it looks like — it needs a product change first. Two shapes:
+
+  - **(a) Version override on the query path** — `/api/query` accepts an
+    optional prompt label/version, threaded through to `resolve()`. Cleanest
+    for evals, but it adds a "make the agent use arbitrary prompt X" lever to a
+    live API surface; per [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md)'s
+    reasoning about prompt-injection routes to unattended action, that lever
+    wants bearer auth and probably a non-prod-only guard.
+  - **(b) Out-of-band harness** — construct the skills in-process against the
+    candidate prompt, bypassing `/api/query`. Adds no production surface, but
+    stops exercising the real deployed path, which was ADR 0019's entire point.
+
+  ADR 0030 chose **neither verbatim**: (a) is rejected for putting a
+  behaviour-substitution lever on an unauthenticated endpoint (ADR 0020 rule 5),
+  (b) for dropping routing/tiering/governance out of coverage — which is the
+  property ADR 0019 exists to have. The decision is (a)'s "reuse the real
+  deployed path" with (b)'s "add no public surface", via a separate
+  authenticated route. It also records a trap worth knowing: eval traffic must
+  be flagged and **excluded from P19's sampler**, or the Evaluator Agent judges
+  its own synthetic traffic and partly learns from its own test set. Note D1 is
+  **worth building regardless of P19**: a prompt A/B test, a canary, and
+  per-version quality comparison all need the same capability.
+
+**D2 — the wiring (straightforward once D1 exists).** Langfuse ships every
+primitive; nothing bespoke is needed:
+
+  - **Webhooks on prompt-version events** (`created` / `updated` / `deleted`).
+    `updated` **fires on label changes**, emitting two events — one for the
+    version gaining the label, one for the version losing it — which is both
+    the promotion trigger and a rollback audit signal. Payloads are
+    HMAC-SHA256 signed (`x-langfuse-signature`); the handler must be idempotent
+    and return 2xx, as Langfuse retries with exponential backoff.
+  - **GitHub `repository_dispatch`** from that webhook, so a `prompt-gate.yml`
+    workflow runs without anyone leaving the Langfuse UI.
+  - **`langfuse/experiment-action`** (v1.0.6 as of July 2026) — runs an
+    experiment script against a named dataset, posts scores as a PR comment,
+    fails the job on regression. Point it at the existing `k8fy-regression`
+    dataset rather than building a second one.
+  - **Protected labels** — admins/owners can mark `production` so `member` /
+    `viewer` roles cannot move it. This is what makes P19's "a human approves"
+    structurally enforced rather than a convention.
+
+**Costs and dependencies to know before committing:**
+  - **Protected labels are a paid tier** (Pro + Teams add-on, Enterprise, or
+    self-hosted EE). Without it, "only approvers move `production`" is
+    honour-system only. Audit logs (who moved which label, with before/after
+    state) are Enterprise / self-hosted-EE.
+  - Langfuse ships **no built-in approval workflow and no traffic splitting**
+    (as of July 2026). A stage-4 canary would be percentage logic in our own
+    code.
+  - Firing a full eval run on every prompt-version creation is a recurring
+    bill in both money and minutes — the same tunable-knob problem P19 already
+    flags for judge sampling, not a new one.
+
+**Sequencing (agreed 2026-08-29):**
+
+1. ~~**Close gaps A, B, C.**~~ **✅ done 2026-08-29** — see each gap above.
+   Shipped on its own merit, independent of whether P19 proceeds: Langfuse prompt
+   editing now actually works as documented and the code-vs-doc contradiction is
+   gone. **Newly surfaced while doing it, not yet actioned:** `requirements.txt`
+   pins `langfuse>=2.0.0` with **no upper bound**, while the Langfuse-touching CI
+   steps install `langfuse>=2.0.0,<3.0.0`. The server-URL kwarg was renamed across
+   that boundary (v2 `host=`, v3+ `base_url=`), so prod and CI can resolve
+   different majors of an API-breaking dependency. `prompt_manager` and the seeding
+   script now accept either kwarg, so nothing is broken today — but the unpinned
+   major deserves closing out as its own small item (a v4 upgrade would
+   additionally touch `scripts/run_evals.py` and `seed_eval_dataset.py`, written
+   against the v2 dataset API). Observed empirically while testing: a fresh
+   install of `langfuse>=2.0.0` resolved to **3.7.0** (on Python 3.9; 3.11 would
+   likely pull v4), i.e. the runtime really is on a v3+ SDK where `base_url=` is
+   correct — while CI's `<3.0.0` pin puts the eval scripts on v2 where `host=` is
+   correct. Both work today only because each side happens to use the right
+   kwarg for the major it gets.
+2. **Ship the sampler + judge in dry-run mode.** Go-side ticker (reuse P4c's
+   `time.NewTicker` sweep shape in `internal/api/investigator.go` — do not add
+   a second scheduler) → Python `POST /evaluator/run` → cheap-tier judge call
+   graded against each trace's own recorded `sources`/`tool_calls`. Log
+   verdicts and would-be proposals; create nothing in Langfuse or GitHub yet.
+   Mirrors how P4c earned trust read-only before P13 added remediation.
+   **Gate before leaving dry-run:** hand-label ~20 judge verdicts (the way P7
+   built its golden set) and track judge-agreement-rate as its own metric. A
+   cheap judge grading a stronger model's output is the main correctness risk
+   in this design — a miscalibrated judge emits confidently-wrong PRs and
+   prompt versions, which is *worse* than today's silence because it arrives
+   looking reviewed.
+3. **Wire the two promotion paths** (Langfuse prompt version → `staging` label;
+   GitHub PR for pre-fetch/code changes), then close **D1 before D2** — the
+   version-pinned eval capability first, the webhook →
+   `repository_dispatch` → `experiment-action` gate second. Gate before
+   promote: the Evaluator Agent labels candidates `staging` and never touches
+   `production`.
+4. **Write the ADR at this point**, not before — same pattern P15/P18 followed.
+   It should cover the sampling/judge design, the dry-run→live gate in step 2,
+   and gap D's promotion trigger. The prompt-loading migration the original
+   proposal wanted an ADR for does not exist as a task; gaps A-C replace it.
+
+**Not started.** Step 1 is the entry point.
 
 ---
 
