@@ -13,21 +13,31 @@
 # precedent applies with more force to prompts than to a pod restart, because a
 # prompt reshapes every future query for every tenant rather than one pod once.
 #
-# TRIGGERING — one manual setup step in Langfuse, which cannot be automated from
-# this repo:
-#   Langfuse → Settings → Webhooks → new webhook
-#     events : prompt version created, prompt version updated
-#              ("updated" covers label changes, and fires twice: once for the
-#               version gaining the label and once for the version losing it)
-#     target : https://api.github.com/repos/<owner>/<repo>/dispatches
-#     method : POST
-#     headers: Authorization: Bearer <PAT with "Contents: read and write">
-#              Accept: application/vnd.github+json
-#     body   : {"event_type":"langfuse-prompt-update","client_payload":{"name":"{{name}}","version":"{{version}}","labels":"{{labels}}"}}
+# TRIGGERING — correction (2026-08-30). An earlier version of this comment said
+# to point a Langfuse webhook straight at GitHub's /dispatches endpoint. **That
+# does not work**, and the reason is worth recording so nobody retries it:
 #
-# Langfuse signs webhook payloads (HMAC-SHA256, x-langfuse-signature) and retries
-# with exponential backoff, so the receiver must be idempotent. GitHub's
-# dispatch endpoint is, since re-dispatching just re-runs the gate.
+#   - GitHub's POST /repos/{owner}/{repo}/dispatches REQUIRES a JSON body
+#     containing `event_type`; without it the request is rejected (422).
+#   - Langfuse webhooks send a FIXED payload — {id, timestamp, type, apiVersion,
+#     action, prompt{name, version, labels, ...}} — and the automation UI lets
+#     you configure only the URL and extra STATIC headers. There is no body
+#     template, so `event_type` cannot be added.
+#
+# So Langfuse cannot invoke repository_dispatch directly. Two workable options:
+#
+#   A. Run this gate by hand (workflow_dispatch) when you publish a candidate.
+#      Zero infrastructure, and adequate while prompt edits are human-initiated
+#      and occasional. This is the supported path today.
+#
+#   B. Put a tiny translator in front, if real-time gating is wanted: a Lambda
+#      Function URL (or any HTTPS endpoint) that verifies the
+#      x-langfuse-signature HMAC-SHA256, then calls GitHub /dispatches with
+#      {"event_type":"langfuse-prompt-update","client_payload":{"name":…,
+#      "version":…,"labels":…}} taken from the Langfuse payload. It must return
+#      2xx and be idempotent, because Langfuse retries with exponential backoff.
+#      The repository_dispatch trigger below is already wired for that payload,
+#      so option B needs no change here.
 #
 # workflow_dispatch is kept so the gate can be run by hand without a webhook —
 # which is also how to use it before the webhook above exists.

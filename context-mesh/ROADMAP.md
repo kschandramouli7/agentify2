@@ -1483,10 +1483,16 @@ which switch it from `/api/query` to `/admin/eval/query`. The workflow **never
 promotes anything** — a pass is evidence for a human moving the `production`
 label, per ADR 0020's precedent.
 
-**Still manual, and cannot be automated from this repo:** creating the Langfuse
-webhook that fires `repository_dispatch` (`langfuse-prompt-update`). The exact
-event selection, target URL, headers and body are documented in the workflow's
-header comment. Until it exists the gate runs via `workflow_dispatch`.
+**Correction (2026-08-30): Langfuse cannot trigger this gate directly.** The
+first version of this item assumed a Langfuse webhook could POST to GitHub's
+`/dispatches` endpoint. It cannot: GitHub requires `event_type` in the body, and
+Langfuse sends a **fixed** payload with only the URL and extra *static* headers
+configurable — there is no body template, so `event_type` cannot be supplied.
+Two options: run the gate by hand via `workflow_dispatch` (zero infrastructure,
+adequate while prompt edits are human-initiated — the supported path today), or
+put a small signature-verifying translator in front (Lambda Function URL) that
+calls `/dispatches` with the right body. The `repository_dispatch` trigger is
+already wired for the latter.
 `EVAL_AUTH_TOKEN` must also be set to the same value in the backend deployment
 and the repo's Actions secrets, or the gate gets a 401 — empty in both leaves
 the endpoint open, which is dev-only.
