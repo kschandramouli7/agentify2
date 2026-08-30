@@ -70,6 +70,21 @@ spec:
           value: "agentify_dev_logs"
         - name: ATHENA_TABLE
           value: "pod_logs"
+        # Langfuse tracing of the reasoning path (ROADMAP P19 gap E). The code
+        # default is off (config/settings.py); enabling lives here so the flag is
+        # a deployment decision, not a code one, and so tests and local dev stay
+        # untraced.
+        #
+        # NOTE ON EGRESS: with this on, the agent sends reasoning inputs and
+        # outputs — including the operator's free-text question and the full chat
+        # history — to Langfuse (US region). ADR 0007's redaction gate applies at
+        # the backend->agent boundary, not to what the agent traces, and that ADR
+        # lists redacting the operator's free-text question as still open. This is
+        # the same class of payload already sent to Anthropic, but Langfuse is an
+        # additional destination. Set to "false" to stop it immediately; no code
+        # change needed.
+        - name: LANGFUSE_TRACING_ENABLED
+          value: "true"
         # ANTHROPIC_API_KEY from Secrets Manager secret agentify/dev/anthropic
         - name: ANTHROPIC_API_KEY
           valueFrom:
