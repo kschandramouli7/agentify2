@@ -139,6 +139,84 @@ def test_sdk_failure_does_not_propagate(monkeypatch):
         span.update(output="the answer still happened")
 
 
+def test_body_exception_propagates_unchanged(monkeypatch):
+    """Regression guard for the bug that masked an Anthropic 401 in production.
+
+    The first version of observe() caught the exception thrown in at `yield` and
+    then yielded a second time. Python turns that into
+    "RuntimeError: generator didn't stop after throw()", which REPLACED the real
+    error — so a 401 invalid x-api-key surfaced as a meaningless message and the
+    agent's own logs were useless.
+
+    Tracing may swallow its own failures. It must never swallow, wrap, or replace
+    the caller's.
+    """
+    client = _FakeClient()
+    monkeypatch.setattr(tracing, "_enabled", True)
+    monkeypatch.setattr(tracing, "get_client", lambda: client)
+
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with tracing.observe("skill:diagnose", model="m"):
+            raise Boom("anthropic 401 invalid x-api-key")
+
+
+def test_body_exception_propagates_even_when_teardown_fails(monkeypatch):
+    """Teardown must not replace the body's exception either."""
+
+    class HostileExit:
+        def __enter__(self):
+            return _Span()
+
+        def __exit__(self, *exc):
+            raise RuntimeError("langfuse exploded on exit")
+
+    class C:
+        def start_as_current_observation(self, **kw):
+            return HostileExit()
+
+    monkeypatch.setattr(tracing, "_enabled", True)
+    monkeypatch.setattr(tracing, "get_client", lambda: C())
+
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with tracing.observe("skill:diagnose", model="m"):
+            raise Boom("the real error")
+
+
+def test_body_exception_marks_the_span(monkeypatch):
+    """The SDK should be told the body failed, so the span records the error."""
+    seen = {}
+
+    class RecordingExit:
+        def __enter__(self):
+            return _Span()
+
+        def __exit__(self, *exc):
+            seen["exc_type"] = exc[0]
+            return False
+
+    class C:
+        def start_as_current_observation(self, **kw):
+            return RecordingExit()
+
+    monkeypatch.setattr(tracing, "_enabled", True)
+    monkeypatch.setattr(tracing, "get_client", lambda: C())
+
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with tracing.observe("skill:diagnose", model="m"):
+            raise Boom("x")
+
+    assert seen.get("exc_type") is Boom, "the in-flight exception must reach __exit__"
+
+
 def test_span_update_failure_is_swallowed(monkeypatch):
     class Hostile:
         def update(self, **kw):

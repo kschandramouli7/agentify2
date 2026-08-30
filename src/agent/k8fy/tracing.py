@@ -28,6 +28,7 @@ needs the conversation needs the conversation *there*.
 """
 
 import logging
+import sys
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
@@ -72,43 +73,70 @@ def observe(
     """Record one reasoning call as a Langfuse generation observation.
 
     Yields an object with `.update(output=..., usage_details=...)`. When tracing
-    is disabled — or anything at all goes wrong — yields a no-op so the caller's
-    code path is identical either way.
+    is disabled — or the observation cannot be started — yields a no-op so the
+    caller's code path is identical either way.
 
-    `prompt` should be the Langfuse prompt object, which links the observation to
-    the exact prompt version that produced the answer. That link is what makes
-    quality comparable across prompt versions.
+    **Exceptions raised by the wrapped body propagate untouched.** This is the
+    whole correctness requirement here, and the first version got it wrong: it
+    caught the exception thrown in at `yield` and then yielded a second time,
+    which Python reports as "generator didn't stop after throw()". That
+    RuntimeError then REPLACED the real error — in production it masked an
+    Anthropic 401 (invalid x-api-key) behind a meaningless message and cost real
+    debugging time. Setup failures are swallowed; body failures never are.
     """
     if not enabled():
         yield _NullSpan()
         return
 
     client = get_client()
-    try:
-        from langfuse import propagate_attributes
-    except Exception:  # pragma: no cover - SDK too old for propagate_attributes
-        propagate_attributes = None
 
+    # --- setup: failures here degrade to "no trace" -----------------------
+    span = None
+    span_cm = None
+    propagate_cm = None
     try:
         kwargs: Dict[str, Any] = {"as_type": "generation", "name": name, "model": model}
         if prompt is not None:
             kwargs["prompt"] = prompt
-        # session_id is propagated rather than set on the observation so that any
-        # nested observation inherits it too (SDK >= 4.14).
-        if session_id and propagate_attributes is not None:
-            with propagate_attributes(session_id=session_id):
-                with client.start_as_current_observation(**kwargs) as span:
-                    _safe_update(span, input=input, metadata=metadata)
-                    yield span
-                    return
-        with client.start_as_current_observation(**kwargs) as span:
-            _safe_update(span, input=input, metadata=metadata)
-            yield span
-            return
+        # session_id is propagated rather than set on the observation so nested
+        # observations inherit it too (SDK >= 4.14).
+        if session_id:
+            try:
+                from langfuse import propagate_attributes
+
+                propagate_cm = propagate_attributes(session_id=session_id)
+                propagate_cm.__enter__()
+            except Exception:  # SDK too old, or no propagate_attributes
+                propagate_cm = None
+        span_cm = client.start_as_current_observation(**kwargs)
+        span = span_cm.__enter__()
+        _safe_update(span, input=input, metadata=metadata)
     except Exception as exc:
-        # Tracing must never be the reason a query fails.
         logger.warning("Langfuse tracing failed for %r — continuing untraced: %s", name, exc)
+        _exit_quietly(span_cm, propagate_cm)
         yield _NullSpan()
+        return
+
+    # --- body: exactly one yield, and nothing catches what it raises ------
+    try:
+        yield span
+    finally:
+        # Pass the in-flight exception (if any) to the SDK so the span is marked
+        # errored, but never let teardown raise — that would replace the body's
+        # exception with a tracing one, which is the bug this whole docstring is
+        # about.
+        _exit_quietly(span_cm, propagate_cm, sys.exc_info())
+
+
+def _exit_quietly(span_cm, propagate_cm, exc_info=(None, None, None)) -> None:
+    """Close the observation and attribute contexts, swallowing teardown errors."""
+    for cm in (span_cm, propagate_cm):
+        if cm is None:
+            continue
+        try:
+            cm.__exit__(*exc_info)
+        except Exception as exc:
+            logger.debug("Langfuse context teardown failed (ignored): %s", exc)
 
 
 def _safe_update(span: Any, **fields: Any) -> None:
