@@ -26,6 +26,16 @@ SECRETS = {
     "EKS_CLUSTER_NAME":  "agentify-dev",
 }
 
+# Secrets whose values are NOT stored here because they are credentials, not
+# infrastructure identifiers. Set them in the repo's Actions secrets by hand.
+#
+#   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
+#       bootstrapped into AWS Secrets Manager by 04-bootstrap-langfuse-secret.yml
+#   EVAL_AUTH_TOKEN
+#       bearer token for POST /admin/eval/query (ADR 0030). Must match the
+#       backend deployment's EVAL_AUTH_TOKEN or 10-prompt-gate.yml gets a 401.
+#       Leaving both empty leaves the endpoint open — dev only.
+
 
 def _api(path: str, method: str = "GET", body: dict = None, token: str = "") -> dict:
     url = f"https://api.github.com{path}"

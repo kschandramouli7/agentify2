@@ -140,6 +140,9 @@ func main() {
 	// Build the API handler once; the router and the proactive investigation loop
 	// (ADR 0016) share it.
 	handler := api.NewHandler(orch, cfg.AgentServiceURL, redactor, integrationStore, traceStore, pricingStore, chatStore, remediationStore, remediationCfg, serviceDepsStore, clusterServiceStore, clusterIngressStore, clusterHealthStore, secretsMgr, cfg.IntegrationSecretsPrefix, logger)
+	// Version-pinned evaluation endpoint (ADR 0030). Set after construction
+	// because NewHandler already takes sixteen parameters.
+	handler.SetEvalAuthToken(cfg.EvalAuthToken)
 
 	// Proactive investigation loop (spec 009). Opt-in: requires INVESTIGATION_ENABLED
 	// and a webhook URL; otherwise the loop never starts.

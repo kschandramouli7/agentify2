@@ -55,6 +55,7 @@ type Config struct {
 	DeployGuardianSettleSeconds       int
 	RemediationProposalTTLMinutes     int
 	RemediationAuthToken              string
+	EvalAuthToken                     string
 
 	// Integration.Token Secrets Manager mode (ADR 0025). Empty (default)
 	// keeps every existing deployment's plaintext-token behavior unchanged;
@@ -106,6 +107,7 @@ func LoadFromEnv() (*Config, error) {
 		DeployGuardianSettleSeconds:       getEnvInt("DEPLOY_GUARDIAN_SETTLE_SECONDS", 30),
 		RemediationProposalTTLMinutes:     getEnvInt("REMEDIATION_PROPOSAL_TTL_MINUTES", 30),
 		RemediationAuthToken:              getEnv("REMEDIATION_AUTH_TOKEN", ""),
+		EvalAuthToken:                     getEnv("EVAL_AUTH_TOKEN", ""),
 
 		IntegrationSecretsPrefix: getEnv("INTEGRATION_SECRETS_PREFIX", ""),
 	}

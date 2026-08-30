@@ -1,0 +1,167 @@
+---
+# Prompt promotion gate (ROADMAP P19 gap D2, ADR 0030).
+#
+# Gate BEFORE promote. A prompt edit changes production behaviour the same way a
+# code change does, but 02-deploy.yml only fires on pushes to main under src/**
+# or infra/kubernetes/** — moving the `production` label in the Langfuse UI
+# touches no git object, so nothing ran and nothing was checked. Since prompts
+# are now resolved per request, a label move reaches live traffic within ~60s.
+#
+# This workflow scores a CANDIDATE version against the k8fy-regression dataset
+# while it is still on the `staging` label, so a human has evidence before
+# promoting. It does not promote anything itself: ADR 0020's approval-gate
+# precedent applies with more force to prompts than to a pod restart, because a
+# prompt reshapes every future query for every tenant rather than one pod once.
+#
+# TRIGGERING — one manual setup step in Langfuse, which cannot be automated from
+# this repo:
+#   Langfuse → Settings → Webhooks → new webhook
+#     events : prompt version created, prompt version updated
+#              ("updated" covers label changes, and fires twice: once for the
+#               version gaining the label and once for the version losing it)
+#     target : https://api.github.com/repos/<owner>/<repo>/dispatches
+#     method : POST
+#     headers: Authorization: Bearer <PAT with "Contents: read and write">
+#              Accept: application/vnd.github+json
+#     body   : {"event_type":"langfuse-prompt-update","client_payload":{"name":"{{name}}","version":"{{version}}","labels":"{{labels}}"}}
+#
+# Langfuse signs webhook payloads (HMAC-SHA256, x-langfuse-signature) and retries
+# with exponential backoff, so the receiver must be idempotent. GitHub's
+# dispatch endpoint is, since re-dispatching just re-runs the gate.
+#
+# workflow_dispatch is kept so the gate can be run by hand without a webhook —
+# which is also how to use it before the webhook above exists.
+
+name: "10 · Prompt promotion gate"
+
+on:
+  repository_dispatch:
+    types: [langfuse-prompt-update]
+  workflow_dispatch:
+    inputs:
+      prompt_label:
+        description: "Langfuse label to gate (default: staging)"
+        required: false
+        default: "staging"
+      prompt_version:
+        description: "Exact Langfuse version to gate (wins over the label)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  gate:
+    name: Score the candidate prompt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src/agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve what to gate
+        id: target
+        working-directory: .
+        run: |
+          # repository_dispatch carries the prompt from Langfuse's payload;
+          # workflow_dispatch takes it from the form. Default to the staging
+          # label, which is the convention this gate assumes: candidates are
+          # labelled `staging`, and only a human moves `production`.
+          LABEL="${{ github.event.inputs.prompt_label }}"
+          VERSION="${{ github.event.inputs.prompt_version }}"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            LABEL="staging"
+            VERSION="${{ github.event.client_payload.version }}"
+            echo "Triggered by Langfuse for prompt '${{ github.event.client_payload.name }}' \
+              version '${{ github.event.client_payload.version }}' labels '${{ github.event.client_payload.labels }}'"
+          fi
+          [ -z "$LABEL" ] && LABEL="staging"
+          echo "label=$LABEL"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Gating label='$LABEL' version='$VERSION'"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Score the candidate against k8fy-regression
+        working-directory: .
+        env:
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+          EVAL_AUTH_TOKEN: ${{ secrets.EVAL_AUTH_TOKEN }}
+        run: |
+          if [ -z "$LANGFUSE_PUBLIC_KEY" ] || [ -z "$LANGFUSE_SECRET_KEY" ]; then
+            echo "::warning::Langfuse credentials not configured — cannot gate a prompt version"
+            exit 0
+          fi
+
+          kubectl port-forward -n agentify svc/agentify-backend 18080:8080 &
+          PF_PID=$!
+          for i in $(seq 1 4); do
+            sleep 5
+            curl -sf http://localhost:18080/health > /dev/null 2>&1 && break
+            echo "Waiting for port-forward... ($i/4)"
+          done
+
+          # Pinned to <3.0.0 for the same reason as 02-deploy.yml: this script
+          # uses the v2 dataset API (lf.trace / item.link). See ADR 0019's
+          # 2026-08-30 correction.
+          pip install -q "langfuse>=2.0.0,<3.0.0" requests
+
+          python scripts/seed_eval_dataset.py
+
+          ARGS=""
+          if [ -n "${{ steps.target.outputs.version }}" ]; then
+            ARGS="--prompt-version ${{ steps.target.outputs.version }}"
+          else
+            ARGS="--prompt-label ${{ steps.target.outputs.label }}"
+          fi
+
+          set +e
+          python scripts/run_evals.py \
+            --backend-url http://localhost:18080 \
+            --run-name "prompt-gate-${{ github.run_id }}" \
+            --pass-threshold 0.85 \
+            $ARGS
+          GATE_EXIT=$?
+          set -e
+
+          kill $PF_PID 2>/dev/null || true
+
+          if [ $GATE_EXIT -ne 0 ]; then
+            echo "::error::Candidate prompt scored below the gate. Do NOT promote it to production. Per-item breakdown is in the Langfuse UI."
+            exit 1
+          fi
+          echo "Candidate cleared the gate. Promotion is still a human action — move the production label in Langfuse."
+
+      - name: Job summary
+        if: always()
+        working-directory: .
+        run: |
+          {
+            echo "### Prompt promotion gate"
+            echo ""
+            echo "- label: \`${{ steps.target.outputs.label }}\`"
+            echo "- version: \`${{ steps.target.outputs.version }}\`"
+            echo "- threshold: 0.85 against \`k8fy-regression\`"
+            echo ""
+            echo "A pass is evidence for a human promoting the \`production\` label — this"
+            echo "workflow never promotes anything itself (ADR 0020 / ADR 0030)."
+          } >> "$GITHUB_STEP_SUMMARY"

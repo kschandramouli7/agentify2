@@ -1431,8 +1431,7 @@ the candidate carries a `staging` label, CI validates *that* label, and only
 then does an approver move `production`. **Gate before promote.** Auto-revert
 is the backstop for what slips past, not the primary control.
 
-**D1 — version-pinned evaluation (the blocker, and not visible from the CI
-layer).** **Design decided 2026-08-30 in its own ADR:
+**D1 — version-pinned evaluation. ✅ done 2026-08-30.** **Design decided 2026-08-30 in its own ADR:
 [ADR 0030](decisions/0030-version-pinned-prompt-evaluation.md)** — a dedicated
 bearer-authenticated `POST /admin/eval/query` that reuses the real deployed
 handler and differs only in which prompt version the agent resolves; the
@@ -1452,6 +1451,19 @@ CI-plumbing task it looks like — it needs a product change first. Two shapes:
     candidate prompt, bypassing `/api/query`. Adds no production surface, but
     stops exercising the real deployed path, which was ADR 0019's entire point.
 
+  *Built:* `POST /admin/eval/query` — bearer-authenticated in-handler
+  (`checkEvalAuth`, mirroring `checkRemediationAuth`; an `/admin/` prefix grants
+  nothing since the only middleware does logging and metrics). It **delegates to
+  `HandleQuery` itself** rather than copying it, so the gate cannot drift from
+  the path production uses — ADR 0030 named that drift as the main long-term
+  cost. The pin rides in the query context, which was already forwarded verbatim
+  to the agent, so the backend→agent wire format is unchanged. `resolve()` gained
+  `label=`/`version=`; a pinned resolve bypasses the SDK cache and keys its
+  failure cooldown separately, so an eval against a broken candidate cannot
+  suppress production's own resolution. `traces.is_eval` marks the synthetic
+  traffic (rule 6). `/api/query` gained nothing, and eval-ness travels as a
+  server-side request-context value so it cannot be set from a request body.
+
   ADR 0030 chose **neither verbatim**: (a) is rejected for putting a
   behaviour-substitution lever on an unauthenticated endpoint (ADR 0020 rule 5),
   (b) for dropping routing/tiering/governance out of coverage — which is the
@@ -1463,8 +1475,23 @@ CI-plumbing task it looks like — it needs a product change first. Two shapes:
   **worth building regardless of P19**: a prompt A/B test, a canary, and
   per-version quality comparison all need the same capability.
 
-**D2 — the wiring (straightforward once D1 exists).** Langfuse ships every
-primitive; nothing bespoke is needed:
+**D2 — the wiring. ✅ done 2026-08-30 (one manual Langfuse step remains).**
+`.github/workflows/10-prompt-gate.yml` scores a candidate against the existing
+`k8fy-regression` dataset via D1's endpoint and fails the job below ADR 0019's
+0.85 threshold. `run_evals.py` gained `--prompt-label` / `--prompt-version`,
+which switch it from `/api/query` to `/admin/eval/query`. The workflow **never
+promotes anything** — a pass is evidence for a human moving the `production`
+label, per ADR 0020's precedent.
+
+**Still manual, and cannot be automated from this repo:** creating the Langfuse
+webhook that fires `repository_dispatch` (`langfuse-prompt-update`). The exact
+event selection, target URL, headers and body are documented in the workflow's
+header comment. Until it exists the gate runs via `workflow_dispatch`.
+`EVAL_AUTH_TOKEN` must also be set to the same value in the backend deployment
+and the repo's Actions secrets, or the gate gets a 401 — empty in both leaves
+the endpoint open, which is dev-only.
+
+Langfuse ships every primitive; nothing bespoke was needed:
 
   - **Webhooks on prompt-version events** (`created` / `updated` / `deleted`).
     `updated` **fires on label changes**, emitting two events — one for the

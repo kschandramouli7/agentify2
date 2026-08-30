@@ -288,3 +288,91 @@ def test_sdk_served_fallback_also_arms_the_cooldown(monkeypatch):
     resolve("k8fy/system", FALLBACK)
 
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Version-pinned resolution (ADR 0030 / P19 gap D1)
+# ---------------------------------------------------------------------------
+# The eval endpoint pins a candidate so it can be gated BEFORE the production
+# label moves. Two properties matter: the pin must actually reach the SDK, and a
+# pinned failure must not poison production's cooldown (or vice versa) — they are
+# different prompts as far as availability is concerned.
+
+def test_pinned_version_is_passed_to_the_sdk(monkeypatch):
+    seen = {}
+
+    def get_prompt(name, label=None, version=None, fallback=None, cache_ttl_seconds=None):
+        seen.update(name=name, label=label, version=version, ttl=cache_ttl_seconds)
+        return _FakePrompt("candidate text", version=version or 0)
+
+    monkeypatch.setattr(
+        prompt_manager, "_get_client", lambda: SimpleNamespace(get_prompt=get_prompt)
+    )
+
+    rp = resolve("k8fy/diagnose", FALLBACK, version=7)
+
+    assert rp.text == "candidate text"
+    assert seen["version"] == 7
+    assert seen["label"] is None, "a version pin must not also send a label"
+    assert seen["ttl"] == 0, "a pinned resolve must bypass the cache"
+
+
+def test_pinned_label_is_passed_to_the_sdk(monkeypatch):
+    seen = {}
+
+    def get_prompt(name, label=None, version=None, fallback=None, cache_ttl_seconds=None):
+        seen.update(label=label, version=version, ttl=cache_ttl_seconds)
+        return _FakePrompt("staging text", version=4)
+
+    monkeypatch.setattr(
+        prompt_manager, "_get_client", lambda: SimpleNamespace(get_prompt=get_prompt)
+    )
+
+    rp = resolve("k8fy/diagnose", FALLBACK, label="staging")
+
+    assert rp.version == 4
+    assert seen["label"] == "staging"
+    assert seen["version"] is None
+    assert seen["ttl"] == 0
+
+
+def test_unpinned_resolution_still_uses_production_and_the_cache(monkeypatch):
+    seen = {}
+
+    def get_prompt(name, label=None, version=None, fallback=None, cache_ttl_seconds=None):
+        seen.update(label=label, version=version, ttl=cache_ttl_seconds)
+        return _FakePrompt("prod text", version=2)
+
+    monkeypatch.setattr(
+        prompt_manager, "_get_client", lambda: SimpleNamespace(get_prompt=get_prompt)
+    )
+
+    resolve("k8fy/diagnose", FALLBACK)
+
+    assert seen["label"] == "production"
+    assert seen["version"] is None
+    assert seen["ttl"] is None, "normal traffic must keep the SDK cache"
+
+
+def test_a_broken_candidate_does_not_suppress_production(monkeypatch):
+    calls = []
+
+    def get_prompt(name, label=None, version=None, fallback=None, cache_ttl_seconds=None):
+        calls.append(("version" if version else "label", version or label))
+        if version:
+            raise RuntimeError("candidate version is broken")
+        return _FakePrompt("prod text", version=2)
+
+    monkeypatch.setattr(
+        prompt_manager, "_get_client", lambda: SimpleNamespace(get_prompt=get_prompt)
+    )
+
+    # An eval against a broken candidate arms a cooldown...
+    assert resolve("k8fy/diagnose", FALLBACK, version=99).is_fallback is True
+    assert resolve("k8fy/diagnose", FALLBACK, version=99).is_fallback is True  # cooled down
+
+    # ...but production traffic for the same prompt must be unaffected.
+    prod = resolve("k8fy/diagnose", FALLBACK)
+    assert prod.is_fallback is False
+    assert prod.text == "prod text"
+    assert calls.count(("version", 99)) == 1, "candidate retried despite cooldown"

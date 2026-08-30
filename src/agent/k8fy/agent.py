@@ -47,7 +47,7 @@ def _with_system_prompt(method):
 
     @functools.wraps(method)
     async def wrapper(self, *args, **kwargs):
-        rp = self._resolve_system_prompt()
+        rp = self._resolve_system_prompt(_pin_from(args, kwargs))
         token = _active_prompt.set(rp)
         try:
             result = await method(self, *args, **kwargs)
@@ -59,6 +59,37 @@ def _with_system_prompt(method):
         return result
 
     return wrapper
+
+
+def _pin_from(args, kwargs) -> Dict[str, Any]:
+    """Extract a prompt pin from the request context, if one is present.
+
+    Set only by the version-pinned evaluation endpoint (ADR 0030), which puts
+    prompt_label / prompt_version into the query context so a candidate version
+    can be gated before promotion. Read here — one place — so every skill honours
+    it without its own plumbing.
+
+    Returns {} for ordinary traffic, which resolves the production label as usual.
+    """
+    ctx = kwargs.get("context")
+    if not isinstance(ctx, dict):
+        # Positional: the reasoning entry points all take (intent, data, context, ...)
+        # or (messages, context, ...). Pick the last dict that looks like a context.
+        for a in reversed(args):
+            if isinstance(a, dict) and ("prompt_label" in a or "prompt_version" in a):
+                ctx = a
+                break
+    if not isinstance(ctx, dict):
+        return {}
+    pin: Dict[str, Any] = {}
+    if ctx.get("prompt_version"):
+        try:
+            pin["version"] = int(ctx["prompt_version"])
+        except (TypeError, ValueError):
+            logger.warning("ignoring non-integer prompt_version %r", ctx.get("prompt_version"))
+    elif ctx.get("prompt_label"):
+        pin["label"] = str(ctx["prompt_label"])
+    return pin
 
 
 def _traced_chat(method):
@@ -432,13 +463,17 @@ class K8fyAgent:
         self.advisor_model = advisor_model
         self.executor_model = executor_model or self.model
 
-    def _resolve_system_prompt(self) -> ResolvedPrompt:
-        """Resolve this agent's system prompt for the current request."""
+    def _resolve_system_prompt(self, pin: Optional[Dict[str, Any]] = None) -> ResolvedPrompt:
+        """Resolve this agent's system prompt for the current request.
+
+        *pin* (from the eval endpoint, ADR 0030) overrides the production label
+        with a specific candidate label or version.
+        """
         if self._static_system_prompt is not None:
             # Caller pinned an exact string; there is no Langfuse version to
             # attribute an answer to.
             return ResolvedPrompt(name=self._prompt_name, text=self._static_system_prompt)
-        return resolve_prompt(self._prompt_name, self._prompt_fallback)
+        return resolve_prompt(self._prompt_name, self._prompt_fallback, **(pin or {}))
 
     def _system_text(self) -> str:
         """System prompt text for the in-flight request.

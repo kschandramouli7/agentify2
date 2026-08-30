@@ -148,7 +148,13 @@ func (c *Client) initSchema(ctx context.Context) error {
 		-- set to the chat session id for chat turns. Without it, evidence (this
 		-- table) and conversation text (chat_sessions.messages) cannot be joined
 		-- — see ROADMAP P19 gap F.
-		session_id TEXT NOT NULL DEFAULT ''
+		session_id TEXT NOT NULL DEFAULT '',
+		-- Produced by /admin/eval/query rather than by real traffic (ADR 0030).
+		-- Eval runs go through the real deployed path on purpose, so their traces
+		-- are production-shaped; without this flag P19's sampler would judge the
+		-- system's own synthetic test traffic and partly learn from its own test
+		-- set. Every consumer of this table must filter on it.
+		is_eval BOOLEAN NOT NULL DEFAULT FALSE
 	);
 	-- Idempotent migrations: add new columns to pre-existing tables.
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;
@@ -158,6 +164,7 @@ func (c *Client) initSchema(ctx context.Context) error {
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS prompt_name TEXT NOT NULL DEFAULT '';
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS prompt_version INT;
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS is_eval BOOLEAN NOT NULL DEFAULT FALSE;
 	CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id, created_at)
 		WHERE session_id <> '';
 	ALTER TABLE IF EXISTS traces ADD COLUMN IF NOT EXISTS cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0;
@@ -695,6 +702,7 @@ type TraceRecord struct {
 	PromptName               string
 	PromptVersion            *int   // nil = local fallback or no LLM call
 	SessionID                string // "" = single-shot query, not part of a conversation
+	IsEval                   bool   // true = synthetic eval traffic; exclude from quality sampling
 	TenantID                 string
 	ClusterID                string
 }
@@ -722,14 +730,14 @@ func (c *Client) InsertTrace(ctx context.Context, t TraceRecord) error {
 		`INSERT INTO traces (id, trace_id, question, intent, namespace, tier, status,
 		  confidence, sources, tool_calls, latency_ms, started_at, created_at,
 		  input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-		  estimated_cost_usd, prompt_name, prompt_version, session_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20)
+		  estimated_cost_usd, prompt_name, prompt_version, session_id, is_eval)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),$13,$14,$15,$16,$17,$18,$19,$20,$21)
 		 ON CONFLICT (id) DO NOTHING`,
 		t.ID, t.TraceID, t.Question, t.Intent, t.Namespace, t.Tier, t.Status,
 		t.Confidence, srcJSON, tcJSON, t.LatencyMs, startedAt,
 		t.InputTokens, t.OutputTokens,
 		t.CacheCreationInputTokens, t.CacheReadInputTokens,
-		t.EstimatedCostUSD, t.PromptName, t.PromptVersion, t.SessionID)
+		t.EstimatedCostUSD, t.PromptName, t.PromptVersion, t.SessionID, t.IsEval)
 	return err
 }
 
@@ -741,6 +749,7 @@ const traceSelectCols = `
 	       COALESCE(cache_creation_input_tokens, 0), COALESCE(cache_read_input_tokens, 0),
 	       COALESCE(estimated_cost_usd, 0),
 	       COALESCE(prompt_name, ''), prompt_version, COALESCE(session_id, ''),
+	       COALESCE(is_eval, FALSE),
 	       tenant_id, COALESCE(cluster_id, '')
 	FROM traces`
 
@@ -754,7 +763,7 @@ func scanTrace(row interface{ Scan(...any) error }) (TraceRecord, error) {
 		&t.InputTokens, &t.OutputTokens,
 		&t.CacheCreationInputTokens, &t.CacheReadInputTokens,
 		&t.EstimatedCostUSD,
-		&t.PromptName, &t.PromptVersion, &t.SessionID,
+		&t.PromptName, &t.PromptVersion, &t.SessionID, &t.IsEval,
 		&t.TenantID, &t.ClusterID)
 	if err != nil {
 		return t, err

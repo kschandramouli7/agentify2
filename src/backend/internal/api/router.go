@@ -24,6 +24,10 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/agent/fetch", h.HandleAgentFetch)
 
 	// Admin: query history + metrics summary
+	// Version-pinned evaluation (ADR 0030). Bearer-authenticated in-handler; the
+	// /admin/ prefix grants nothing on its own.
+	mux.HandleFunc("POST /admin/eval/query", h.HandleEvalQuery)
+
 	mux.HandleFunc("GET /admin/traces", h.HandleTraceList)
 	mux.HandleFunc("GET /admin/traces/{id}", h.HandleTraceGet)
 	mux.HandleFunc("GET /admin/metrics/summary", h.HandleMetricsSummary)

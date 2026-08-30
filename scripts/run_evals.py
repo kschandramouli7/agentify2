@@ -111,7 +111,24 @@ def score_response(
 # Main eval loop
 # ---------------------------------------------------------------------------
 
-def run_evals(backend_url: str, run_name: str, pass_threshold: float) -> bool:
+def _eval_auth_headers() -> dict:
+    """Bearer header for /admin/eval/query, when a token is configured.
+
+    EVAL_AUTH_TOKEN must match the backend's. Absent means the endpoint is open
+    (dev only), matching the collector/remediation posture — so an empty header
+    set is valid rather than an error.
+    """
+    token = os.environ.get("EVAL_AUTH_TOKEN", "")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def run_evals(
+    backend_url: str,
+    run_name: str,
+    pass_threshold: float,
+    prompt_label: str = "",
+    prompt_version: int = 0,
+) -> bool:
     """Run the full dataset and return True if the gate passes."""
     public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
     secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "")
@@ -165,11 +182,26 @@ def run_evals(backend_url: str, run_name: str, pass_threshold: float) -> bool:
             "question": item_input.get("question", ""),
             "context":  item_input.get("context", {}),
         }
+        # Gate a CANDIDATE prompt before its label is promoted (ADR 0030): the
+        # pinned run goes to /admin/eval/query, which is the same handler as
+        # /api/query but resolves the named version instead of `production`, and
+        # marks its traces is_eval so quality sampling excludes them. Unpinned
+        # runs keep hitting the public endpoint exactly as before.
+        pinned = bool(prompt_label or prompt_version)
+        if pinned:
+            url = f"{backend_url}/admin/eval/query"
+            if prompt_version:
+                query_body["prompt_version"] = prompt_version
+            else:
+                query_body["prompt_label"] = prompt_label
+        else:
+            url = f"{backend_url}/api/query"
         t0 = time.time()
         try:
             http_resp = session.post(
-                f"{backend_url}/api/query",
+                url,
                 json=query_body,
+                headers=_eval_auth_headers() if pinned else None,
                 timeout=90,   # Tier-2 Opus calls can take 30-90s
             )
             http_resp.raise_for_status()
@@ -255,6 +287,17 @@ def main() -> None:
         help="Name for this eval run in Langfuse (default: IMAGE_TAG env var)",
     )
     parser.add_argument(
+        "--prompt-label",
+        default="",
+        help="gate this Langfuse prompt label (e.g. 'staging') instead of production",
+    )
+    parser.add_argument(
+        "--prompt-version",
+        type=int,
+        default=0,
+        help="gate this exact Langfuse prompt version; wins over --prompt-label",
+    )
+    parser.add_argument(
         "--pass-threshold",
         type=float,
         default=float(os.environ.get("EVAL_PASS_THRESHOLD", DEFAULT_THRESHOLD)),
@@ -266,6 +309,8 @@ def main() -> None:
         backend_url=args.backend_url,
         run_name=args.run_name,
         pass_threshold=args.pass_threshold,
+        prompt_label=args.prompt_label,
+        prompt_version=args.prompt_version,
     )
     sys.exit(0 if passed else 1)
 

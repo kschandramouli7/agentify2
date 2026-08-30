@@ -92,30 +92,54 @@ def _get_client():
     return get_client()
 
 
-def resolve(name: str, fallback: str) -> ResolvedPrompt:
+def resolve(
+    name: str,
+    fallback: str,
+    *,
+    label: Optional[str] = None,
+    version: Optional[int] = None,
+) -> ResolvedPrompt:
     """Resolve *name* from Langfuse (production label) for the current request.
 
     Safe to call on every request: the SDK serves from its client-side cache and
     revalidates in the background. Falls back to *fallback* if Langfuse is not
     configured, the prompt does not exist, or the API is unreachable with a cold
     cache.
+
+    `label`/`version` pin resolution to a specific candidate instead of the
+    production label — used only by the version-pinned evaluation endpoint
+    (ADR 0030), so a candidate can be gated before promotion. A pinned resolve
+    bypasses the SDK cache (exactness beats latency; a stale entry would defeat
+    the point) and keys its failure cooldown separately, so an eval against a
+    broken candidate cannot suppress production's own resolution or vice versa.
     """
+    pinned = bool(label or version)
     client = _get_client()
     if client is None:
         return ResolvedPrompt(name=name, text=fallback)
 
+    cooldown_key = f"{name}@{version or label}" if pinned else name
+
     now = time.monotonic()
-    if now < _cooldown_until.get(name, 0.0):
+    if now < _cooldown_until.get(cooldown_key, 0.0):
         # A recent attempt failed; skip the network entirely this time.
         return ResolvedPrompt(name=name, text=fallback)
 
+    kwargs: Dict[str, object] = {}
+    if version:
+        kwargs["version"] = version
+    else:
+        kwargs["label"] = label or PRODUCTION_LABEL
+    if pinned:
+        kwargs["cache_ttl_seconds"] = 0
+
     try:
-        prompt = client.get_prompt(name, label=PRODUCTION_LABEL, fallback=fallback)
+        prompt = client.get_prompt(name, fallback=fallback, **kwargs)
     except TypeError:
         # Older SDKs without the `fallback=` kwarg.
-        prompt = client.get_prompt(name, label=PRODUCTION_LABEL)
+        prompt = client.get_prompt(name, **kwargs)
     except Exception as exc:
-        _cooldown_until[name] = now + FAILURE_COOLDOWN_SECONDS
+        _cooldown_until[cooldown_key] = now + FAILURE_COOLDOWN_SECONDS
         logger.warning(
             "Langfuse resolve('%s') failed — using local fallback, not retrying for %.0fs: %s",
             name, FAILURE_COOLDOWN_SECONDS, exc,
@@ -125,7 +149,7 @@ def resolve(name: str, fallback: str) -> ResolvedPrompt:
     # When the SDK serves its own fallback it sets is_fallback and has no version.
     # That means its own fetch failed, so treat it like any other failure.
     if getattr(prompt, "is_fallback", False):
-        _cooldown_until[name] = now + FAILURE_COOLDOWN_SECONDS
+        _cooldown_until[cooldown_key] = now + FAILURE_COOLDOWN_SECONDS
         return ResolvedPrompt(name=name, text=fallback)
 
     try:
@@ -136,7 +160,7 @@ def resolve(name: str, fallback: str) -> ResolvedPrompt:
         )
         return ResolvedPrompt(name=name, text=fallback)
 
-    _cooldown_until.pop(name, None)  # healthy again
+    _cooldown_until.pop(cooldown_key, None)  # healthy again
     return ResolvedPrompt(
         name=name,
         text=text,

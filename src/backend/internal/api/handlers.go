@@ -36,6 +36,7 @@ type Handler struct {
 	chatStore                ChatStore        // nil when postgres is not provisioned
 	remediationStore         RemediationStore // nil when postgres is not provisioned
 	remediationConfig        RemediationConfig
+	evalAuthToken            string                 // POST /admin/eval/query bearer token (ADR 0030); "" = open, dev only
 	serviceDepsStore         ServiceDependencyStore // nil when postgres is not provisioned
 	collectorHub             *CollectorHub          // fleet collectors' persistent connections (ADR 0022 Decision #7 / ROADMAP P18 use case #9)
 	clusterServiceStore      ClusterServiceStore    // service->cluster registry (ROADMAP P16 / ADR 0023); nil when postgres is not provisioned
@@ -169,6 +170,9 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	traceID := uuid.New().String() // provenance correlation id (spec 004)
+	// Set only when this request was delegated from /admin/eval/query (ADR 0030).
+	// Marks the resulting trace as synthetic so quality sampling can exclude it.
+	isEval := isEvalRequest(r)
 
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -194,7 +198,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Error("failed to route query", "error", err)
 		telemetry.QueriesTotal.WithLabelValues(intent, "none", "error").Inc()
-		h.logTrace(traceID, req.Question, intent, namespace, "none", "error", nil, 0, nil, start, nil, "")
+		h.logTrace(traceID, req.Question, intent, namespace, "none", "error", nil, 0, nil, start, nil, "", isEval)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -208,7 +212,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			TraceID:    traceID,
 		}
 		telemetry.QueriesTotal.WithLabelValues(intent, "no_data", "no_data").Inc()
-		h.logTrace(traceID, req.Question, intent, namespace, "no_data", "no_data", nil, 0, nil, start, nil, "")
+		h.logTrace(traceID, req.Question, intent, namespace, "no_data", "no_data", nil, 0, nil, start, nil, "", isEval)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
@@ -246,7 +250,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("answered via deterministic fast-path", "intent", intent, "pods", len(pods))
 		telemetry.QueriesTotal.WithLabelValues(intent, "tier1", "ok").Inc()
 		telemetry.QueryDuration.WithLabelValues("tier1").Observe(time.Since(start).Seconds())
-		h.logTrace(traceID, req.Question, intent, namespace, "tier1", resp.Status, resp.Sources, resp.Confidence, nil, start, nil, "")
+		h.logTrace(traceID, req.Question, intent, namespace, "tier1", resp.Status, resp.Sources, resp.Confidence, nil, start, nil, "", isEval)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -272,7 +276,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			Sources:    extractPodIDs(pods),
 			TraceID:    traceID,
 		}
-		h.logTrace(traceID, req.Question, intent, namespace, "tier2", "partial", resp.Sources, 0.5, nil, start, nil, "")
+		h.logTrace(traceID, req.Question, intent, namespace, "tier2", "partial", resp.Sources, 0.5, nil, start, nil, "", isEval)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
@@ -307,7 +311,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		Intent:     intent,
 		Tier:       "tier2",
 	}
-	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, "")
+	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, "", isEval)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -726,7 +730,7 @@ func buildPodQuery(reqContext map[string]interface{}) map[string]interface{} {
 // string in a long positional list, and placing it next to the other strings
 // would let a mis-ordered call compile while silently recording the wrong value.
 // "" means the query was single-shot rather than part of a conversation.
-func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status string, sources []string, confidence float64, toolCalls []string, start time.Time, agentResp *AgentResponse, sessionID string) {
+func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status string, sources []string, confidence float64, toolCalls []string, start time.Time, agentResp *AgentResponse, sessionID string, isEval bool) {
 	latencyMs := time.Since(start).Milliseconds()
 	var inTok, outTok, cacheWriteTok, cacheReadTok int64
 	var cost float64
@@ -760,6 +764,7 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 		"prompt_name", promptName,
 		"prompt_version", promptVersion,
 		"session_id", sessionID,
+		"is_eval", isEval,
 	)
 	if h.traceStore != nil {
 		go func() {
@@ -787,6 +792,7 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 				PromptName:               promptName,
 				PromptVersion:            promptVersion,
 				SessionID:                sessionID,
+				IsEval:                   isEval,
 			}); err != nil {
 				h.logger.Warn("trace persist failed", "error", err)
 				return
@@ -1438,7 +1444,7 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	if agentErr == nil && agentResp != nil {
 		h.logTrace(traceID, req.Content, "chat", s.Namespace, "tier2", "ok",
 			agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls),
-			start, agentResp, s.ID)
+			start, agentResp, s.ID, false)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1651,7 +1657,8 @@ func (h *Handler) HandleCertRenew(w http.ResponseWriter, r *http.Request) {
 		nil,
 		start,
 		agentResp,
-		"", // cert renewal is a single action, not a conversation turn
+		"",    // cert renewal is a single action, not a conversation turn
+		false, // real traffic, not an eval run
 	)
 
 	writeJSON(w, http.StatusOK, resp)

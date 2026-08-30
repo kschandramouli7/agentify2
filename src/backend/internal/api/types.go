@@ -38,6 +38,7 @@ type TraceResponse struct {
 	PromptName               string    `json:"prompt_name"`
 	PromptVersion            *int      `json:"prompt_version"`
 	SessionID                string    `json:"session_id"`
+	IsEval                   bool      `json:"is_eval"`
 }
 
 // MetricsSummaryResponse is returned by GET /admin/metrics/summary.
@@ -74,6 +75,7 @@ func traceToResponse(t pgstore.TraceRecord) TraceResponse {
 		PromptName:               t.PromptName,
 		PromptVersion:            t.PromptVersion,
 		SessionID:                t.SessionID,
+		IsEval:                   t.IsEval,
 	}
 }
 
@@ -216,6 +218,24 @@ func integrationToResponse(in pgstore.Integration) IntegrationResponse {
 type QueryRequest struct {
 	Question string                 `json:"question"`
 	Context  map[string]interface{} `json:"context"`
+}
+
+// EvalQueryRequest is the body of POST /admin/eval/query (ADR 0030): a normal
+// query plus a pin naming which prompt version should answer it.
+//
+// Deliberately a separate type from QueryRequest so the public, unauthenticated
+// /api/query cannot carry a pin — "make the agent answer with arbitrary prompt
+// text" is a behaviour-substitution lever, and ADR 0020 rule 5 keeps that class
+// of capability off unauthenticated surfaces.
+//
+// PromptLabel and PromptVersion are mutually exclusive; version wins if both are
+// set. Empty/zero means "resolve normally", which makes this endpoint a
+// bearer-authenticated mirror of /api/query when no pin is given.
+type EvalQueryRequest struct {
+	Question      string                 `json:"question"`
+	Context       map[string]interface{} `json:"context"`
+	PromptLabel   string                 `json:"prompt_label,omitempty"`
+	PromptVersion int                    `json:"prompt_version,omitempty"`
 }
 
 // ToolCallInfo describes one tool call made by Claude during reasoning.

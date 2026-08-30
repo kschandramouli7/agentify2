@@ -89,6 +89,18 @@ spec:
           value: "30"
         - name: REMEDIATION_AUTH_TOKEN
           value: ""
+        # Version-pinned prompt evaluation (ADR 0030 / P19 gap D1). Guards
+        # POST /admin/eval/query, which can make the agent answer using an
+        # arbitrary prompt version — a behaviour-substitution lever, hence its
+        # own token rather than exposure on the unauthenticated /api/query.
+        #
+        # Empty means the endpoint is OPEN, matching the posture of
+        # REMEDIATION_AUTH_TOKEN and COLLECTOR_TOKEN above. Set it from a Secret
+        # (same secretKeyRef pattern as DB_PASSWORD) before this cluster carries
+        # anything that matters, and set the same value as the EVAL_AUTH_TOKEN
+        # GitHub secret so 10-prompt-gate.yml can authenticate.
+        - name: EVAL_AUTH_TOKEN
+          value: ""
         livenessProbe:
           httpGet:
             path: /health
