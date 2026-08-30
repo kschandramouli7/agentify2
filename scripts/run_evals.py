@@ -393,6 +393,21 @@ def run_evals(
             f"  {symbol}  {score_val:.2f}  {item_id:<45}"
             f"  {detail}  ({latency_ms:.0f}ms)"
         )
+        # For a failing item, show what the agent actually said. The agent
+        # sanitises its error text (_user_error_message) so this never leaks a raw
+        # API response, but it does classify the failure — rate limit, billing,
+        # timeout, overloaded, or "unexpected" — which is often enough to locate
+        # the cause without cluster access. result["error"] is present only when
+        # the HTTP call itself failed, and does carry the raw reason.
+        if score_val < pass_threshold:
+            if result.get("error"):
+                print(f"        transport error: {str(result['error'])[:300]}")
+            answer = (result.get("answer") or "").strip()
+            if answer:
+                print(f"        agent said: {answer[:300]}")
+            print(f"        status={result.get('status')!r} "
+                  f"tier={result.get('tier')!r} intent={result.get('intent')!r} "
+                  f"trace_id={result.get('trace_id')!r}")
 
     # Flush to ensure all scores reach Langfuse before CI exits
     lf.flush()
