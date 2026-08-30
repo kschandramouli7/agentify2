@@ -114,6 +114,18 @@ fails if the dataset contains **no** such item — gating a prompt the dataset
 never exercises tests nothing. The intent→prompt map lives in
 `INTENT_TO_PROMPT` in `run_evals.py` and mirrors `SkillRouter`.
 
+**When a gated item fails, the gate re-runs just that item unpinned** and reports
+candidate vs production side by side, because the two outcomes demand opposite
+actions:
+
+| Result | Verdict |
+|---|---|
+| candidate fails, production passes | **REGRESSION** — the candidate caused it. Fail, do not promote. |
+| candidate fails, production fails too | **Pre-existing** — the candidate is not at fault. Pass with a warning, and fix the underlying failure separately. |
+
+Without that comparison a long-standing failure would block every prompt change
+forever, and a genuine regression would look identical to it.
+
 **Where to read the result:**
 
 | Where | What you get |

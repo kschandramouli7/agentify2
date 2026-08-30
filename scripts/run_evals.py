@@ -31,6 +31,11 @@ from typing import Any
 import requests
 from langfuse import Langfuse
 
+def _item_id(item) -> str:
+    """Dataset item id — must match how the main scoring loop derives it."""
+    return getattr(item, "id", None) or "unknown"
+
+
 class PreconditionError(RuntimeError):
     """The run cannot be trusted, so it must not run at all (exit code 2)."""
 
@@ -134,6 +139,44 @@ def score_response(
 # ---------------------------------------------------------------------------
 # Main eval loop
 # ---------------------------------------------------------------------------
+
+def _ask(session, backend_url: str, item_input: dict, *, prompt_name: str = "",
+         prompt_label: str = "", prompt_version: int = 0):
+    """Send one dataset item to agentify. Returns (result, latency_ms).
+
+    Pinned requests go to /admin/eval/query — the same handler as /api/query, but
+    resolving the named prompt version instead of `production`, and marking their
+    traces is_eval. Unpinned requests hit the public endpoint, which is the
+    production baseline.
+    """
+    body = {
+        "question": item_input.get("question", ""),
+        "context":  item_input.get("context", {}),
+    }
+    pinned = bool(prompt_label or prompt_version)
+    if pinned:
+        url = f"{backend_url}/admin/eval/query"
+        body["prompt_name"] = prompt_name
+        if prompt_version:
+            body["prompt_version"] = prompt_version
+        else:
+            body["prompt_label"] = prompt_label
+    else:
+        url = f"{backend_url}/api/query"
+
+    t0 = time.time()
+    try:
+        http_resp = session.post(
+            url, json=body,
+            headers=_eval_auth_headers() if pinned else None,
+            timeout=90,   # Tier-2 Opus calls can take 30-90s
+        )
+        http_resp.raise_for_status()
+        result = http_resp.json()
+    except Exception as exc:
+        result = {"error": str(exc), "status": "error", "answer": ""}
+    return result, (time.time() - t0) * 1000
+
 
 def _eval_auth_headers() -> dict:
     """Bearer header for /admin/eval/query, when a token is configured.
@@ -379,14 +422,52 @@ def run_evals(
         print(f"  Gated prompt {prompt_name}: {ok}/{len(gated_scores)} of its own items passed")
         for item_id, val, detail in failed_gated:
             print(f"    ✗ {val:.2f}  {item_id}  {detail}")
+
         if failed_gated:
+            # Re-run ONLY the failing gated items against production, unpinned.
+            # Without this the gate cannot distinguish "the candidate broke it"
+            # from "it was already broken", and those demand opposite actions:
+            # one blocks the candidate, the other blocks nothing and needs a
+            # separate fix. Cheap — one or two extra calls.
             print(f"{'─' * 72}")
+            print("  Comparing against production (unpinned) to tell regression from"
+                  " pre-existing failure...")
+            regressions, pre_existing = [], []
+            for item_id, cand_val, _detail in failed_gated:
+                item = next((i for i in items if _item_id(i) == item_id), None)
+                if item is None:
+                    continue
+                base_result, base_latency = _ask(session, backend_url, item.input or {})
+                base_val, base_detail = score_response(
+                    base_result, (item.expected_output or {}), base_latency
+                )
+                verdict = "REGRESSION" if base_val >= pass_threshold else "pre-existing"
+                print(f"    {item_id}: candidate={cand_val:.2f}  production={base_val:.2f}"
+                      f"  -> {verdict}")
+                if base_val >= pass_threshold:
+                    regressions.append(item_id)
+                else:
+                    pre_existing.append((item_id, base_detail))
+
+            print(f"{'─' * 72}")
+            if regressions:
+                print(
+                    "  ✗ FAIL  the candidate REGRESSED "
+                    f"{', '.join(regressions)} — production passes these and the\n"
+                    "          candidate does not. Do not promote."
+                )
+                print(f"{'─' * 72}")
+                return False
+
             print(
-                "  ✗ FAIL  the candidate failed on an item that uses it. The overall mean\n"
-                "          is not evidence here — most items do not touch this prompt."
+                "  ⚠ PASS with warning: the failing items fail on production too, so the\n"
+                "          candidate did not cause them. Promoting is defensible, but these\n"
+                "          are pre-existing failures worth their own fix:"
             )
+            for item_id, detail in pre_existing:
+                print(f"            {item_id}: {detail}")
             print(f"{'─' * 72}")
-            return False
+            return passed
 
     print(f"{'─' * 72}")
     return passed
