@@ -169,8 +169,16 @@ jobs:
 
           kill $PF_PID 2>/dev/null || true
 
+          # Exit 2 means the gate REFUSED to run (e.g. the candidate does not exist
+          # in Langfuse), which is not the same as scoring badly. Reporting a
+          # refusal as "scored below the gate" sends someone hunting for a quality
+          # regression that never happened.
+          if [ $GATE_EXIT -eq 2 ]; then
+            echo "::error::Gate did not run — precondition failed (see the log; usually the candidate was never published to Langfuse). Nothing was scored."
+            exit 1
+          fi
           if [ $GATE_EXIT -ne 0 ]; then
-            echo "::error::Candidate prompt scored below the gate. Do NOT promote it to production. Per-item breakdown is in the Langfuse UI."
+            echo "::error::Candidate prompt scored below the gate. Do NOT promote it to production. Per-item breakdown is in Langfuse → Experiments."
             exit 1
           fi
           echo "Candidate cleared the gate. Promotion is still a human action — move the production label in Langfuse."

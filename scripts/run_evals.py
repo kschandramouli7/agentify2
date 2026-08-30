@@ -24,11 +24,16 @@ import argparse
 import os
 import sys
 import time
+import urllib.parse
 import uuid
 from typing import Any
 
 import requests
 from langfuse import Langfuse
+
+class PreconditionError(RuntimeError):
+    """The run cannot be trusted, so it must not run at all (exit code 2)."""
+
 
 DATASET_NAME   = "k8fy-regression"
 SCORE_NAME     = "eval-regression"
@@ -160,30 +165,50 @@ def run_evals(
     # its local prompt string, produces perfectly good answers, and the gate
     # reports "candidate cleared" for a candidate that was never used. Verified
     # up front, before spending any model budget.
+    #
+    # Checked over the REST API rather than through the SDK on purpose. CI pins
+    # this script to langfuse<3 (it uses the v2 dataset API), and the v2 SDK's
+    # prompt endpoint predates the current /api/public/v2/prompts path — against
+    # Langfuse Cloud it lands on the web app and returns an HTML 404, so an
+    # SDK-based check can never succeed here. The REST path is stable across SDK
+    # majors. Seen for real 2026-08-30.
     if prompt_label or prompt_version:
         if not prompt_name:
-            print("ERROR: --prompt-name is required when pinning a label or version.",
-                  file=sys.stderr)
-            return False
+            raise PreconditionError(
+                "--prompt-name is required when pinning a label or version."
+            )
         target = f"version {prompt_version}" if prompt_version else f"label '{prompt_label}'"
+        # The name contains a slash ("k8fy/diagnose"), so it must be encoded or it
+        # becomes an extra path segment and 404s for the wrong reason.
+        encoded = urllib.parse.quote(prompt_name, safe="")
+        url = f"{base_url.rstrip('/')}/api/public/v2/prompts/{encoded}"
+        params = {"version": prompt_version} if prompt_version else {"label": prompt_label}
         try:
-            if prompt_version:
-                candidate = lf.get_prompt(prompt_name, version=prompt_version, cache_ttl_seconds=0)
-            else:
-                candidate = lf.get_prompt(prompt_name, label=prompt_label, cache_ttl_seconds=0)
+            resp = requests.get(
+                url, params=params, auth=(public_key, secret_key), timeout=20
+            )
         except Exception as exc:
-            print(
-                f"ERROR: cannot gate {prompt_name} at {target} — it does not exist in "
-                f"Langfuse ({exc}).\n"
+            raise PreconditionError(f"could not reach Langfuse at {base_url}: {exc}")
+
+        if resp.status_code == 404:
+            raise PreconditionError(
+                f"{prompt_name} does not exist at {target} in Langfuse.\n"
                 "       Publish the candidate first:\n"
                 f"         python3 scripts/migrate_prompts_to_langfuse.py "
                 f"--label {prompt_label or 'staging'} {prompt_name}\n"
                 "       Refusing to run: the agent would fall back to its local prompt "
-                "string and the gate would pass without testing anything.",
-                file=sys.stderr,
+                "string and the gate would pass without testing anything."
             )
-            return False
-        pinned_version = getattr(candidate, "version", None)
+        if resp.status_code >= 400:
+            raise PreconditionError(
+                f"Langfuse returned {resp.status_code} for {prompt_name} at {target}. "
+                f"Check LANGFUSE_BASE_URL ({base_url}) — projects are region-scoped, "
+                "and a wrong region returns 401 even with correct keys."
+            )
+        try:
+            pinned_version = resp.json().get("version")
+        except Exception:
+            pinned_version = None
         print(f"Gating   : {prompt_name} {target} (resolved to version {pinned_version})")
 
     print(f"Run name : {run_name}")
@@ -344,14 +369,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    passed = run_evals(
-        backend_url=args.backend_url,
-        run_name=args.run_name,
-        pass_threshold=args.pass_threshold,
-        prompt_name=args.prompt_name,
-        prompt_label=args.prompt_label,
-        prompt_version=args.prompt_version,
-    )
+    try:
+        passed = run_evals(
+            backend_url=args.backend_url,
+            run_name=args.run_name,
+            pass_threshold=args.pass_threshold,
+            prompt_name=args.prompt_name,
+            prompt_label=args.prompt_label,
+            prompt_version=args.prompt_version,
+        )
+    except PreconditionError as exc:
+        # Exit 2 = the gate refused to run, which is NOT "scored below threshold".
+        # Conflating them makes the CI message actively misleading.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
     sys.exit(0 if passed else 1)
 
 
