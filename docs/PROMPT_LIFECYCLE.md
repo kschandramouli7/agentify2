@@ -105,6 +105,20 @@ backend↔agent boundary all included.
 
 The gate **never promotes anything**. A pass is evidence for a human.
 
+**Where to read the result:**
+
+| Where | What you get |
+|---|---|
+| The workflow run's **step log** ("Score the candidate against k8fy-regression") | The authoritative result. Per-item scores, the mean, and a `Gating: <prompt> <label> (resolved to version N)` line proving which version was actually measured. The gate decision is computed here, locally — not in Langfuse. |
+| The run's **Job Summary** | Prompt, label, version and threshold at a glance, no expanding |
+| Langfuse → **Experiments** | The run named `prompt-gate-<run_id>`, with per-item scores that persist so candidates can be compared across runs. Note: this is under **Experiments**, not under the dataset — Langfuse v4 surfaces what the SDK calls a "dataset run" as an experiment. |
+| Red tick + annotation | `Candidate prompt scored below the gate. Do NOT promote it to production.` |
+
+Langfuse reporting is **best-effort**: it is wrapped in a `try/except` that prints
+`WARN Langfuse reporting skipped` and continues, so a Langfuse outage cannot fail
+the gate. That also means the step log — not the Experiments view — is the source
+of truth for whether a candidate passed.
+
 ### 4. Promote
 
 In Langfuse, move the `production` label to the gated version. Live traffic picks
