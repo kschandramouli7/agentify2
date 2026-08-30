@@ -165,6 +165,7 @@ def main() -> None:
     print(f"Mode: {mode}\n")
 
     created = skipped = failed = 0
+    created_names: list = []
     for name, content in selected:
         if not args.force and not publishing_candidate:
             try:
@@ -186,6 +187,7 @@ def main() -> None:
             )
             print(f"  OK   {name}  (version {prompt.version})")
             created += 1
+            created_names.append((name, prompt.version))
         except Exception as exc:
             print(f"  ERR  {name}  FAILED: {exc}", file=sys.stderr)
             failed += 1
@@ -193,12 +195,14 @@ def main() -> None:
     print(f"\nCreated {created}, skipped {skipped}, failed {failed}.")
     print("Verify in Langfuse UI → Prompts (filter by \"k8fy/\").")
     if publishing_candidate and created:
-        print(
-            f"\nCandidate published on '{args.label}'. It is NOT serving traffic.\n"
-            "Next: GitHub Actions → '10 · Prompt promotion gate' → Run workflow with "
-            f"prompt_label={args.label}, then move the 'production' label yourself "
-            "if it passes."
-        )
+        print(f"\nCandidate published on '{args.label}'. It is NOT serving traffic.")
+        print("Next: GitHub Actions → '10 · Prompt promotion gate' → Run workflow with")
+        for name, version in created_names:
+            # prompt_name is REQUIRED: the eval dataset spans several prompts, and an
+            # unscoped pin would resolve the others at this label, 404, and fall back
+            # to their local strings — scoring one candidate plus several fallbacks.
+            print(f"    prompt_name={name}  prompt_label={args.label}   (version {version})")
+        print("Then move the 'production' label yourself if it passes — the gate never promotes.")
     if failed:
         sys.exit(1)
 

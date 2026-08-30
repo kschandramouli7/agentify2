@@ -131,6 +131,101 @@ the fastest rollback in the system — faster than any code path.
 
 ---
 
+## Quick reference — verify a prompt change end to end
+
+### 0. Get credentials without pasting them anywhere
+
+The keys already live in AWS Secrets Manager (`agentify/dev/langfuse`), put there
+by `04-bootstrap-langfuse-secret.yml`. Source them from there rather than copying
+them into a scratch file — a secret key in an editor buffer or shell history is
+one screen-share away from being leaked, and rotating it means touching the
+GitHub secret, Secrets Manager and every developer.
+
+```bash
+export AWS_PROFILE=agentify-dev            # aws sso login --profile agentify-dev first
+
+eval "$(aws secretsmanager get-secret-value \
+  --secret-id agentify/dev/langfuse \
+  --query SecretString --output text \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for k in ("LANGFUSE_PUBLIC_KEY","LANGFUSE_SECRET_KEY","LANGFUSE_BASE_URL"):
+    if d.get(k): print(f"export {k}={d[k]}")')"
+```
+
+If you must set them by hand, use placeholders and mind the space after `export`
+(`exportLANGFUSE_BASE_URL=...` fails silently as a single unknown command):
+
+```bash
+export LANGFUSE_PUBLIC_KEY=pk-lf-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export LANGFUSE_SECRET_KEY=sk-lf-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export LANGFUSE_BASE_URL=https://us.cloud.langfuse.com
+```
+
+`LANGFUSE_BASE_URL` must match `config/settings.py` — Langfuse projects are
+region-scoped, and the wrong region returns `401 Invalid credentials` even when
+the keys are correct.
+
+### 1. Publish the candidate
+
+```bash
+cd src/agent
+python3 scripts/migrate_prompts_to_langfuse.py --label staging k8fy/diagnose
+```
+
+Expect `Created 1, skipped 0, failed 0` and a reminder that it is not serving
+traffic. `Created 11` means you are pointed at the wrong project — stop.
+
+### 2. Confirm it exists before gating
+
+```bash
+python3 - <<'EOF'
+import os
+from langfuse import Langfuse
+lf = Langfuse(public_key=os.environ["LANGFUSE_PUBLIC_KEY"],
+              secret_key=os.environ["LANGFUSE_SECRET_KEY"],
+              base_url=os.environ["LANGFUSE_BASE_URL"])
+p = lf.get_prompt("k8fy/diagnose", label="staging", cache_ttl_seconds=0)
+print("staging version:", p.version)
+EOF
+```
+
+The gate performs this check itself and refuses to run without it, so this step
+is only for a faster answer.
+
+### 3. Gate it
+
+GitHub → Actions → **10 · Prompt promotion gate** → Run workflow:
+`prompt_name=k8fy/diagnose`, `prompt_label=staging`.
+
+Read the step log for `Gating : k8fy/diagnose label 'staging' (resolved to
+version N)` — that line proves the candidate was measured rather than a
+fallback.
+
+### 4. Promote, then verify it took effect
+
+Move the `production` label in Langfuse, wait ~60s, then check a Tier-2 trace
+shows the new version:
+
+```bash
+kubectl port-forward -n agentify svc/agentify-backend 18080:8080 &
+
+curl -sS -X POST localhost:18080/api/query -H 'Content-Type: application/json' \
+  -d '{"question":"why is payment-worker crashing?","context":{"namespace":"payments","service":"payment-worker"}}'
+
+curl -sS localhost:18080/admin/traces | python3 -m json.tool \
+  | grep -E 'prompt_name|prompt_version|tier' | head
+```
+
+A `diagnose` question is used deliberately: a healthy service takes the Tier-1
+fast path, makes no LLM call, and correctly records no prompt (ADR 0006).
+
+### 5. If it misbehaves
+
+Move `production` back to the previous version. ~60s, no redeploy.
+
+---
+
 ## Adding a new prompt
 
 1. Add the constant to `prompts.py`.
