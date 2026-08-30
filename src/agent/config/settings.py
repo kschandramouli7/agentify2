@@ -115,6 +115,13 @@ class Settings(BaseSettings):
     )
     langfuse_secret_name: str = "agentify/dev/langfuse"
 
+    # Emit Langfuse traces/observations for reasoning calls (ROADMAP P19 gap E).
+    # Off by default: it instruments the hottest path in the system, and nothing
+    # downstream (prompt management, evals) depends on it. Turn on deliberately.
+    langfuse_tracing_enabled: bool = Field(
+        default=False, validation_alias=AliasChoices("LANGFUSE_TRACING_ENABLED")
+    )
+
     # Voyage AI — embedding model for semantic memory (P8).
     # Set VOYAGE_API_KEY to enable; omit to run without semantic similarity search.
     voyage_api_key: str = Field(default="", validation_alias=AliasChoices("VOYAGE_API_KEY"))

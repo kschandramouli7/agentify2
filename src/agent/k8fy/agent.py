@@ -12,6 +12,7 @@ from pydantic import ValidationError
 import metrics
 from config.claude_client import get_claude_client
 from config.settings import get_settings
+from k8fy import tracing
 from k8fy.prompt_manager import ResolvedPrompt
 from k8fy.prompt_manager import resolve as resolve_prompt
 from k8fy.prompts import CHAT_STRUCTURE_PROMPT, CHAT_SYSTEM_PROMPT, SYSTEM_PROMPT
@@ -56,6 +57,39 @@ def _with_system_prompt(method):
             result.prompt_name = rp.name
             result.prompt_version = rp.version
         return result
+
+    return wrapper
+
+
+def _traced_chat(method):
+    """Record one chat turn as a single Langfuse observation (P19 gap E).
+
+    A whole turn rather than each tool-loop iteration, and `input` is the FULL
+    conversation history on purpose: Langfuse evaluators only see data on the
+    observation they match, and judging a conversation — or spotting context that
+    should have been fetched earlier — needs the conversation to be there.
+
+    Must sit BELOW @_with_system_prompt so that decorator has already resolved
+    the prompt into the ContextVar by the time this one reads it; decorators
+    apply bottom-up, so the outer one runs first.
+    """
+
+    @functools.wraps(method)
+    async def wrapper(self, messages, context=None, *args, **kwargs):
+        ctx = context or {}
+        rp = _active_prompt.get()
+        with tracing.observe(
+            "chat:turn",
+            model=self.model,
+            input=messages,
+            prompt=rp.raw if rp else None,
+            session_id=str(ctx.get("session_id") or ""),
+            metadata={"turns": len(messages) if messages else 0},
+        ) as span:
+            result = await method(self, messages, context, *args, **kwargs)
+            if isinstance(result, AgentResponse):
+                tracing._safe_update(span, output=result.answer)
+            return result
 
     return wrapper
 
@@ -704,6 +738,7 @@ class K8fyAgent:
         Cost profile: N parallel backend fetches + exactly 1 Claude call.
         """
         merged = {**data, **prefetched}
+        rp = _active_prompt.get()
         system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
         # Append a direct instruction so Claude doesn't wait for tool calls
         # that will never come.
@@ -714,14 +749,27 @@ class K8fyAgent:
         )
 
         try:
-            response = await self.client.messages.create(
+            with tracing.observe(
+                f"skill:{intent}",
                 model=self.model,
-                max_tokens=self.max_tokens,
-                system=system,
-                thinking={"type": "adaptive"},
-                output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": self._output_schema}},
-                messages=[{"role": "user", "content": user_content}],
-            )
+                input=user_content,
+                prompt=rp.raw if rp else None,
+                session_id=str(context.get("session_id") or ""),
+                metadata={"intent": intent, "pattern": "A"},
+            ) as span:
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    system=system,
+                    thinking={"type": "adaptive"},
+                    output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": self._output_schema}},
+                    messages=[{"role": "user", "content": user_content}],
+                )
+                tracing._safe_update(
+                    span,
+                    output=next((b.text for b in response.content if b.type == "text"), ""),
+                    usage_details=tracing.usage_from(response) or None,
+                )
             _record_loop_usage(response, self.model)
             final_text = next((b.text for b in response.content if b.type == "text"), "")
             metrics.record_request("ok")
@@ -749,6 +797,7 @@ class K8fyAgent:
     # ------------------------------------------------------------------
 
     @_with_system_prompt
+    @_traced_chat
     async def reason_chat(
         self,
         messages: List[Dict[str, Any]],

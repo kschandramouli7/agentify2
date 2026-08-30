@@ -1408,7 +1408,10 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	traceID := uuid.New().String()
 	agentResp, agentErr := h.agentClient.Chat(
 		history,
-		map[string]interface{}{"namespace": s.Namespace, "service": s.Service},
+		// session_id lets the agent group a conversation's observations into one
+		// Langfuse session (P19 gap E) — conversation-level evaluation is
+		// impossible turn-by-turn.
+		map[string]interface{}{"namespace": s.Namespace, "service": s.Service, "session_id": s.ID},
 		traceID,
 	)
 

@@ -42,14 +42,31 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-logger = logging.getLogger(__name__)
+from k8fy.langfuse_client import get_client
 
-_langfuse = None
-_initialised = False
+logger = logging.getLogger(__name__)
 
 # Label whose version serves live traffic. The Evaluator Agent (P19) will push
 # new *versions* without moving this label; a human promotes it.
 PRODUCTION_LABEL = "production"
+
+
+@dataclass(frozen=True)
+class ResolvedPrompt:
+    """A prompt resolved for one request, with the provenance to record on a trace.
+
+    `version` is None when the text came from the local fallback — there is no
+    Langfuse version to attribute the answer to in that case.
+    """
+
+    name: str
+    text: str
+    version: Optional[int] = None
+    is_fallback: bool = True
+    # The Langfuse prompt object, when one was served. Carried so tracing can
+    # link an observation to the exact prompt version that produced the answer
+    # (P19 gap E); None whenever the local fallback was used.
+    raw: Optional[object] = None
 
 # How long to stop re-attempting a prompt that just failed to resolve.
 #
@@ -70,60 +87,9 @@ FAILURE_COOLDOWN_SECONDS = 60.0
 _cooldown_until: Dict[str, float] = {}
 
 
-@dataclass(frozen=True)
-class ResolvedPrompt:
-    """A prompt resolved for one request, with the provenance to record on a trace.
-
-    `version` is None when the text came from the local fallback — there is no
-    Langfuse version to attribute the answer to in that case.
-    """
-
-    name: str
-    text: str
-    version: Optional[int] = None
-    is_fallback: bool = True
-
-
 def _get_client():
-    """Return a Langfuse client, or None if credentials are not configured."""
-    global _langfuse, _initialised
-    if _initialised:
-        return _langfuse
-
-    _initialised = True
-    from config.settings import get_settings  # imported lazily to avoid circular deps
-    settings = get_settings()
-
-    if not settings.langfuse_public_key:
-        logger.info(
-            "LANGFUSE_PUBLIC_KEY not set — prompt management disabled; using local prompts"
-        )
-        return None
-
-    try:
-        from langfuse import Langfuse
-
-        creds = {
-            "public_key": settings.langfuse_public_key,
-            "secret_key": settings.langfuse_secret_key,
-        }
-        # The server-URL kwarg was renamed between SDK majors: v2 takes `host=`,
-        # v3+ take `base_url=` (which also outranks env vars). requirements.txt
-        # does not pin a major, so accept either rather than failing closed into
-        # permanent local-fallback on a TypeError.
-        try:
-            _langfuse = Langfuse(base_url=settings.langfuse_base_url, **creds)
-        except TypeError:
-            _langfuse = Langfuse(host=settings.langfuse_base_url, **creds)
-
-        logger.info(
-            "Langfuse prompt management enabled",
-            extra={"langfuse_base_url": settings.langfuse_base_url},
-        )
-    except Exception as exc:
-        logger.warning("Langfuse init failed — using local prompts: %s", exc)
-
-    return _langfuse
+    """The shared Langfuse client (see k8fy.langfuse_client)."""
+    return get_client()
 
 
 def resolve(name: str, fallback: str) -> ResolvedPrompt:
@@ -176,6 +142,7 @@ def resolve(name: str, fallback: str) -> ResolvedPrompt:
         text=text,
         version=getattr(prompt, "version", None),
         is_fallback=False,
+        raw=prompt,
     )
 
 
