@@ -162,6 +162,41 @@ aws secretsmanager put-secret-value \
   --secret-string '{"api_key":"sk-ant-YOUR-KEY-HERE"}'
 ```
 
+**Put the RAW key in there, never the secret's existing JSON.** This command
+replaces the whole value, so passing the current value as `api_key` wraps it one
+level deeper each time you run it. Seen for real on 2026-08-30: the secret ended
+up triple-wrapped —
+
+```json
+{"api_key":"{\"api_key\":\"{\\\"api_key\\\":\\\"sk-ant-...\\\"}\"}"}
+```
+
+— the agent sent that JSON as its `x-api-key`, and **every Tier-2 query 401'd for
+hours** while the eval suite still reported mean 0.935. The agent now unwraps
+nested layers and refuses to start if the value is still JSON, but the stored
+value should be correct rather than rescued.
+
+Verify after writing:
+
+```bash
+aws secretsmanager get-secret-value --secret-id agentify/dev/anthropic \
+  --region ap-southeast-2 --query SecretString --output text \
+  | python3 -c "import sys,json;v=json.load(sys.stdin)['api_key'];\
+print('OK' if v.startswith('sk-ant-') else 'STILL WRAPPED -> '+v[:60])"
+```
+
+Then push it to the cluster and restart the agent so it re-reads at startup:
+
+```bash
+kubectl create secret generic agentify-anthropic-secret -n agentify \
+  --from-literal=api_key="$(aws secretsmanager get-secret-value \
+     --secret-id agentify/dev/anthropic --region ap-southeast-2 \
+     --query SecretString --output text | python3 -c 'import sys,json;print(json.load(sys.stdin)["api_key"])')" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl rollout restart deploy/agentify-agent -n agentify
+```
+
 ---
 
 ## Step 5 — Configure kubeconfig

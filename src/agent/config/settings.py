@@ -26,16 +26,66 @@ def _fetch_secret(secret_name: str, region: str) -> str:
         ) from e
 
     raw = response.get("SecretString") or ""
-    try:
-        data = json.loads(raw)
-        return (
+
+    # Unwrap repeatedly, not once.
+    #
+    # Seen in production 2026-08-30: the secret held
+    #   {"api_key": "{\"api_key\": \"{\\\"api_key\\\": \\\"sk-ant-...\\\"}\"}"}
+    # — three nested layers, because DEPLOYMENT.md Step 4 writes
+    # {"api_key": "<value>"} and someone pasted the secret's existing JSON as
+    # <value>, once per run. A single unwrap returned a JSON string, the agent
+    # sent that as x-api-key, and EVERY Tier-2 call 401'd for hours while the
+    # eval suite still reported mean 0.935.
+    key = raw
+    for _ in range(6):  # bounded: a malformed secret must not spin
+        stripped = key.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            break
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            break
+        if not isinstance(data, dict):
+            break
+        inner = (
             data.get("ANTHROPIC_API_KEY")
             or data.get("CLAUDE_API_KEY")
             or data.get("api_key")
-            or raw
         )
-    except (json.JSONDecodeError, AttributeError):
-        return raw
+        if not isinstance(inner, str) or not inner:
+            break
+        key = inner
+        if key is not raw:
+            logger.warning(
+                "Secret '%s' was nested — unwrapped one more level. Fix the stored "
+                "value; see docs/DEPLOYMENT.md Step 4.",
+                secret_name,
+            )
+
+    key = key.strip()
+
+    # Fail loudly on a value that cannot possibly be an API key. Passing JSON
+    # through as x-api-key produces a 401 on every request, which surfaces far
+    # from the cause — the whole point of this check is to fail at startup
+    # instead, where the message can name the actual problem.
+    if key.startswith("{"):
+        raise RuntimeError(
+            f"Secret '{secret_name}' does not contain an API key — after unwrapping it is "
+            "still JSON. The stored value is malformed (likely wrapped more than once by "
+            "repeated 'put-secret-value' runs). Rewrite it as "
+            '\'{"api_key":"sk-ant-..."}\' with the raw key.'
+        )
+    if not key:
+        raise RuntimeError(f"Secret '{secret_name}' is empty.")
+    if not key.startswith("sk-ant-"):
+        # Not fatal: a gateway or in-region endpoint (ADR 0007's ANTHROPIC_BASE_URL
+        # override) can legitimately use a differently-shaped credential.
+        logger.warning(
+            "Secret '%s' does not look like an Anthropic key (expected 'sk-ant-' prefix). "
+            "Continuing — this is expected only when using a gateway or in-region endpoint.",
+            secret_name,
+        )
+    return key
 
 
 def _fetch_langfuse_secrets(secret_name: str, region: str) -> dict:
