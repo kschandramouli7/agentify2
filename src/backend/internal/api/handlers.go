@@ -186,6 +186,12 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	if ns, ok := req.Context["namespace"]; ok {
 		namespace = ns.(string)
 	}
+	// The service the question is about, when the caller supplied one. Used for
+	// semantic-memory attribution (P8) — previously mis-derived from a pod ID.
+	service := ""
+	if sv, ok := req.Context["service"].(string); ok {
+		service = sv
+	}
 
 	// Extract intent or infer from question
 	// For MVP: use simple heuristics to determine intent
@@ -198,7 +204,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Error("failed to route query", "error", err)
 		telemetry.QueriesTotal.WithLabelValues(intent, "none", "error").Inc()
-		h.logTrace(traceID, req.Question, intent, namespace, "none", "error", nil, 0, nil, start, nil, "", isEval)
+		h.logTrace(traceID, req.Question, intent, namespace, "none", "error", nil, 0, nil, start, nil, traceMeta{IsEval: isEval, Service: service})
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -212,7 +218,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			TraceID:    traceID,
 		}
 		telemetry.QueriesTotal.WithLabelValues(intent, "no_data", "no_data").Inc()
-		h.logTrace(traceID, req.Question, intent, namespace, "no_data", "no_data", nil, 0, nil, start, nil, "", isEval)
+		h.logTrace(traceID, req.Question, intent, namespace, "no_data", "no_data", nil, 0, nil, start, nil, traceMeta{IsEval: isEval, Service: service})
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
@@ -250,7 +256,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("answered via deterministic fast-path", "intent", intent, "pods", len(pods))
 		telemetry.QueriesTotal.WithLabelValues(intent, "tier1", "ok").Inc()
 		telemetry.QueryDuration.WithLabelValues("tier1").Observe(time.Since(start).Seconds())
-		h.logTrace(traceID, req.Question, intent, namespace, "tier1", resp.Status, resp.Sources, resp.Confidence, nil, start, nil, "", isEval)
+		h.logTrace(traceID, req.Question, intent, namespace, "tier1", resp.Status, resp.Sources, resp.Confidence, nil, start, nil, traceMeta{IsEval: isEval, Service: service})
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -276,7 +282,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			Sources:    extractPodIDs(pods),
 			TraceID:    traceID,
 		}
-		h.logTrace(traceID, req.Question, intent, namespace, "tier2", "partial", resp.Sources, 0.5, nil, start, nil, "", isEval)
+		h.logTrace(traceID, req.Question, intent, namespace, "tier2", "partial", resp.Sources, 0.5, nil, start, nil, traceMeta{IsEval: isEval, Service: service})
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
@@ -311,7 +317,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		Intent:     intent,
 		Tier:       "tier2",
 	}
-	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, "", isEval)
+	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, traceMeta{IsEval: isEval, Service: service})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -726,14 +732,24 @@ func buildPodQuery(reqContext map[string]interface{}) map[string]interface{} {
 // logTrace emits the per-query provenance record (spec 004): structured log +
 // async Postgres insert so the HTTP response is never blocked.
 // agentResp may be nil for Tier-1 / error paths (no LLM call was made).
-// sessionID is last and follows a pointer parameter deliberately: it is one more
-// string in a long positional list, and placing it next to the other strings
-// would let a mis-ordered call compile while silently recording the wrong value.
-// "" means the query was single-shot rather than part of a conversation.
-func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status string, sources []string, confidence float64, toolCalls []string, start time.Time, agentResp *AgentResponse, sessionID string, isEval bool) {
+// traceMeta carries the fields that are not part of a trace's core identity.
+//
+// A struct rather than three more positional parameters: logTrace already takes
+// eleven, and appending same-typed strings to that list lets a mis-ordered call
+// compile while silently recording the wrong value. Named fields cannot be
+// transposed.
+type traceMeta struct {
+	SessionID string // "" = single-shot query, not part of a conversation
+	IsEval    bool   // true = synthetic /admin/eval/query traffic (ADR 0030)
+	Service   string // the service the query was about; attribution for semantic memory
+}
+
+func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status string, sources []string, confidence float64, toolCalls []string, start time.Time, agentResp *AgentResponse, meta traceMeta) {
 	latencyMs := time.Since(start).Milliseconds()
 	var inTok, outTok, cacheWriteTok, cacheReadTok int64
 	var cost float64
+	sessionID := meta.SessionID
+	isEval := meta.IsEval
 	var promptName string
 	var promptVersion *int
 	if agentResp != nil {
@@ -801,7 +817,7 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 			// P8 — Semantic memory: embed Tier-2 diagnose traces so DiagnoseSkill
 			// can retrieve similar past incidents as few-shot context.
 			if tier == "tier2" && intent == "diagnose" && agentResp != nil {
-				go h.embedAndStoreIncident(rowID, traceID, namespace, intent, agentResp)
+				go h.embedAndStoreIncident(rowID, traceID, namespace, meta.Service, agentResp)
 			}
 		}()
 	}
@@ -810,7 +826,7 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 // embedAndStoreIncident calls the agent's /embed endpoint and stores the
 // resulting vector in incident_embeddings. Never blocks the query response —
 // called from a goroutine. Silently skips if the embed service is unavailable.
-func (h *Handler) embedAndStoreIncident(rowID, traceID, namespace, intent string, agentResp *AgentResponse) {
+func (h *Handler) embedAndStoreIncident(rowID, traceID, namespace, service string, agentResp *AgentResponse) {
 	// Build a compact summary from the structured diagnosis fields.
 	details := agentResp.Details
 	headline, _ := details["headline"].(string)
@@ -826,14 +842,16 @@ func (h *Handler) embedAndStoreIncident(rowID, traceID, namespace, intent string
 		return
 	}
 
-	// Derive the service name from the sources list (e.g. "k8fy.live-state.payments" → "payments").
-	service := ""
-	for _, src := range agentResp.Sources {
-		if strings.HasPrefix(src, "k8fy.live-state.") {
-			service = strings.TrimPrefix(src, "k8fy.live-state.")
-			break
-		}
-	}
+	// service comes from the request context, not from the sources list.
+	//
+	// It used to be reverse-engineered as strings.TrimPrefix(src,
+	// "k8fy.live-state."), but that suffix is the NAMESPACE partition — pod IDs
+	// are "{family}.{partition}" where partition is the namespace (see
+	// ingester.go routeAndCreatePod), optionally with a cluster segment under
+	// ADR 0024. So every row was stored with service = namespace, and
+	// FindSimilarIncidents' recency fallback (WHERE service = $2, given a real
+	// service name) matched nothing. With pgvector absent, semantic memory
+	// returned an empty list every time.
 
 	// Call the agent's /embed endpoint with a 10 s deadline.
 	type embedResp struct {
@@ -1444,7 +1462,7 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	if agentErr == nil && agentResp != nil {
 		h.logTrace(traceID, req.Content, "chat", s.Namespace, "tier2", "ok",
 			agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls),
-			start, agentResp, s.ID, false)
+			start, agentResp, traceMeta{SessionID: s.ID, Service: s.Service})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1657,8 +1675,7 @@ func (h *Handler) HandleCertRenew(w http.ResponseWriter, r *http.Request) {
 		nil,
 		start,
 		agentResp,
-		"",    // cert renewal is a single action, not a conversation turn
-		false, // real traffic, not an eval run
+		traceMeta{Service: req.Service}, // single action, not a conversation turn; not an eval
 	)
 
 	writeJSON(w, http.StatusOK, resp)
