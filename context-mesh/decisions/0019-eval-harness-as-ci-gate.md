@@ -114,3 +114,49 @@ scripts/run_evals.py
   after rollout completes, not on every PR.
 - **Revisit if:** Dataset grows beyond 50 cases — at that point consider the Batch
   API (50% discount) for eval runs to control cost.
+
+## Correction (2026-08-30)
+
+Appended rather than edited, per this directory's append-only rule. The decision
+stands; two factual claims in "Langfuse integration points" above are wrong, and
+one has a consequence worth acting on.
+
+**1. "`langfuse.score(trace_id, name, value)` attaches the eval score to the
+existing trace" — there is no existing Langfuse trace.** Verified 2026-08-30: the
+agent service emits **no Langfuse traces or observations at all**. There is no
+`@observe`, `start_observation`, `update_current_generation`, or
+`propagate_attributes` anywhere in `src/agent`; Langfuse is wired for prompt
+management only (`k8fy/prompt_manager.py`). The `trace_id` this ADR refers to is
+agentify's own identifier from `traces` (spec 004), unrelated to Langfuse.
+
+`scripts/run_evals.py` therefore **fabricates** a Langfuse trace so the score has
+somewhere to live — its own comment says so:
+
+```python
+# Create a trace in Langfuse so the score has something to attach to.
+lf_trace = lf.trace(...)
+item.link(lf_trace, run_name)
+lf.create_score(...)
+```
+
+**2. "Eval results visible in Langfuse UI alongside the production traces" —
+follows from the same error.** There are no production traces in Langfuse to sit
+alongside. The only Langfuse traces in the project are the synthetic ones this
+script creates during CI runs.
+
+**Consequences of the correction:**
+
+- The eval gate still works as designed — dataset items run against the deployed
+  backend and the mean score gates the deploy. Nothing about the gate's value
+  depends on the misconception.
+- But the scoring path is fragile: `lf.trace()` and `item.link()` are **v2-only
+  APIs**, which is why CI installs `langfuse>=2.0.0,<3.0.0` for these scripts
+  while the agent (as of 2026-08-30) pins `>=4.14.0,<5.0.0`. Two majors of one
+  API-breaking dependency in one repo is a known inconsistency, retired by
+  migrating these scripts to the v4 dataset/experiment API.
+- Real production tracing is tracked as **ROADMAP P19 gap E**, and it is a
+  prerequisite for anything that judges live traffic — Langfuse's LLM-as-a-Judge
+  evaluators attach to *observations*, so with none emitted there is nothing for
+  a judge to run on. Trace-level evaluators are additionally legacy and stop
+  producing results on Langfuse Cloud after 2026-11-16, so instrumentation
+  should target observation level from the start.

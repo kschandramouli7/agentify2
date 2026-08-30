@@ -10,6 +10,19 @@ redis==5.0.1
 sqlalchemy==2.0.23
 python-dotenv==1.0.0
 structlog==23.2.0
-langfuse>=2.0.0
+# Pinned to a major deliberately (2026-08-30). Langfuse renames APIs across
+# majors (the server-URL kwarg moved from host= in v2 to base_url= in v3+), and
+# since prompts are now resolved per request (P19 gap B) an SDK break would
+# silently drop every skill back to its hardcoded fallback — quietly, because
+# resolve()'s negative cache logs once per prompt per minute and answers still
+# look correct. >=4.14 is what python:3.11-slim already resolves to, and is the
+# floor for propagate_attributes(), needed for conversation-level tracing
+# (P19 gap E).
+#
+# NOTE: scripts/run_evals.py and scripts/seed_eval_dataset.py are installed
+# separately in CI with an explicit "<3.0.0" because they use the v2 dataset API
+# (lf.trace(), item.link()). That split is intentional but is a known
+# inconsistency, not a design: migrating those scripts to v4 retires it.
+langfuse>=4.14.0,<5.0.0
 cryptography>=42.0.0
 voyageai>=0.3.0

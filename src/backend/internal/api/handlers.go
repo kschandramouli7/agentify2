@@ -194,7 +194,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.logger.Error("failed to route query", "error", err)
 		telemetry.QueriesTotal.WithLabelValues(intent, "none", "error").Inc()
-		h.logTrace(traceID, req.Question, intent, namespace, "none", "error", nil, 0, nil, start, nil)
+		h.logTrace(traceID, req.Question, intent, namespace, "none", "error", nil, 0, nil, start, nil, "")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -208,7 +208,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			TraceID:    traceID,
 		}
 		telemetry.QueriesTotal.WithLabelValues(intent, "no_data", "no_data").Inc()
-		h.logTrace(traceID, req.Question, intent, namespace, "no_data", "no_data", nil, 0, nil, start, nil)
+		h.logTrace(traceID, req.Question, intent, namespace, "no_data", "no_data", nil, 0, nil, start, nil, "")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
@@ -246,7 +246,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info("answered via deterministic fast-path", "intent", intent, "pods", len(pods))
 		telemetry.QueriesTotal.WithLabelValues(intent, "tier1", "ok").Inc()
 		telemetry.QueryDuration.WithLabelValues("tier1").Observe(time.Since(start).Seconds())
-		h.logTrace(traceID, req.Question, intent, namespace, "tier1", resp.Status, resp.Sources, resp.Confidence, nil, start, nil)
+		h.logTrace(traceID, req.Question, intent, namespace, "tier1", resp.Status, resp.Sources, resp.Confidence, nil, start, nil, "")
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -272,7 +272,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 			Sources:    extractPodIDs(pods),
 			TraceID:    traceID,
 		}
-		h.logTrace(traceID, req.Question, intent, namespace, "tier2", "partial", resp.Sources, 0.5, nil, start, nil)
+		h.logTrace(traceID, req.Question, intent, namespace, "tier2", "partial", resp.Sources, 0.5, nil, start, nil, "")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(resp)
@@ -307,7 +307,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		Intent:     intent,
 		Tier:       "tier2",
 	}
-	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp)
+	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, "")
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -722,7 +722,11 @@ func buildPodQuery(reqContext map[string]interface{}) map[string]interface{} {
 // logTrace emits the per-query provenance record (spec 004): structured log +
 // async Postgres insert so the HTTP response is never blocked.
 // agentResp may be nil for Tier-1 / error paths (no LLM call was made).
-func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status string, sources []string, confidence float64, toolCalls []string, start time.Time, agentResp *AgentResponse) {
+// sessionID is last and follows a pointer parameter deliberately: it is one more
+// string in a long positional list, and placing it next to the other strings
+// would let a mis-ordered call compile while silently recording the wrong value.
+// "" means the query was single-shot rather than part of a conversation.
+func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status string, sources []string, confidence float64, toolCalls []string, start time.Time, agentResp *AgentResponse, sessionID string) {
 	latencyMs := time.Since(start).Milliseconds()
 	var inTok, outTok, cacheWriteTok, cacheReadTok int64
 	var cost float64
@@ -755,6 +759,7 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 		"estimated_cost_usd", cost,
 		"prompt_name", promptName,
 		"prompt_version", promptVersion,
+		"session_id", sessionID,
 	)
 	if h.traceStore != nil {
 		go func() {
@@ -781,6 +786,7 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 				EstimatedCostUSD:         cost,
 				PromptName:               promptName,
 				PromptVersion:            promptVersion,
+				SessionID:                sessionID,
 			}); err != nil {
 				h.logger.Warn("trace persist failed", "error", err)
 				return
@@ -1429,7 +1435,7 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	if agentErr == nil && agentResp != nil {
 		h.logTrace(traceID, req.Content, "chat", s.Namespace, "tier2", "ok",
 			agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls),
-			start, agentResp)
+			start, agentResp, s.ID)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1642,6 +1648,7 @@ func (h *Handler) HandleCertRenew(w http.ResponseWriter, r *http.Request) {
 		nil,
 		start,
 		agentResp,
+		"", // cert renewal is a single action, not a conversation turn
 	)
 
 	writeJSON(w, http.StatusOK, resp)

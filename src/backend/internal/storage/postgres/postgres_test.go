@@ -1039,6 +1039,54 @@ func TestTracePromptProvenance(t *testing.T) {
 		}
 	}
 
+	t.Run("session_id round-trips and groups a conversation's turns", func(t *testing.T) {
+		// Conversation-level evaluation (ROADMAP P19 gap F) needs the turns of one
+		// conversation to be identifiable. Before session_id existed, evidence
+		// (this table) and conversation text (chat_sessions.messages) could not be
+		// joined, so "what context should have been available earlier" — which is
+		// inherently multi-turn — was not expressible.
+		for i, id := range []string{"conv-turn-1", "conv-turn-2"} {
+			v := i + 1
+			if err := client.InsertTrace(ctx, TraceRecord{
+				ID: id, TraceID: id, Question: "why is it crashing", Intent: "chat",
+				Namespace: "payments", Tier: "tier2", Status: "ok", Confidence: 0.7,
+				PromptName: "k8fy/chat", PromptVersion: &v, SessionID: "sess-abc",
+			}); err != nil {
+				t.Fatalf("insert %s: %v", id, err)
+			}
+		}
+		// A single-shot query must NOT be attributed to any conversation.
+		insert("one-shot", "k8fy/health-check", nil)
+
+		got, err := client.GetTrace(ctx, "conv-turn-2")
+		if err != nil {
+			t.Fatalf("GetTrace: %v", err)
+		}
+		if got.SessionID != "sess-abc" {
+			t.Errorf("SessionID = %q, want sess-abc", got.SessionID)
+		}
+
+		traces, err := client.ListTraces(ctx, 100)
+		if err != nil {
+			t.Fatalf("ListTraces: %v", err)
+		}
+		var inConv, oneShot int
+		for _, tr := range traces {
+			switch tr.SessionID {
+			case "sess-abc":
+				inConv++
+			case "":
+				oneShot++
+			}
+		}
+		if inConv != 2 {
+			t.Errorf("turns grouped under sess-abc = %d, want 2", inConv)
+		}
+		if oneShot == 0 {
+			t.Error("expected at least one trace with an empty SessionID (single-shot query)")
+		}
+	})
+
 	t.Run("a Langfuse-served prompt round-trips its name and version", func(t *testing.T) {
 		v := 7
 		insert("trace-versioned", "k8fy/health-check", &v)

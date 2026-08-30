@@ -37,6 +37,7 @@ type TraceResponse struct {
 	EstimatedCostUSD         float64   `json:"estimated_cost_usd"`
 	PromptName               string    `json:"prompt_name"`
 	PromptVersion            *int      `json:"prompt_version"`
+	SessionID                string    `json:"session_id"`
 }
 
 // MetricsSummaryResponse is returned by GET /admin/metrics/summary.
@@ -72,6 +73,7 @@ func traceToResponse(t pgstore.TraceRecord) TraceResponse {
 		EstimatedCostUSD:         t.EstimatedCostUSD,
 		PromptName:               t.PromptName,
 		PromptVersion:            t.PromptVersion,
+		SessionID:                t.SessionID,
 	}
 }
 
