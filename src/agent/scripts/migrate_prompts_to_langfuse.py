@@ -89,6 +89,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("names", nargs="*", help="only seed these prompt names (default: all)")
     ap.add_argument(
+        "--label",
+        default=PRODUCTION_LABEL,
+        help=f"label for the created version (default: {PRODUCTION_LABEL}). Use "
+             "'staging' to publish a CANDIDATE for the promotion gate without "
+             "touching live traffic.",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="re-push prompts that already exist, creating a new version and moving "
@@ -111,6 +118,12 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # A candidate label is always a NEW version by definition, so
+    # seed-only-if-absent must not apply: the prompt almost certainly already
+    # exists on `production`, and skipping would mean never being able to publish
+    # a candidate at all.
+    publishing_candidate = args.label != PRODUCTION_LABEL
 
     selected = [(n, c) for n, c in PROMPTS if not args.names or n in set(args.names)]
     if args.names:
@@ -143,11 +156,17 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Connected to Langfuse at {base_url}")
-    print(f"Mode: {'FORCE re-push' if args.force else 'seed only if absent'}\n")
+    if publishing_candidate:
+        mode = f"publish CANDIDATE on label '{args.label}' (live traffic untouched)"
+    elif args.force:
+        mode = "FORCE re-push (moves the production label)"
+    else:
+        mode = "seed only if absent"
+    print(f"Mode: {mode}\n")
 
     created = skipped = failed = 0
     for name, content in selected:
-        if not args.force:
+        if not args.force and not publishing_candidate:
             try:
                 present = _exists(lf, name)
             except SeedError as exc:
@@ -163,7 +182,7 @@ def main() -> None:
                 name=name,
                 type="text",
                 prompt=content,
-                labels=[PRODUCTION_LABEL],
+                labels=[args.label],
             )
             print(f"  OK   {name}  (version {prompt.version})")
             created += 1
@@ -173,6 +192,13 @@ def main() -> None:
 
     print(f"\nCreated {created}, skipped {skipped}, failed {failed}.")
     print("Verify in Langfuse UI → Prompts (filter by \"k8fy/\").")
+    if publishing_candidate and created:
+        print(
+            f"\nCandidate published on '{args.label}'. It is NOT serving traffic.\n"
+            "Next: GitHub Actions → '10 · Prompt promotion gate' → Run workflow with "
+            f"prompt_label={args.label}, then move the 'production' label yourself "
+            "if it passes."
+        )
     if failed:
         sys.exit(1)
 

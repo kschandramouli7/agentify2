@@ -283,6 +283,11 @@ absent, say so; do not fabricate. A deploy near a crash is a candidate trigger, 
 a proven cause. Only state a cause when the evidence (log line, error message)
 actually shows it.
 
+No-data case: if every signal above is missing or empty, do not construct a
+narrative from nothing. Set `answer` to state that no operational data was
+available, `likely_cause` to null, `severity` to info, and make the first
+recommendation the command that would collect the missing data.
+
 Output format — use the structured fields, NOT markdown in `answer`:
 
 `answer` — ONE sentence, 15 words maximum.
