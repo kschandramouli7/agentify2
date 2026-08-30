@@ -376,3 +376,49 @@ def test_a_broken_candidate_does_not_suppress_production(monkeypatch):
     assert prod.is_fallback is False
     assert prod.text == "prod text"
     assert calls.count(("version", 99)) == 1, "candidate retried despite cooldown"
+
+
+# ---------------------------------------------------------------------------
+# The pin is scoped to ONE prompt
+# ---------------------------------------------------------------------------
+# Regression guard for a real bug: the first version of the gate pinned every
+# prompt the dataset touched. Only the gated prompt had a candidate version, so
+# the others 404'd and resolved to their LOCAL FALLBACKS — the run scored one
+# candidate plus several fallbacks instead of the production baseline, and
+# reported a pass.
+
+def test_pin_applies_only_to_the_named_prompt(monkeypatch):
+    seen = []
+
+    def fake_resolve(name, fallback, **kw):
+        seen.append((name, kw))
+        return ResolvedPrompt(name=name, text="t", version=1, is_fallback=False)
+
+    monkeypatch.setattr(agent_mod, "resolve_prompt", fake_resolve)
+
+    gated = K8fyAgent(prompt_name="k8fy/diagnose", prompt_fallback=FALLBACK)
+    other = K8fyAgent(prompt_name="k8fy/health-check", prompt_fallback=FALLBACK)
+    pin = {"only_for": "k8fy/diagnose", "label": "staging"}
+
+    gated._resolve_system_prompt(pin)
+    other._resolve_system_prompt(pin)
+
+    assert seen[0] == ("k8fy/diagnose", {"label": "staging"}), "gated prompt must be pinned"
+    assert seen[1] == ("k8fy/health-check", {}), (
+        "a prompt the pin does not name must resolve normally, or the rest of the "
+        "dataset silently runs on fallbacks"
+    )
+
+
+def test_unscoped_pin_still_applies(monkeypatch):
+    # Backwards compatible: a pin with no only_for applies to whatever resolves.
+    seen = []
+    monkeypatch.setattr(
+        agent_mod, "resolve_prompt",
+        lambda name, fallback, **kw: seen.append((name, kw))
+        or ResolvedPrompt(name=name, text="t", version=1, is_fallback=False),
+    )
+    K8fyAgent(prompt_name="k8fy/diagnose", prompt_fallback=FALLBACK)._resolve_system_prompt(
+        {"version": 5}
+    )
+    assert seen == [("k8fy/diagnose", {"version": 5})]

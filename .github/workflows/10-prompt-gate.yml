@@ -49,6 +49,10 @@ on:
     types: [langfuse-prompt-update]
   workflow_dispatch:
     inputs:
+      prompt_name:
+        description: "The ONE prompt being gated, e.g. k8fy/diagnose (required)"
+        required: true
+        default: "k8fy/diagnose"
       prompt_label:
         description: "Langfuse label to gate (default: staging)"
         required: false
@@ -84,18 +88,25 @@ jobs:
           # workflow_dispatch takes it from the form. Default to the staging
           # label, which is the convention this gate assumes: candidates are
           # labelled `staging`, and only a human moves `production`.
+          NAME="${{ github.event.inputs.prompt_name }}"
           LABEL="${{ github.event.inputs.prompt_label }}"
           VERSION="${{ github.event.inputs.prompt_version }}"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            NAME="${{ github.event.client_payload.name }}"
             LABEL="staging"
             VERSION="${{ github.event.client_payload.version }}"
             echo "Triggered by Langfuse for prompt '${{ github.event.client_payload.name }}' \
               version '${{ github.event.client_payload.version }}' labels '${{ github.event.client_payload.labels }}'"
           fi
           [ -z "$LABEL" ] && LABEL="staging"
+          if [ -z "$NAME" ]; then
+            echo "::error::prompt_name is required — the dataset spans several prompts, so an unscoped pin would resolve the others to their local fallbacks instead of production."
+            exit 1
+          fi
+          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
           echo "label=$LABEL"     >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Gating label='$LABEL' version='$VERSION'"
+          echo "Gating name='$NAME' label='$LABEL' version='$VERSION'"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -137,11 +148,14 @@ jobs:
 
           python scripts/seed_eval_dataset.py
 
-          ARGS=""
+          # run_evals.py refuses to run if the pinned prompt does not exist, rather
+          # than letting the agent fall back to its local string and reporting a
+          # pass for a candidate that was never tested.
+          ARGS="--prompt-name ${{ steps.target.outputs.name }}"
           if [ -n "${{ steps.target.outputs.version }}" ]; then
-            ARGS="--prompt-version ${{ steps.target.outputs.version }}"
+            ARGS="$ARGS --prompt-version ${{ steps.target.outputs.version }}"
           else
-            ARGS="--prompt-label ${{ steps.target.outputs.label }}"
+            ARGS="$ARGS --prompt-label ${{ steps.target.outputs.label }}"
           fi
 
           set +e
@@ -168,6 +182,7 @@ jobs:
           {
             echo "### Prompt promotion gate"
             echo ""
+            echo "- prompt: \`${{ steps.target.outputs.name }}\`"
             echo "- label: \`${{ steps.target.outputs.label }}\`"
             echo "- version: \`${{ steps.target.outputs.version }}\`"
             echo "- threshold: 0.85 against \`k8fy-regression\`"

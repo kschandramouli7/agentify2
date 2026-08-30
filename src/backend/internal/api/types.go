@@ -232,10 +232,18 @@ type QueryRequest struct {
 // set. Empty/zero means "resolve normally", which makes this endpoint a
 // bearer-authenticated mirror of /api/query when no pin is given.
 type EvalQueryRequest struct {
-	Question      string                 `json:"question"`
-	Context       map[string]interface{} `json:"context"`
-	PromptLabel   string                 `json:"prompt_label,omitempty"`
-	PromptVersion int                    `json:"prompt_version,omitempty"`
+	Question string                 `json:"question"`
+	Context  map[string]interface{} `json:"context"`
+	// PromptName scopes the pin to ONE prompt (e.g. "k8fy/diagnose"). Required
+	// when pinning: the dataset spans several intents and therefore several
+	// prompts, so an unscoped pin would resolve every skill's prompt at the
+	// candidate label. Those that have no such version fall back to their local
+	// string — meaning the run would score a mixture of one candidate and
+	// several fallbacks, not the production baseline. Empty name + a pin is
+	// rejected.
+	PromptName    string `json:"prompt_name,omitempty"`
+	PromptLabel   string `json:"prompt_label,omitempty"`
+	PromptVersion int    `json:"prompt_version,omitempty"`
 }
 
 // ToolCallInfo describes one tool call made by Claude during reasoning.

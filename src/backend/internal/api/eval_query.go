@@ -98,20 +98,32 @@ func (h *Handler) HandleEvalQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pinned := req.PromptVersion > 0 || req.PromptLabel != ""
+	if pinned && req.PromptName == "" {
+		// Refuse rather than silently pin every prompt: an unscoped pin makes the
+		// run score a mixture of one candidate and several fallbacks.
+		h.logger.Warn("eval query rejected: pin given without prompt_name")
+		http.Error(w, "prompt_name is required when prompt_label or prompt_version is set", http.StatusBadRequest)
+		return
+	}
+
 	inner := QueryRequest{Question: req.Question, Context: req.Context}
 	if inner.Context == nil {
 		inner.Context = map[string]interface{}{}
 	}
-	// Version wins over label when both are given: a version is unambiguous,
-	// whereas a label can be moved underneath a run mid-flight.
-	switch {
-	case req.PromptVersion > 0:
-		inner.Context["prompt_version"] = req.PromptVersion
-	case req.PromptLabel != "":
-		inner.Context["prompt_label"] = req.PromptLabel
+	if pinned {
+		inner.Context["prompt_name"] = req.PromptName
+		// Version wins over label when both are given: a version is unambiguous,
+		// whereas a label can be moved underneath a run mid-flight.
+		if req.PromptVersion > 0 {
+			inner.Context["prompt_version"] = req.PromptVersion
+		} else {
+			inner.Context["prompt_label"] = req.PromptLabel
+		}
 	}
 
 	h.logger.Info("eval query",
+		"prompt_name", req.PromptName,
 		"prompt_label", req.PromptLabel,
 		"prompt_version", req.PromptVersion,
 	)

@@ -82,6 +82,13 @@ def _pin_from(args, kwargs) -> Dict[str, Any]:
     if not isinstance(ctx, dict):
         return {}
     pin: Dict[str, Any] = {}
+    # The pin names exactly one prompt. The eval dataset spans several intents and
+    # therefore several prompts; applying a candidate label to all of them would
+    # resolve the ones without such a version to their local fallback, so the run
+    # would score one candidate plus several fallbacks instead of the production
+    # baseline. Matched against the skill's own name in _resolve_system_prompt.
+    if ctx.get("prompt_name"):
+        pin["only_for"] = str(ctx["prompt_name"])
     if ctx.get("prompt_version"):
         try:
             pin["version"] = int(ctx["prompt_version"])
@@ -473,7 +480,15 @@ class K8fyAgent:
             # Caller pinned an exact string; there is no Langfuse version to
             # attribute an answer to.
             return ResolvedPrompt(name=self._prompt_name, text=self._static_system_prompt)
-        return resolve_prompt(self._prompt_name, self._prompt_fallback, **(pin or {}))
+
+        pin = dict(pin or {})
+        only_for = pin.pop("only_for", None)
+        if only_for is not None and only_for != self._prompt_name:
+            # The pin targets a different skill's prompt; this one resolves
+            # normally, so the rest of the dataset measures the production
+            # baseline rather than a pile of fallbacks.
+            pin = {}
+        return resolve_prompt(self._prompt_name, self._prompt_fallback, **pin)
 
     def _system_text(self) -> str:
         """System prompt text for the in-flight request.

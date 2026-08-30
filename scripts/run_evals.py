@@ -126,6 +126,7 @@ def run_evals(
     backend_url: str,
     run_name: str,
     pass_threshold: float,
+    prompt_name: str = "",
     prompt_label: str = "",
     prompt_version: int = 0,
 ) -> bool:
@@ -155,6 +156,36 @@ def run_evals(
         return False
 
     print(f"Running {len(items)} eval items against {backend_url}")
+    # A pin that does not resolve is the dangerous case: the agent falls back to
+    # its local prompt string, produces perfectly good answers, and the gate
+    # reports "candidate cleared" for a candidate that was never used. Verified
+    # up front, before spending any model budget.
+    if prompt_label or prompt_version:
+        if not prompt_name:
+            print("ERROR: --prompt-name is required when pinning a label or version.",
+                  file=sys.stderr)
+            return False
+        target = f"version {prompt_version}" if prompt_version else f"label '{prompt_label}'"
+        try:
+            if prompt_version:
+                candidate = lf.get_prompt(prompt_name, version=prompt_version, cache_ttl_seconds=0)
+            else:
+                candidate = lf.get_prompt(prompt_name, label=prompt_label, cache_ttl_seconds=0)
+        except Exception as exc:
+            print(
+                f"ERROR: cannot gate {prompt_name} at {target} — it does not exist in "
+                f"Langfuse ({exc}).\n"
+                "       Publish the candidate first:\n"
+                f"         python3 scripts/migrate_prompts_to_langfuse.py "
+                f"--label {prompt_label or 'staging'} {prompt_name}\n"
+                "       Refusing to run: the agent would fall back to its local prompt "
+                "string and the gate would pass without testing anything.",
+                file=sys.stderr,
+            )
+            return False
+        pinned_version = getattr(candidate, "version", None)
+        print(f"Gating   : {prompt_name} {target} (resolved to version {pinned_version})")
+
     print(f"Run name : {run_name}")
     print(f"Gate     : mean score ≥ {pass_threshold}\n")
 
@@ -190,6 +221,7 @@ def run_evals(
         pinned = bool(prompt_label or prompt_version)
         if pinned:
             url = f"{backend_url}/admin/eval/query"
+            query_body["prompt_name"] = prompt_name
             if prompt_version:
                 query_body["prompt_version"] = prompt_version
             else:
@@ -287,6 +319,13 @@ def main() -> None:
         help="Name for this eval run in Langfuse (default: IMAGE_TAG env var)",
     )
     parser.add_argument(
+        "--prompt-name",
+        default="",
+        help="the ONE prompt being gated, e.g. k8fy/diagnose. Required when pinning: "
+             "the dataset spans several prompts, and an unscoped pin would resolve the "
+             "others to their local fallbacks instead of production.",
+    )
+    parser.add_argument(
         "--prompt-label",
         default="",
         help="gate this Langfuse prompt label (e.g. 'staging') instead of production",
@@ -309,6 +348,7 @@ def main() -> None:
         backend_url=args.backend_url,
         run_name=args.run_name,
         pass_threshold=args.pass_threshold,
+        prompt_name=args.prompt_name,
         prompt_label=args.prompt_label,
         prompt_version=args.prompt_version,
     )

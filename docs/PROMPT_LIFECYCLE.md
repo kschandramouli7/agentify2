@@ -83,7 +83,19 @@ You can also edit directly in the Langfuse UI and label the new version
 ### 3. Gate the candidate
 
 GitHub → Actions → **10 · Prompt promotion gate** → Run workflow, with
+`prompt_name` = the prompt you changed (e.g. `k8fy/diagnose`) and
 `prompt_label` = `staging` (or `prompt_version` for an exact version).
+
+`prompt_name` is **required**, and the pin applies only to that prompt. The
+dataset spans several intents and therefore several prompts; an unscoped pin
+would resolve the others at the candidate label too, 404, and fall back to their
+local strings — so the run would score one candidate plus several fallbacks
+instead of the production baseline.
+
+The gate also **refuses to run if the pinned prompt does not exist**. Without
+that check the agent falls back to its local string, produces good answers, and
+the gate reports "candidate cleared" for a candidate that was never used. Seen
+for real on 2026-08-30.
 
 The gate scores the candidate against the `k8fy-regression` Langfuse dataset via
 `POST /admin/eval/query` (ADR 0030) and fails below ADR 0019's 0.85 threshold.
