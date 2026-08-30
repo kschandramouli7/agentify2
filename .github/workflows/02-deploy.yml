@@ -518,6 +518,14 @@ jobs:
         # backend. Scores each item (intent routing, tier, status, required fields,
         # latency) and fails the deploy if the mean score drops below 0.85.
         # Skip when Langfuse credentials are not configured (opt-in per environment).
+        #
+        # THE GATE IS A THRESHOLD ON THE MEAN, which hides a single bad item.
+        # Found 2026-08-30: diagnose-payment-crash-001 returns status='error' on
+        # production, and every deploy still passed at mean 0.935. run_evals.py
+        # now emits a ::warning:: annotation per failing item, plus one saying the
+        # gate passed despite them — report-only, deliberately: a hard per-item
+        # gate would block every deploy until that pre-existing failure is fixed.
+        # Tighten to per-item once the dataset is clean.
         run: |
           if [ -z "$LANGFUSE_PUBLIC_KEY" ] || [ -z "$LANGFUSE_SECRET_KEY" ]; then
             echo "LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set — skipping evals"

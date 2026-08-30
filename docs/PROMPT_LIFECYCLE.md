@@ -275,6 +275,22 @@ curl -sS localhost:18080/admin/traces | python3 -m json.tool \
 | `prompt_version: null` on a **tier1** trace | Correct: no LLM call, so no prompt (ADR 0006) |
 | `prompt_name` empty on tier2 | Provenance plumbing is broken |
 
+### Per-item failures are reported, not gated
+
+Both eval gates threshold the **mean** (ADR 0019). A single failing item
+disappears into the average — `diagnose-payment-crash-001` returned
+`status='error'` on production while every deploy passed at mean 0.935.
+
+`run_evals.py` therefore emits a `::warning::` annotation per failing item, plus
+one stating the gate passed despite them, whenever it runs in GitHub Actions.
+**Report-only on purpose:** a hard per-item gate on the deploy path would block
+every deploy until that pre-existing failure is fixed. The *prompt* gate is
+stricter — it does fail when the gated prompt's own items fail — because a
+candidate has no business being promoted on a diluted average.
+
+Tightening the deploy gate to per-item is a policy decision to take once the
+dataset is clean.
+
 `02-deploy.yml`'s **Verify prompt provenance on traces** step asserts this on
 every deploy: a missing `prompt_name` fails the deploy, a null `prompt_version`
 warns. It warns rather than fails on purpose — coupling deploy success to

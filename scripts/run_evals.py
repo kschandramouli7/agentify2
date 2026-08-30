@@ -277,6 +277,9 @@ def run_evals(
     print(f"Gate     : mean score ≥ {pass_threshold}\n")
 
     scores: list[float] = []
+    # Every item's outcome, so per-item failures can be surfaced even when the
+    # mean clears the gate.
+    all_results: list = []
     # Scores for the items that actually exercise the pinned prompt.
     gated_scores: list = []
     session = requests.Session()
@@ -340,6 +343,7 @@ def run_evals(
         # ------------------------------------------------------------------
         score_val, detail = score_response(result, expected, latency_ms)
         scores.append(score_val)
+        all_results.append((item_id, score_val, detail))
         if prompt_name and INTENT_TO_PROMPT.get(expected.get("intent", "")) == prompt_name:
             gated_scores.append((item_id, score_val, detail))
 
@@ -396,6 +400,29 @@ def run_evals(
     mean = sum(scores) / len(scores) if scores else 0.0
     passed = mean >= pass_threshold
     symbol = "✓ PASS" if passed else "✗ FAIL"
+
+    # Report-only per-item failures.
+    #
+    # The gate is a threshold on the MEAN (ADR 0019), which hides a single bad
+    # item: diagnose-payment-crash-001 returned status='error' on production
+    # while every deploy passed at mean 0.935. These annotations make that
+    # impossible to miss without turning a pre-existing failure into a
+    # deployment freeze. Tighten to a hard per-item gate once the dataset is
+    # clean — that is a policy decision, not a bug fix.
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        below = [(i, v, d) for i, v, d in all_results if v < pass_threshold]
+        for item_id, val, detail in below:
+            print(
+                f"::warning title=Eval item below threshold::{item_id} scored "
+                f"{val:.2f} (threshold {pass_threshold}) — {detail}"
+            )
+        if below and passed:
+            print(
+                "::warning title=Eval gate passed with failing items::"
+                f"{len(below)} of {len(all_results)} items scored below "
+                f"{pass_threshold}, but the mean ({mean:.3f}) cleared the gate. "
+                "These are not blocking the deploy — they are also not fixed."
+            )
 
     print(f"\n{'─' * 72}")
     print(f"  {symbol}  mean={mean:.3f}  threshold={pass_threshold}")
