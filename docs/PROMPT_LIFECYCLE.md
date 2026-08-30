@@ -1,0 +1,192 @@
+# Prompt Lifecycle
+
+How a skill's system prompt gets changed, tested, promoted, and rolled back.
+
+> **The one thing to internalise:** prompts are **data served from Langfuse**, not
+> code shipped in the container. Editing `src/agent/k8fy/prompts.py` and deploying
+> **does not change production behaviour** — the Langfuse copy wins. Prompts ship
+> through Langfuse; the repo copy is a fallback and a seed.
+>
+> This inverted on 2026-08-29 (ROADMAP P19 gap B). Before then prompts were frozen
+> at process start, so a code deploy *was* how they changed.
+
+---
+
+## Where prompts live
+
+| Location | Role |
+|---|---|
+| **Langfuse**, label `production` | What actually answers live traffic |
+| `src/agent/k8fy/prompts.py` | Fallback when Langfuse is unreachable/unconfigured, and the seed content for first publish |
+| `k8fy.prompts.ALL_PROMPTS` | Canonical registry of every prompt name fetched at runtime |
+
+Eleven names are fetched at runtime: `k8fy/system`, `k8fy/health-check`,
+`k8fy/cert-audit`, `k8fy/change-history`, `k8fy/restart-trend`, `k8fy/diagnose`,
+`k8fy/vault-cert`, `k8fy/incident-responder`, `k8fy/deployment-guardian`,
+`k8fy/chat`, `k8fy/chat-structure`.
+
+`ALL_PROMPTS` is the single source of truth for both the startup prefetch
+(`app.py`) and the seeding script. A prompt used by a skill but missing from that
+registry runs on its fallback forever and can never be versioned — that is how
+three prompts sat unseeded until 2026-08-29 (P19 gap A). **Add new prompts to
+`ALL_PROMPTS`, not just to the skill.**
+
+## How resolution works at runtime
+
+`k8fy/prompt_manager.resolve()` is called **once per request**, not at import.
+
+- The Langfuse SDK caches client-side with **stale-while-revalidate** (default TTL
+  60s): a fresh cache returns with no network call; an expired one returns the
+  stale value immediately and refreshes in the background. So per-request
+  resolution costs effectively nothing.
+- `app.py` prefetches every prompt at startup so the first request never pays a
+  cold-cache fetch.
+- **Negative cache:** a failed resolve is not retried for `FAILURE_COOLDOWN_SECONDS`
+  (60s). `resolve()` is synchronous inside async handlers, and a failed fetch
+  against an unreachable Langfuse costs 0.9–3.1s that blocks the event loop for
+  *every* concurrent request. Without the cooldown, a Langfuse outage becomes a
+  per-request stall.
+- Per-request state lives in a `ContextVar`, never on the agent instance — skills
+  are process-wide singletons via `SkillRouter`, so instance state would race
+  across concurrent queries.
+
+**Net effect: promoting the `production` label reaches live traffic within ~60s,
+with no pod restart.**
+
+---
+
+## Changing an existing prompt
+
+### 1. Edit the repo copy (keeps the fallback honest)
+
+Edit the constant in `src/agent/k8fy/prompts.py` and commit. This does **not**
+change production; it keeps the fallback and future seeds in step with reality.
+
+### 2. Publish it as a candidate on `staging`
+
+```bash
+cd src/agent
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+export LANGFUSE_BASE_URL=https://us.cloud.langfuse.com   # must match settings.py
+
+python3 scripts/migrate_prompts_to_langfuse.py --label staging k8fy/diagnose
+```
+
+`--label staging` publishes a new version **without touching live traffic**.
+Naming one or more prompt names limits the run to those.
+
+You can also edit directly in the Langfuse UI and label the new version
+`staging` — equivalent, but then remember to mirror the text back into
+`prompts.py` so the fallback does not drift.
+
+### 3. Gate the candidate
+
+GitHub → Actions → **10 · Prompt promotion gate** → Run workflow, with
+`prompt_label` = `staging` (or `prompt_version` for an exact version).
+
+The gate scores the candidate against the `k8fy-regression` Langfuse dataset via
+`POST /admin/eval/query` (ADR 0030) and fails below ADR 0019's 0.85 threshold.
+Because that endpoint delegates to the real `HandleQuery`, the candidate is
+measured through the actual production path — routing, tiering, redaction and the
+backend↔agent boundary all included.
+
+The gate **never promotes anything**. A pass is evidence for a human.
+
+### 4. Promote
+
+In Langfuse, move the `production` label to the gated version. Live traffic picks
+it up within ~60s.
+
+### 5. Roll back
+
+Move `production` back to the previous version. Same ~60s, no redeploy. This is
+the fastest rollback in the system — faster than any code path.
+
+---
+
+## Adding a new prompt
+
+1. Add the constant to `prompts.py`.
+2. **Add `(name, constant)` to `ALL_PROMPTS`.**
+3. Have the skill pass `prompt_name=` / `prompt_fallback=` to `K8fyAgent.__init__`
+   (never a pre-resolved string — that pins it and skips Langfuse).
+4. Seed it: `python3 scripts/migrate_prompts_to_langfuse.py` (default mode is
+   seed-only-if-absent, so it will not disturb existing prompts).
+
+---
+
+## Verifying a prompt change took effect
+
+`traces.prompt_name` and `traces.prompt_version` record which prompt produced
+each answer.
+
+```bash
+curl -sS localhost:18080/admin/traces | python3 -m json.tool \
+  | grep -E 'prompt_name|prompt_version|tier'
+```
+
+| Observation | Meaning |
+|---|---|
+| `prompt_name` set, `prompt_version` a number | Resolved from Langfuse — working |
+| `prompt_version: null` on a **tier2** trace | **Fell back to the local string** — Langfuse is not serving this prompt |
+| `prompt_version: null` on a **tier1** trace | Correct: no LLM call, so no prompt (ADR 0006) |
+| `prompt_name` empty on tier2 | Provenance plumbing is broken |
+
+`02-deploy.yml`'s **Verify prompt provenance on traces** step asserts this on
+every deploy: a missing `prompt_name` fails the deploy, a null `prompt_version`
+warns. It warns rather than fails on purpose — coupling deploy success to
+Langfuse's availability would be a worse failure mode than the one it guards.
+
+`traces.is_eval` marks traffic produced by `/admin/eval/query`. Eval runs use the
+real path, so their traces look production-shaped; **every consumer of the traces
+table must filter them out**, or quality analysis grades the system's own test
+traffic.
+
+---
+
+## Do not
+
+- **Do not** expect a code deploy to change prompt behaviour. It changes the
+  fallback only.
+- **Do not** use `--force` casually. It re-pushes every prompt *and moves the
+  `production` label*, silently reverting any Langfuse-side edit. Use it only when
+  you intend `prompts.py` to overwrite Langfuse.
+- **Do not** promote straight to `production` without gating. Prompt changes have
+  a wider blast radius than a pod restart — they reshape every future query for
+  every tenant, indefinitely (ADR 0020's reasoning, applied to prompts).
+- **Do not** pass `system_prompt=` from a skill. That pins an exact string and
+  bypasses Langfuse entirely; it exists for tests.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `401 Invalid credentials. Confirm that you've configured the correct host.` | Langfuse projects are **region-scoped**. The keys are usually right and the host wrong. Set `LANGFUSE_BASE_URL` to the region holding your project, and make it match `config/settings.py`. |
+| Seeding reports `Created 11` when you expected `Created 3` | You are pointed at the wrong project — the existing prompts were not found, and their `production` labels have just been moved. |
+| Candidate publish reports `SKIP … already in Langfuse` | Only happens without `--label`; a candidate label bypasses the seed-only-if-absent guard. |
+| `prompt_version` null in production traces | Langfuse not resolving. Check pod logs for `Langfuse resolve('…') failed`, and note the 60s negative cache means one log line per prompt per minute, not one per request. |
+| Gate returns 401 | `EVAL_AUTH_TOKEN` differs between the backend deployment and the repo's Actions secret. Empty in both means the endpoint is open (dev only). |
+| Langfuse UI edit seems to have no effect | Check the label. Only the version carrying `production` serves traffic. |
+
+---
+
+## Configuration
+
+| Variable | Where | Notes |
+|---|---|---|
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | AWS Secrets Manager `agentify/dev/langfuse`, bootstrapped by `04-bootstrap-langfuse-secret.yml` | Absent → all prompts use fallbacks, cleanly |
+| `LANGFUSE_BASE_URL` | same | Defaults to `https://us.cloud.langfuse.com` |
+| `LANGFUSE_TRACING_ENABLED` | `infra/kubernetes/agent.yaml` | Emits observations for reasoning calls (P19 gap E). Code default is off |
+| `EVAL_AUTH_TOKEN` | `infra/kubernetes/backend.yaml` + Actions secret | Guards `/admin/eval/query`. Empty = open |
+| `langfuse` SDK | `src/agent/requirements.txt` | Pinned `>=4.14.0,<5.0.0`. CI's eval scripts install `<3.0.0` separately — they use the v2 dataset API |
+
+## References
+
+- [ADR 0030](../context-mesh/decisions/0030-version-pinned-prompt-evaluation.md) — version-pinned evaluation endpoint
+- [ADR 0019](../context-mesh/decisions/0019-eval-harness-as-ci-gate.md) — eval harness as CI gate, plus its 2026-08-30 correction
+- [ADR 0020](../context-mesh/decisions/0020-phase-3-remediation-with-approval-gate.md) — the never-auto-apply precedent
+- [ROADMAP P19](../context-mesh/ROADMAP.md) — gaps A–F and the self-improving-agent design
+- `.github/workflows/10-prompt-gate.yml` — the gate, and why a Langfuse webhook cannot trigger it directly

@@ -13,6 +13,10 @@ live in Langfuse under the label "production":
 
 Run `python scripts/migrate_prompts_to_langfuse.py` to push the current local
 strings into Langfuse for the first time.
+
+EDITING THESE STRINGS DOES NOT CHANGE PRODUCTION. They are the fallback and
+the seed; the Langfuse copy on the `production` label is what answers live
+traffic. See docs/PROMPT_LIFECYCLE.md for how to actually ship a change.
 """
 
 # ---------------------------------------------------------------------------

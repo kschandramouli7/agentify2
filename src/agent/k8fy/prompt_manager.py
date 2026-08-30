@@ -1,5 +1,8 @@
 """Langfuse-backed prompt management with local fallback.
 
+Operational runbook — how to change, gate, promote and roll back a prompt:
+docs/PROMPT_LIFECYCLE.md
+
 Prompts are stored and versioned in Langfuse under the label "production".
 `resolve()` is called **per request**, not once at import: the Langfuse SDK
 caches prompts client-side with a stale-while-revalidate strategy (default TTL

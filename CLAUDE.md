@@ -116,6 +116,10 @@ See [ADR 0004](context-mesh/decisions/0004-tech-stack-polyglot-go-python-typescr
 - **API:** OpenAPI/Swagger schema (auto-generated from Go handlers + Pydantic models).
 - **Database:** schema diagram and ER relationships (in `docs/`).
 - **Deployment:** `docs/DEPLOYMENT.md` — step-by-step AWS setup and runbooks.
+- **Prompts:** `docs/PROMPT_LIFECYCLE.md` — prompts are data served from Langfuse,
+  not code in the container. Editing `src/agent/k8fy/prompts.py` changes only the
+  fallback; shipping a prompt change means publishing a candidate, gating it, and
+  promoting a label. Read this before touching any prompt.
 - **Code comments:** see above.
 
 **Versioning & Releases:**
