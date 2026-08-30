@@ -105,6 +105,15 @@ backend↔agent boundary all included.
 
 The gate **never promotes anything**. A pass is evidence for a human.
 
+**The overall mean is not the verdict.** The dataset spans ten intents, so a mean
+across all of them can clear 0.85 while the single item that exercises the
+candidate fails outright — observed on `prompt-gate-33305278654` (mean 0.935
+PASS, while the `diagnose` item returned `status='error'`). The gate therefore
+also requires **every item whose intent maps to the gated prompt** to pass, and
+fails if the dataset contains **no** such item — gating a prompt the dataset
+never exercises tests nothing. The intent→prompt map lives in
+`INTENT_TO_PROMPT` in `run_evals.py` and mirrors `SkillRouter`.
+
 **Where to read the result:**
 
 | Where | What you get |

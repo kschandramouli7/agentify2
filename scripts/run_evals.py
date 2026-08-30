@@ -35,6 +35,25 @@ class PreconditionError(RuntimeError):
     """The run cannot be trusted, so it must not run at all (exit code 2)."""
 
 
+# Which prompt answers each intent (mirrors SkillRouter in
+# src/agent/k8fy/skills/router.py). Needed because the gate must judge a
+# candidate on the items that actually USE it: the dataset spans ten intents, so
+# a mean over all of them can pass while the one item exercising the candidate
+# fails. Keep in step with the router.
+INTENT_TO_PROMPT = {
+    "health_check":          "k8fy/health-check",
+    "cert_check":            "k8fy/cert-audit",
+    "diagnose":              "k8fy/diagnose",
+    "change_history":        "k8fy/change-history",
+    "metrics_history":       "k8fy/restart-trend",
+    "vault_cert":            "k8fy/vault-cert",
+    "renew_cert":            "k8fy/vault-cert",
+    "incident_respond":      "k8fy/incident-responder",
+    "deploy_guardian_check": "k8fy/deployment-guardian",
+    "general_query":         "k8fy/system",
+    "chat":                  "k8fy/chat",
+}
+
 DATASET_NAME   = "k8fy-regression"
 SCORE_NAME     = "eval-regression"
 DEFAULT_THRESHOLD = 0.85
@@ -215,6 +234,8 @@ def run_evals(
     print(f"Gate     : mean score ≥ {pass_threshold}\n")
 
     scores: list[float] = []
+    # Scores for the items that actually exercise the pinned prompt.
+    gated_scores: list = []
     session = requests.Session()
     session.headers["Content-Type"] = "application/json"
 
@@ -276,6 +297,8 @@ def run_evals(
         # ------------------------------------------------------------------
         score_val, detail = score_response(result, expected, latency_ms)
         scores.append(score_val)
+        if prompt_name and INTENT_TO_PROMPT.get(expected.get("intent", "")) == prompt_name:
+            gated_scores.append((item_id, score_val, detail))
 
         # ------------------------------------------------------------------
         # 4. Report to Langfuse (optional — warn but never block the gate)
@@ -298,13 +321,22 @@ def run_evals(
                 },
             )
             item.link(lf_trace, run_name)  # positional — v2 doesn't accept trace= kwarg
-            lf.create_score(
+            # create_score() is a v3+ name; the v2 SDK this script is pinned to
+            # calls it score(). Without this, every item logged
+            # "'Langfuse' object has no attribute 'create_score'" and the
+            # experiment ended up with linked traces but NO scores — the run
+            # looked empty in Langfuse while the gate passed.
+            score_kwargs = dict(
                 name=SCORE_NAME,
                 value=score_val,
                 trace_id=lf_trace.id,
                 data_type="NUMERIC",
                 comment=f"[{item_id}] {detail} | latency={latency_ms:.0f}ms",
             )
+            if hasattr(lf, "create_score"):
+                lf.create_score(**score_kwargs)
+            else:
+                lf.score(**score_kwargs)
         except Exception as lf_exc:
             # Langfuse reporting failed — log it but don't fail the eval gate.
             print(f"  WARN Langfuse reporting skipped for {item_id}: {lf_exc}")
@@ -326,8 +358,37 @@ def run_evals(
     print(f"  {symbol}  mean={mean:.3f}  threshold={pass_threshold}")
     print(f"  {len([s for s in scores if s >= pass_threshold])}/{len(scores)} items at or above threshold")
     print(f"  Langfuse run: {run_name}")
-    print(f"{'─' * 72}")
 
+    # A candidate must pass on the items that USE it. Without this the mean over
+    # ten intents can clear the threshold while the single item exercising the
+    # candidate fails outright — which is exactly what happened on
+    # prompt-gate-33305278654 (mean 0.935 PASS, diagnose item status='error').
+    if prompt_name:
+        if not gated_scores:
+            print(f"{'─' * 72}")
+            print(
+                f"  ✗ FAIL  the dataset has NO item exercising {prompt_name}, so this run\n"
+                f"          tested the candidate on nothing. Add a dataset item for it\n"
+                f"          before gating this prompt."
+            )
+            print(f"{'─' * 72}")
+            return False
+
+        failed_gated = [(i, v, d) for i, v, d in gated_scores if v < pass_threshold]
+        ok = len(gated_scores) - len(failed_gated)
+        print(f"  Gated prompt {prompt_name}: {ok}/{len(gated_scores)} of its own items passed")
+        for item_id, val, detail in failed_gated:
+            print(f"    ✗ {val:.2f}  {item_id}  {detail}")
+        if failed_gated:
+            print(f"{'─' * 72}")
+            print(
+                "  ✗ FAIL  the candidate failed on an item that uses it. The overall mean\n"
+                "          is not evidence here — most items do not touch this prompt."
+            )
+            print(f"{'─' * 72}")
+            return False
+
+    print(f"{'─' * 72}")
     return passed
 
 
