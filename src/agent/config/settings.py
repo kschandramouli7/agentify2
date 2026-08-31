@@ -25,19 +25,30 @@ def _fetch_secret(secret_name: str, region: str) -> str:
             f"Failed to fetch secret '{secret_name}' from Secrets Manager: {e}"
         ) from e
 
-    raw = response.get("SecretString") or ""
+    return _clean_api_key(response.get("SecretString") or "", f"secret '{secret_name}'")
 
-    # Unwrap repeatedly, not once.
-    #
-    # Seen in production 2026-08-30: the secret held
-    #   {"api_key": "{\"api_key\": \"{\\\"api_key\\\": \\\"sk-ant-...\\\"}\"}"}
-    # — three nested layers, because DEPLOYMENT.md Step 4 writes
-    # {"api_key": "<value>"} and someone pasted the secret's existing JSON as
-    # <value>, once per run. A single unwrap returned a JSON string, the agent
-    # sent that as x-api-key, and EVERY Tier-2 call 401'd for hours while the
-    # eval suite still reported mean 0.935.
-    key = raw
-    for _ in range(6):  # bounded: a malformed secret must not spin
+
+def _clean_api_key(value: str, source: str) -> str:
+    """Unwrap a possibly-nested JSON-wrapped API key and validate the result.
+
+    Applied to EVERY source of the key — the environment variable as well as
+    Secrets Manager — because in production the key arrives via env from a
+    Kubernetes secret, and that path bypassed this check entirely when it lived
+    only in _fetch_secret.
+
+    Seen in production 2026-08-30: Secrets Manager held
+      {"api_key": "{\\"api_key\\": \\"{...\\"sk-ant-...\\"}\\"}"}
+    — three nested layers, because DEPLOYMENT.md Step 4 writes
+    {"api_key": "<value>"} and someone pasted the secret's existing JSON as
+    <value>, once per run. The deploy step then unwraps exactly ONE layer when
+    it copies the value into the Kubernetes secret, so the pod's env held a
+    still-wrapped JSON string, sent it as x-api-key, and every Tier-2 call
+    returned 401 invalid x-api-key — for hours, while the eval suite reported
+    mean 0.935.
+    """
+    key = value
+    unwrapped = 0
+    for _ in range(6):  # bounded: a malformed value must not spin
         stripped = key.strip()
         if not (stripped.startswith("{") and stripped.endswith("}")):
             break
@@ -55,35 +66,34 @@ def _fetch_secret(secret_name: str, region: str) -> str:
         if not isinstance(inner, str) or not inner:
             break
         key = inner
-        if key is not raw:
-            logger.warning(
-                "Secret '%s' was nested — unwrapped one more level. Fix the stored "
-                "value; see docs/DEPLOYMENT.md Step 4.",
-                secret_name,
-            )
+        unwrapped += 1
+
+    if unwrapped:
+        logger.warning(
+            "API key from %s was JSON-wrapped %d level(s) deep — unwrapped it. "
+            "Fix the stored value; see docs/DEPLOYMENT.md Step 4.",
+            source, unwrapped,
+        )
 
     key = key.strip()
 
-    # Fail loudly on a value that cannot possibly be an API key. Passing JSON
-    # through as x-api-key produces a 401 on every request, which surfaces far
-    # from the cause — the whole point of this check is to fail at startup
-    # instead, where the message can name the actual problem.
+    # Fail loudly rather than sending JSON as x-api-key, which produces a 401 on
+    # every request far from the cause.
     if key.startswith("{"):
         raise RuntimeError(
-            f"Secret '{secret_name}' does not contain an API key — after unwrapping it is "
-            "still JSON. The stored value is malformed (likely wrapped more than once by "
-            "repeated 'put-secret-value' runs). Rewrite it as "
-            '\'{"api_key":"sk-ant-..."}\' with the raw key.'
+            f"API key from {source} is still JSON after unwrapping — the stored value is "
+            "malformed (likely wrapped more than once by repeated 'put-secret-value' "
+            'runs). Rewrite it as \'{"api_key":"sk-ant-..."}\' with the raw key.'
         )
     if not key:
-        raise RuntimeError(f"Secret '{secret_name}' is empty.")
+        raise RuntimeError(f"API key from {source} is empty.")
     if not key.startswith("sk-ant-"):
-        # Not fatal: a gateway or in-region endpoint (ADR 0007's ANTHROPIC_BASE_URL
-        # override) can legitimately use a differently-shaped credential.
+        # Not fatal: a gateway or in-region endpoint (ADR 0007's
+        # ANTHROPIC_BASE_URL override) can legitimately use another shape.
         logger.warning(
-            "Secret '%s' does not look like an Anthropic key (expected 'sk-ant-' prefix). "
-            "Continuing — this is expected only when using a gateway or in-region endpoint.",
-            secret_name,
+            "API key from %s does not look like an Anthropic key (expected 'sk-ant-' "
+            "prefix). Continuing — expected only with a gateway or in-region endpoint.",
+            source,
         )
     return key
 
@@ -201,6 +211,14 @@ class Settings(BaseSettings):
                 extra={"secret": self.anthropic_secret_name, "region": self.aws_region},
             )
             self.claude_api_key = _fetch_secret(self.anthropic_secret_name, self.aws_region)
+        else:
+            # The production path: the key arrives via env from a Kubernetes
+            # secret, so it needs the same unwrap-and-validate as the Secrets
+            # Manager path. Omitting this is what let a double-wrapped value
+            # reach the Anthropic API unchecked.
+            self.claude_api_key = _clean_api_key(
+                self.claude_api_key, "ANTHROPIC_API_KEY environment variable"
+            )
 
         if not self.langfuse_public_key or not self.langfuse_secret_key:
             logger.info(
