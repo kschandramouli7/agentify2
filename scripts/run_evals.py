@@ -87,13 +87,28 @@ def score_response(
 
     Returns (score 0.0–1.0, human-readable detail string).
 
-    Penalty breakdown (penalties stack, floor is 0.0):
+    status='error' scores 0.0 unconditionally — see below. Otherwise penalties
+    stack, floor 0.0:
       -0.40  wrong intent    (routing failure — most severe)
       -0.25  wrong tier      (tier1/tier2 mismatch)
       -0.20  wrong status    (status not in expected list, when list non-empty)
       -0.05  each missing required_details field (max 4 fields → max -0.20)
       -0.10  latency exceeded (when latency_ms_max > 0)
     """
+    # An errored answer is worth nothing, whatever else it got right.
+    #
+    # This is unconditional rather than per-item because intent and tier are
+    # decided by deterministic Go-side routing BEFORE Claude is called, so an
+    # item asserting only those two scores 1.00 on a totally failed model call.
+    # Three of five Tier-2 items were in exactly that state, and on 2026-08-30
+    # the suite reported mean 0.935 with 8/10 passing while EVERY Tier-2 call
+    # was returning 401 invalid x-api-key, then "insufficient credits". Checking
+    # it here rather than in ground truth means a newly added item cannot
+    # reintroduce the blindness by omission.
+    if response.get("status") == "error":
+        why = (response.get("answer") or response.get("error") or "").strip()
+        return 0.0, f"agent returned status='error'" + (f": {why[:120]}" if why else "")
+
     score  = 1.0
     issues = []
 
