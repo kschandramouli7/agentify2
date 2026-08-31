@@ -890,9 +890,19 @@ func (h *Handler) embedAndStoreIncident(rowID, traceID, namespace, service strin
 		if es, ok := relational.(embStorer); ok {
 			storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer storeCancel()
+			// TraceID must be the traces PRIMARY KEY (rowID), not the correlation
+			// trace_id: the column is declared
+			//   trace_id TEXT NOT NULL REFERENCES traces(id) ON DELETE CASCADE
+			// and traces.id is rowID while traces.trace_id is the separate
+			// correlation uuid. Passing traceID here violated the foreign key on
+			// EVERY insert; the error was logged at Warn and swallowed, so
+			// incident_embeddings stayed permanently empty and semantic memory
+			// could never work. Confirmed 2026-09-01: 0 rows despite successful
+			// diagnoses. The correlation id is not lost — join
+			// traces.id = incident_embeddings.trace_id to reach it.
 			if serr := es.InsertIncidentEmbedding(storeCtx, pgstore.IncidentEmbedding{
 				ID:        rowID,
-				TraceID:   traceID,
+				TraceID:   rowID,
 				Namespace: namespace,
 				Service:   service,
 				Summary:   summary,

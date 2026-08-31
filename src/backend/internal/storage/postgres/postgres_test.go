@@ -883,15 +883,46 @@ func TestIncidentEmbeddings(t *testing.T) {
 	ctx := context.Background()
 
 	// incident_embeddings.trace_id REFERENCES traces(id) — seed one first.
+	//
+	// id and trace_id are deliberately DIFFERENT here, mirroring production:
+	// logTrace generates a fresh rowID for traces.id and carries the separate
+	// correlation uuid in traces.trace_id. This fixture used to set both to the
+	// same value, which satisfied the foreign key in tests while production
+	// passed the correlation id and violated it on every insert — so
+	// incident_embeddings was permanently empty and no test noticed.
 	seedTrace := func(id string) {
 		t.Helper()
 		if err := client.InsertTrace(ctx, TraceRecord{
-			ID: id, TraceID: id, Question: "why is it crashing", Intent: "diagnose",
-			Namespace: "payments", Tier: "tier2", Status: "answered", Confidence: 0.8,
+			ID: id, TraceID: "correlation-" + id, Question: "why is it crashing",
+			Intent: "diagnose", Namespace: "payments", Tier: "tier2",
+			Status: "answered", Confidence: 0.8,
 		}); err != nil {
 			t.Fatalf("seed trace %s: %v", id, err)
 		}
 	}
+
+	t.Run("embedding must reference traces.id, not traces.trace_id", func(t *testing.T) {
+		// The production regression guard: an embedding keyed on the correlation
+		// id must be REJECTED by the foreign key, and one keyed on the traces PK
+		// must be accepted.
+		seedTrace("fk-guard")
+
+		if err := client.InsertIncidentEmbedding(ctx, IncidentEmbedding{
+			ID: uuid.New().String(), TraceID: "correlation-fk-guard",
+			Namespace: "payments", Service: "payment-worker", Summary: "wrong key",
+		}); err == nil {
+			t.Error("expected a foreign-key violation when using traces.trace_id; " +
+				"if this passes, the FK no longer protects the join and production " +
+				"can silently write orphaned rows")
+		}
+
+		if err := client.InsertIncidentEmbedding(ctx, IncidentEmbedding{
+			ID: "fk-guard", TraceID: "fk-guard",
+			Namespace: "payments", Service: "payment-worker", Summary: "right key",
+		}); err != nil {
+			t.Fatalf("insert keyed on traces.id should succeed: %v", err)
+		}
+	})
 
 	t.Run("insert without embedding, then upsert updates the summary in place", func(t *testing.T) {
 		seedTrace("trace-a")
