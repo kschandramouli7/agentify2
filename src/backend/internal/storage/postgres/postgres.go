@@ -1426,12 +1426,43 @@ func (c *Client) InsertIncidentEmbedding(ctx context.Context, e IncidentEmbeddin
 	return err
 }
 
+// incidentDedupKey groups rows describing the same incident.
+//
+// Summaries are built as "headline | likely_cause" (see embedAndStoreIncident),
+// so the headline identifies the incident and the cause may vary in wording
+// between runs. Keying on the normalised headline therefore collapses repeat
+// diagnoses of one problem without merging genuinely different incidents that
+// happen to share a cause.
+func incidentDedupKey(summary string) string {
+	head := summary
+	if i := strings.Index(summary, " | "); i >= 0 {
+		head = summary[:i]
+	}
+	return strings.ToLower(strings.Join(strings.Fields(head), " "))
+}
+
 // FindSimilarIncidents returns up to limit incidents whose embedding is closest
 // to queryVec (cosine similarity). Falls back to recency order when pgvector is
 // unavailable (vec is nil) so callers always get a useful result.
+//
+// Results are deduplicated by incident: diagnosing the same problem repeatedly
+// writes a near-identical row each time (there is no write-side dedup), so an
+// undeduplicated top-3 can be three copies of one incident, crowding out every
+// genuinely different past incident. Observed 2026-09-01: four of five stored
+// rows were the same payment-worker Pending incident.
+//
+// Deduplication happens on read rather than on write so storage stays an honest
+// log of what actually happened — how often an incident recurs is real
+// information, it just should not consume all three few-shot slots.
 func (c *Client) FindSimilarIncidents(ctx context.Context, namespace, service string, queryVec []float32, limit int) ([]IncidentEmbedding, error) {
 	if limit <= 0 {
 		limit = 3
+	}
+	// Over-fetch so duplicates can be dropped without under-filling the result.
+	// Bounded so a pathological table cannot turn this into a large scan.
+	fetchLimit := limit * 4
+	if fetchLimit > 60 {
+		fetchLimit = 60
 	}
 
 	var rows *sql.Rows
@@ -1454,7 +1485,7 @@ func (c *Client) FindSimilarIncidents(ctx context.Context, namespace, service st
 			WHERE embedding IS NOT NULL
 			ORDER BY embedding <-> $1::vector
 			LIMIT $2`,
-			sb.String(), limit)
+			sb.String(), fetchLimit)
 	} else {
 		// Fallback: most recent incidents matching namespace/service.
 		rows, err = c.db.QueryContext(ctx, `
@@ -1464,7 +1495,7 @@ func (c *Client) FindSimilarIncidents(ctx context.Context, namespace, service st
 			  AND ($2 = '' OR service  = $2)
 			ORDER BY created_at DESC
 			LIMIT $3`,
-			namespace, service, limit)
+			namespace, service, fetchLimit)
 	}
 	if err != nil {
 		return nil, err
@@ -1472,10 +1503,19 @@ func (c *Client) FindSimilarIncidents(ctx context.Context, namespace, service st
 	defer rows.Close()
 
 	var result []IncidentEmbedding
+	seen := make(map[string]struct{}, fetchLimit)
 	for rows.Next() {
 		var e IncidentEmbedding
 		if serr := rows.Scan(&e.ID, &e.TraceID, &e.Namespace, &e.Service, &e.Summary, &e.TenantID, &e.ClusterID); serr != nil {
 			continue
+		}
+		key := incidentDedupKey(e.Summary)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if len(result) >= limit {
+			break
 		}
 		result = append(result, e)
 	}

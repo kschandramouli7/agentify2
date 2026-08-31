@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -900,6 +901,47 @@ func TestIncidentEmbeddings(t *testing.T) {
 			t.Fatalf("seed trace %s: %v", id, err)
 		}
 	}
+
+	t.Run("repeat diagnoses of one incident do not crowd out the others", func(t *testing.T) {
+		// Observed 2026-09-01: four of five stored rows were the same
+		// payment-worker Pending incident, so an undeduplicated top-3 would have
+		// been three copies of it and no other incident at all.
+		for i, summary := range []string{
+			"payment-worker has no running replica | pod stuck in Pending",
+			"payment-worker has no running replica | scheduler found no node",
+			"payment-worker has no running replica | pod stuck in Pending",
+			"payment-api TLS cert expires in 3 days | cert-manager renewal stalled",
+		} {
+			id := fmt.Sprintf("dedup-%d", i)
+			seedTrace(id)
+			if err := client.InsertIncidentEmbedding(ctx, IncidentEmbedding{
+				ID: id, TraceID: id, Namespace: "dedupns", Service: "svc",
+				Summary: summary,
+			}); err != nil {
+				t.Fatalf("insert %s: %v", id, err)
+			}
+		}
+
+		got, err := client.FindSimilarIncidents(ctx, "dedupns", "svc", nil, 3)
+		if err != nil {
+			t.Fatalf("FindSimilarIncidents: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("got %d incidents, want 2 distinct ones", len(got))
+		}
+		// Distinct headlines, whatever the cause clause says.
+		keys := map[string]bool{}
+		for _, e := range got {
+			head := e.Summary
+			if i := strings.Index(e.Summary, " | "); i >= 0 {
+				head = e.Summary[:i]
+			}
+			if keys[head] {
+				t.Errorf("duplicate incident returned: %q", head)
+			}
+			keys[head] = true
+		}
+	})
 
 	t.Run("embedding must reference traces.id, not traces.trace_id", func(t *testing.T) {
 		// The production regression guard: an embedding keyed on the correlation

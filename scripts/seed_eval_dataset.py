@@ -18,6 +18,21 @@ import sys
 from langfuse import Langfuse
 
 DATASET_NAME = "k8fy-regression"
+
+# Latency budget shared by both diagnose items.
+#
+# Set above the observed maximum, not at an aspiration. Measured on identical
+# input: 19,405ms and 33,166ms — a 1.7x spread, which is normal for Opus with
+# effort=high and adaptive thinking. The previous 20,000ms budget on
+# diagnose-payment-crash-001 sat inside that spread, so the gate passed or failed
+# essentially at random. A gate that flaps is worse than one that fails: people
+# learn to re-run it, and then they re-run the real failures too.
+#
+# 45s still catches a genuine regression (a 60s diagnose fails) without
+# reporting normal variance as a defect. Whether 19-33s is acceptable for an
+# operator mid-incident is a separate product question — tracked in the roadmap,
+# deliberately not hidden inside this threshold.
+DIAGNOSE_LATENCY_MS_MAX = 45_000
 DATASET_DESCRIPTION = (
     "Regression suite for agentify K8fy skills. "
     "Each item is a (query, ground_truth) pair covering all intent classes. "
@@ -49,7 +64,10 @@ ITEMS = [
             "tier":             "tier2",
             "status":           ["unhealthy", "degraded"],
             "required_details": ["headline", "timeline", "findings", "likely_cause"],
-            "latency_ms_max":   20_000,
+            # DIAGNOSE_LATENCY_MS_MAX — see the constant's comment. Both diagnose
+            # items share it; they used to disagree (20s here, 35s on 009) with no
+            # stated rationale, and 20s made this item flap.
+            "latency_ms_max":   DIAGNOSE_LATENCY_MS_MAX,
         },
     },
     {
@@ -173,7 +191,7 @@ ITEMS = [
             # Only check headline — the other fields depend on whether Claude
             # has enough signal data to populate them.
             "required_details": ["headline"],
-            "latency_ms_max":   35_000,
+            "latency_ms_max":   DIAGNOSE_LATENCY_MS_MAX,
         },
     },
     {

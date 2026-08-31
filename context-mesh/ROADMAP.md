@@ -1573,6 +1573,52 @@ Langfuse ships every primitive; nothing bespoke was needed:
 
 ---
 
+## P20 — Tier-2 latency: is 19-33s acceptable mid-incident? (raised 2026-09-01)
+
+**Not a test-threshold question, which is why it is here rather than buried in
+one.** With the Anthropic key fixed and diagnose genuinely reasoning for the
+first time, measured Tier-2 latencies are:
+
+| intent | observed |
+|---|---|
+| `diagnose` | 19.4s / 22.4s / 30.3s / 33.2s |
+| `general_query` | 10.3s / 15.7s |
+| `change_history` | 13.6s / 17.2s |
+| `metrics_history` | 5.0s / 5.1s |
+| Tier-1 (no LLM) | ~0.2s |
+
+Two separate problems:
+
+**1. Variance breaks gates.** Identical input produced 19.4s and 33.2s — a 1.7x
+spread, normal for Opus with `effort=high` plus adaptive thinking. Any budget
+inside that spread makes the eval gate flap, and a flapping gate is worse than a
+failing one: people learn to re-run it, then re-run the real failures too. Both
+diagnose items now share `DIAGNOSE_LATENCY_MS_MAX = 45_000` (above the observed
+max). **Still exposed on the same footing:** `general-query-pods-010` (20s cap,
+15.7s observed) and `change-history-payments-006` (25s cap, 17.2s observed) —
+raise these when they first flap, or pre-emptively.
+
+**2. The product question.** An operator asking "why is payment-worker
+crashing?" during an incident waits 20-33s. That may be fine — it replaces
+minutes of manual `kubectl` — or it may be too slow to use under pressure. It
+has never been decided, only inherited. Levers, cheapest first:
+- `claude_effort` is `high` (`settings.claude_effort`); `medium` on diagnose is a
+  one-line change with a measurable quality/latency trade-off the eval suite can
+  now actually score.
+- Prefetch parallelism in `DiagnoseSkill._prefetch` — several backend fetches;
+  confirm they are concurrent, not sequential.
+- The Sonnet-executor / Opus-advisor split, already implemented in
+  `_reason_advisor_executor` and abandoned for diagnose by
+  [ADR 0026](decisions/0026-pattern-a-skills-standardisation.md) on complexity
+  grounds. Revisiting is a real option now that latency is measured rather than
+  assumed.
+
+**Do not tune this by moving thresholds.** Decide the target first, then measure
+against it — the eval suite scores latency per item and can answer the question
+directly.
+
+---
+
 ## Frontend — ops console (not a reviewer P-item; foundational gap)
 
 **Status (v1 scaffolded, 2026-06-04):** `src/frontend/` — Vite + React + TypeScript
