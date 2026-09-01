@@ -629,6 +629,58 @@ def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
     return answer, details
 
 
+async def _resolve_namespace(question: str, backend_url: str) -> Optional[str]:
+    """Work out which namespace a dependency question is about, when the caller
+    did not say.
+
+    THIS IS NOT AN EDGE CASE. ChatPanel calls createChatSession() with no
+    arguments, so every chat session's namespace is "" — and the Go chat handler
+    forwards `{"namespace": s.Namespace}` verbatim. Without this, the
+    deterministic route resolved no graph and silently fell through to the model
+    on every single chat turn, which is exactly what it did in production.
+
+    Resolved from the Hub's own tracked `"namespace/service"` list rather than
+    guessed: the longest service name mentioned in the question wins (so
+    "payment-api" beats "payment"), then an exact namespace mention, and finally
+    the sole tracked namespace when there is only one. Returns None rather than
+    picking arbitrarily when several namespaces are plausible — answering about
+    the wrong namespace is worse than handing the turn to the model.
+    """
+    # Imported here, not at module scope: this file's convention for
+    # service_topology (see _build_service_graph and resolve_service_clusters),
+    # and a module-level binding would sit outside the reach of tests that patch
+    # k8fy.service_topology.
+    from k8fy.service_topology import fetch_tracked_pairs
+
+    pairs = await fetch_tracked_pairs(backend_url)
+    if not pairs:
+        return None
+    lowered = question.lower()
+
+    by_service: List[tuple] = []
+    namespaces = set()
+    for entry in pairs:
+        ns, _, svc = str(entry).partition("/")
+        if not ns:
+            continue
+        namespaces.add(ns)
+        if svc:
+            by_service.append((svc, ns))
+
+    # Longest service name first, so "payment-api" is not shadowed by "payment".
+    for svc, ns in sorted(by_service, key=lambda p: len(p[0]), reverse=True):
+        if svc.lower() in lowered:
+            return ns
+
+    for ns in sorted(namespaces, key=len, reverse=True):
+        if ns.lower() in lowered:
+            return ns
+
+    if len(namespaces) == 1:
+        return next(iter(namespaces))
+    return None
+
+
 async def _build_service_graph(
     messages: List[Dict[str, Any]], context: Dict[str, Any], backend_url: str,
 ) -> Optional[Dict[str, Any]]:
@@ -640,7 +692,11 @@ async def _build_service_graph(
     """
     namespace = context.get("namespace")
     if not isinstance(namespace, str) or not namespace:
-        return None
+        # Chat sessions carry no namespace — see _resolve_namespace.
+        namespace = await _resolve_namespace(_latest_user_text(messages), backend_url)
+        if not namespace:
+            return None
+        logger.info("resolved namespace %r from the question text", namespace)
     try:
         from k8fy.service_topology import fetch_service_dependencies
 

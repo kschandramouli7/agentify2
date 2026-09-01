@@ -89,6 +89,13 @@ It also falls through to the model when there is **no graph** for the
 namespace — a bare "no evidence" would be a dead end, while the model can
 explain why the namespace is empty (§4).
 
+> **If a dependency question comes back as prose with no diagram**, the running
+> agent image predates this route, or the namespace could not be resolved. The
+> tell is the answer's shape: the deterministic answer is templated and always
+> ends with the "lower bound" sentence, while a model answer carries timestamps
+> and a Recommendations section. Check with
+> `kubectl logs -n agentify -l app=agentify-agent | grep -i "answered deterministically\|resolved namespace"`.
+
 ### Details that matter if you change this
 
 - **The turn is still traced.** The route sits inside `reason_chat`, below its
@@ -105,6 +112,15 @@ explain why the namespace is empty (§4).
   names, longest first, so `payment-api` is never collapsed to `payment`;
   failing that, the session's context service. It cannot focus a service the
   graph does not contain.
+- **The namespace is resolved from the question too, because chat has none.**
+  `ChatPanel` calls `createChatSession()` with no arguments, so a session's
+  namespace is `""` and the Go handler forwards that verbatim. `_resolve_namespace`
+  therefore falls back to the Hub's tracked `namespace/service` list: the longest
+  service name mentioned wins, then an explicit namespace mention, then the sole
+  tracked namespace if there is only one. It returns nothing rather than guessing
+  when several namespaces are plausible — answering about the wrong namespace is
+  worse than handing the turn to the model. An explicit context namespace always
+  wins; this is a fallback, never an override.
 - **Only the latest user turn is inspected**, so a conversation that discussed
   dependencies five turns ago does not attach a graph to every later answer.
 

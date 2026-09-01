@@ -538,3 +538,147 @@ def test_the_skill_avoids_310_only_syntax():
     src = (Path(__file__).resolve().parents[1] / "k8fy" / "skills" / "dependency_graph.py").read_text()
     assert "Dict[str, Any] | None" not in src
     assert "Optional[Dict[str, Any]]" in src
+
+
+# ── Namespace resolution ──────────────────────────────────────────────────────
+#
+# Not an edge case: ChatPanel calls createChatSession() with no arguments, so
+# every chat session's namespace is "" and the Go handler forwards that verbatim.
+# Before this, _build_service_graph bailed on the empty namespace and the
+# deterministic route fell through to the model on every chat turn — which is
+# exactly what happened in production.
+
+TRACKED = [
+    "payments/payment",
+    "payments/payment-api",
+    "payments/payment-batch",
+    "payments/payment-worker",
+    "agentify/agentify-backend",
+    "vault/vault",
+]
+
+
+def _patch_tracked(monkeypatch, pairs=TRACKED):
+    async def fake(backend_url):
+        return pairs
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_tracked_pairs", fake)
+
+
+@pytest.mark.asyncio
+async def test_namespace_resolved_from_a_service_named_in_the_question(monkeypatch):
+    from k8fy.agent import _resolve_namespace
+
+    _patch_tracked(monkeypatch)
+    ns = await _resolve_namespace(
+        "what are the upstream and downstream services for payment-api service?", "http://b",
+    )
+    assert ns == "payments"
+
+
+@pytest.mark.asyncio
+async def test_longest_service_name_wins_when_resolving(monkeypatch):
+    """"payment-api" must not be shadowed by the shorter "payment", which would
+    still land on payments here but would pick the wrong namespace as soon as two
+    namespaces share a prefix."""
+    from k8fy.agent import _resolve_namespace
+
+    _patch_tracked(monkeypatch, ["other/payment", "payments/payment-api"])
+    assert await _resolve_namespace("dependencies of payment-api", "http://b") == "payments"
+
+
+@pytest.mark.asyncio
+async def test_namespace_resolved_from_an_explicit_mention(monkeypatch):
+    from k8fy.agent import _resolve_namespace
+
+    _patch_tracked(monkeypatch)
+    assert await _resolve_namespace("show the call graph for vault", "http://b") == "vault"
+
+
+@pytest.mark.asyncio
+async def test_sole_tracked_namespace_is_used_when_nothing_matches(monkeypatch):
+    from k8fy.agent import _resolve_namespace
+
+    _patch_tracked(monkeypatch, ["payments/payment-api"])
+    assert await _resolve_namespace("what are the upstream dependencies?", "http://b") == "payments"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_namespace_resolves_to_none(monkeypatch):
+    """Answering about the wrong namespace is worse than handing the turn to the
+    model, so several plausible namespaces must yield None, not a guess."""
+    from k8fy.agent import _resolve_namespace
+
+    _patch_tracked(monkeypatch)
+    assert await _resolve_namespace("what are the upstream dependencies?", "http://b") is None
+
+
+@pytest.mark.asyncio
+async def test_no_tracked_data_resolves_to_none(monkeypatch):
+    from k8fy.agent import _resolve_namespace
+
+    _patch_tracked(monkeypatch, [])
+    assert await _resolve_namespace("dependencies of payment-api", "http://b") is None
+
+
+@pytest.mark.asyncio
+async def test_build_service_graph_recovers_from_an_empty_context_namespace(monkeypatch):
+    """The regression this whole section exists for: a chat session with no
+    namespace must still produce a drawable graph."""
+    _patch_tracked(monkeypatch)
+
+    async def fake_fetch(namespace, backend_url):
+        assert namespace == "payments"
+        return EDGES
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+
+    graph = await _build_service_graph(
+        _user("what are the upstream and downstream services for payment-api service?"),
+        {"namespace": "", "service": ""},   # exactly what ChatPanel produces today
+        "http://backend",
+    )
+    assert graph is not None
+    assert graph["namespace"] == "payments"
+    assert graph["focus"] == "payment-api"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_context_namespace_still_wins(monkeypatch):
+    """Resolution is a fallback, never an override — a caller that says which
+    namespace it means must be obeyed."""
+    _patch_tracked(monkeypatch)
+
+    seen = {}
+
+    async def fake_fetch(namespace, backend_url):
+        seen["ns"] = namespace
+        return EDGES
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+    await _build_service_graph(
+        _user("dependencies of payment-api"), {"namespace": "explicit-ns"}, "http://backend",
+    )
+    assert seen["ns"] == "explicit-ns"
+
+
+@pytest.mark.asyncio
+async def test_reason_chat_end_to_end_with_no_session_namespace(monkeypatch):
+    """The full production shape: empty session namespace, dependency question,
+    no model call, graph attached."""
+    _patch_tracked(monkeypatch)
+
+    async def fake_fetch(namespace, backend_url):
+        return EDGES
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+
+    agent = _bare_agent()
+    resp = await type(agent).reason_chat(
+        agent,
+        _user("what are the upstream and downstream services for payment-api service?"),
+        {"namespace": "", "service": "", "session_id": "abc"},
+    )
+    assert resp.tier == "tier1"
+    assert resp.details["service_graph"]["namespace"] == "payments"
+    assert resp.details["service_graph"]["focus"] == "payment-api"

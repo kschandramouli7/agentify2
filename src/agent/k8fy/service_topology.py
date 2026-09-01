@@ -96,6 +96,24 @@ def extract_service_mentions(log_text: str, namespace: str, known_services: Set[
     return found
 
 
+async def fetch_tracked_pairs(backend_url: str) -> List[str]:
+    """Every tracked `"namespace/service"` pair the Hub knows about.
+
+    Same `GET /admin/tracked` endpoint `get_known_services` wraps, without the
+    namespace filter — callers that do not yet know the namespace need the whole
+    list to resolve one. Degrades to an empty list on any failure, like every
+    other best-effort fetch here.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{backend_url.rstrip('/')}/admin/tracked")
+            resp.raise_for_status()
+            return resp.json() or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("fetch_tracked_pairs failed: %s", e)
+        return []
+
+
 async def get_known_services(namespace: str, backend_url: str) -> Set[str]:
     """Real services tracked for this namespace — the ground truth
     `extract_service_mentions` cross-validates candidates against. Wraps the
