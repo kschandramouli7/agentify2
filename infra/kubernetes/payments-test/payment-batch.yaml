@@ -5,9 +5,11 @@
 # Service-dependency discovery (ROADMAP P18 use case #2, ADR 0029) mines LOG
 # TEXT, not network traffic: both the live per-cluster miner
 # (agentify-discovery's _scan_namespace) and the centralized Glue/Athena miner
-# look for "<service>.<namespace>[.svc.cluster.local]" in pod logs and count a
-# match only when the namespace segment matches and the service segment is in
-# the live Service list. The whole pipeline — storage, ingest, two miners,
+# look for a service hostname in pod logs — either qualified
+# ("<service>.<namespace>[.svc.cluster.local]", namespace segment must match) or
+# bare in a hostname context ("//<name>" or "<name>:<port>", resolved in the
+# pod's own namespace) — and count a match only when the name is in the live
+# Service list. The whole pipeline — storage, ingest, two miners,
 # tenant scoping, consumption by diagnose — was built and had nothing to find,
 # because no test workload ever called another service or logged its name.
 #

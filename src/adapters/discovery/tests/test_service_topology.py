@@ -66,6 +66,57 @@ def test_extract_finds_multiple_distinct_services():
     assert found == {"payment-ui", "payment-backend"}
 
 
+def test_extract_accepts_bare_name_after_a_scheme():
+    """The case that made this miner blind in real namespaces.
+
+    In-cluster callers use the short name — Kubernetes resolves it via the pod's
+    search domain — so requiring "<service>.<namespace>" meant agentify's own
+    services produced zero edges while addressing each other constantly.
+    """
+    log_text = 'POST http://agentify-backend:8080/api/query'
+    found = st.extract_service_mentions(log_text, "agentify", {"agentify-backend"})
+    assert found == {"agentify-backend"}
+
+
+def test_extract_accepts_bare_name_with_a_port_and_no_scheme():
+    log_text = "dialing agentify-agent:8001 for reasoning"
+    found = st.extract_service_mentions(log_text, "agentify", {"agentify-agent"})
+    assert found == {"agentify-agent"}
+
+
+def test_extract_still_rejects_a_bare_name_in_prose():
+    """The false-positive guard. A service named after a common word must not be
+    matched by ordinary log text — only by a hostname context."""
+    for text in [
+        "payment-backend restarted due to OOMKilled",
+        "payment: 200",              # structured log pair, space before the value
+        "processing payment now",
+        "retrying payment-backend after 3s",
+    ]:
+        assert st.extract_service_mentions(text, "payments", {"payment-backend", "payment"}) == set(), text
+
+
+def test_extract_bare_name_still_validated_against_known_services():
+    log_text = "GET http://not-a-service:8080/health"
+    assert st.extract_service_mentions(log_text, "agentify", {"agentify-backend"}) == set()
+
+
+def test_extract_qualified_url_with_port_does_not_double_match_the_last_label():
+    """A FQDN ending ".local:8080" must not yield "local" as a service."""
+    log_text = "http://payment-backend.payments.svc.cluster.local:8080/charge"
+    found = st.extract_service_mentions(log_text, "payments", {"payment-backend", "local"})
+    assert found == {"payment-backend"}
+
+
+def test_extract_bare_name_is_namespace_local():
+    """A short name resolves in the pod's OWN namespace, so it is validated
+    against that namespace's Service list — a service of the same name elsewhere
+    must not produce an edge."""
+    log_text = "http://payment-backend:8080/charge"
+    # Scanning "orders", whose Service list does not contain payment-backend.
+    assert st.extract_service_mentions(log_text, "orders", {"orders-api"}) == set()
+
+
 def test_extract_empty_inputs_return_empty_set():
     assert st.extract_service_mentions("", "payments", {"payment-backend"}) == set()
     assert st.extract_service_mentions("payment-backend.payments", "payments", set()) == set()

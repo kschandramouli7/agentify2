@@ -95,9 +95,11 @@ spec:
           #
           # Service-dependency discovery mines LOG TEXT, not network traffic
           # (agentify-discovery's _scan_namespace and the Glue miner both look
-          # for "<service>.<namespace>[.svc.cluster.local]" and validate the
-          # match against the live Service list). So the FQDN must be echoed —
-          # making the call without logging it produces no edge at all.
+          # for a service hostname — qualified, or bare before ":<port>" — and
+          # validate the match against the live Service list). So the hostname
+          # must be echoed: making the call without logging it produces no edge
+          # at all. This workload logs the FQDN, which exercises the qualified
+          # form; agentify's own services exercise the bare form.
           #
           # The hostname is logged whether or not the call succeeds, on purpose:
           # an unreachable dependency is still a dependency, and that is exactly

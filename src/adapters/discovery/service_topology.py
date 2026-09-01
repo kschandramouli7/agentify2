@@ -29,13 +29,42 @@ _HOSTNAME_RE = re.compile(
     r"\b([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)(?:\.svc\.cluster\.local)?\b"
 )
 
+# Bare in-cluster hostnames, e.g. "http://agentify-backend:8080".
+#
+# Kubernetes resolves a short service name through the pod's search domain, so
+# in-cluster callers almost never write the FQDN. That meant this miner could
+# only ever see dependencies logged in a form nobody actually uses: confirmed
+# 2026-09-01, the agentify namespace's own services address each other as
+# "http://agentify-backend:8080" and produced ZERO edges, while the payments
+# namespace produced five only because its test workloads were written to log
+# FQDNs on purpose.
+#
+# A bare name counts ONLY in a hostname context — immediately after "//", or
+# immediately before ":<port>" — because a service named "payment" would
+# otherwise match the word "payment" in ordinary log prose. Validation against
+# the live Service list is the second guard. The boundary is pinned by
+# test_extract_rejects_bare_unqualified_mention: "payment-backend restarted due
+# to OOMKilled" must still yield nothing.
+#
+# A bare name is namespace-local by construction (that is what the search domain
+# does), so checking it against the scanned namespace's own Service list is
+# exactly the right test.
+_URL_HOST_RE = re.compile(r"//([a-z0-9][a-z0-9.-]*)")
+_HOST_PORT_RE = re.compile(r"(?<![\w.-])([a-z0-9][a-z0-9-]*):(\d{2,5})(?![\w.])")
+
 
 def extract_service_mentions(log_text: str, namespace: str, known_services: Set[str]) -> Set[str]:
-    """Find candidate `<service>.<namespace>[.svc.cluster.local]` mentions in
-    log text. A match only counts if the namespace segment equals `namespace`
-    AND the service segment is in `known_services` — real ground truth, not
-    just regex-shaped text. Returns the set of validated service names
-    (never includes `namespace` itself, never raises on malformed input).
+    """Find candidate service hostnames in log text, in two forms:
+
+      - qualified — `<service>.<namespace>[.svc.cluster.local]`, counted only
+        when the namespace segment equals `namespace`;
+      - bare — a short name in a hostname context (`//<name>` or
+        `<name>:<port>`), which Kubernetes resolves within the pod's own
+        namespace. This is the form in-cluster callers actually use.
+
+    Either way the name must be in `known_services` — real ground truth, not
+    just regex-shaped text. Returns the set of validated service names (never
+    includes `namespace` itself, never raises on malformed input).
     """
     if not log_text or not known_services:
         return set()
@@ -44,6 +73,17 @@ def extract_service_mentions(log_text: str, namespace: str, known_services: Set[
     for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(log_text):
         if namespace_candidate == namespace and service_candidate in known_services:
             found.add(service_candidate)
+
+    # Bare short names, hostname contexts only (see the regexes above).
+    for host in _URL_HOST_RE.findall(log_text):
+        if "." in host:
+            continue  # dotted form — the qualified pass above already ruled on it
+        if host in known_services:
+            found.add(host)
+    for name, _port in _HOST_PORT_RE.findall(log_text):
+        if name in known_services:
+            found.add(name)
+
     return found
 
 
