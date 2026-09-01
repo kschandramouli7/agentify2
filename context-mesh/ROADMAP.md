@@ -1373,6 +1373,14 @@ not on `self`: agent instances are process-wide singletons via `SkillRouter`, so
 instance state would race across concurrent queries. The false docstring claim is
 gone, replaced by a note recording what the old behaviour actually was.
 
+*Verified live 2026-09-01 — the claim is now an observation.* `k8fy/diagnose` v6
+was promoted by moving the `production` label in the Langfuse UI; a Tier-2 trace
+then reported `prompt_version: 6` with **no pod restart, no deploy and no code
+change**. It took one extra request: the SDK is stale-while-revalidate, so the
+first call after the 60 s TTL expires still serves the stale version and only
+kicks off the refresh. "Within ~60 s" is therefore really "within ~60 s plus one
+request" — worth knowing before concluding a promotion failed.
+
 *One regression the change introduced, found by measuring rather than reasoning,
 and fixed:* per-request resolution means a Langfuse **outage** is paid per
 request, not once at startup — and because `resolve()` is synchronous inside

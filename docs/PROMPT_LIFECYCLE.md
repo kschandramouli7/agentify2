@@ -178,6 +178,12 @@ curl -sS localhost:18080/admin/traces | python3 -m json.tool | grep -m2 prompt_v
 ```
 
 `prompt_version: 6` on a Tier-2 trace means live traffic is on the new version.
+
+**Expect to need one extra request.** The SDK is stale-while-revalidate: the
+first call after the 60 s TTL expires still returns the *stale* version and only
+then refreshes in the background. So a query immediately after promoting can
+legitimately still report the old version — query again before concluding the
+promotion failed. Observed 2026-09-01: `5`, then `6` on the next request.
 The next deploy's **Verify prompt provenance** step reports the same thing.
 
 Two consequences worth expecting:
