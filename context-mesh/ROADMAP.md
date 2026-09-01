@@ -44,7 +44,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029); use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
-| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 4 smaller gaps. A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert) and C (no prompt provenance on `traces`) are closed; D (a prompt change still reaches production through a gate-less path) stays open as part of P19 step 3, reframed 2026-08-30 to gate-before-promote and split into D1 (version-pinned evaluation — the real blocker, useful independently of P19) and D2 (webhook → `repository_dispatch` → `experiment-action` wiring) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
+| **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 
 ---
 
@@ -1325,7 +1325,10 @@ got the first one wrong:**
   still true (`traces` DDL, `postgres.go:123-141`). Now gap C, with a sub-gap
   the original didn't see.
 
-**The four real gaps — all small, each blocking for a different reason:**
+**The real gaps — all small, each blocking for a different reason.** A–D were
+identified on 2026-08-29; **E and F were found on 2026-08-30 while designing the
+judge**, and E turned out to be the true blocker for anything that reviews live
+traffic. All except D2's Langfuse webhook are now built.
 
 **A — three fetched prompts are never seeded into Langfuse. ✅ done 2026-08-29.**
 `migrate_prompts_to_langfuse.py`'s `PROMPTS` list covers 8 names, but
@@ -1526,6 +1529,44 @@ Langfuse ships every primitive; nothing bespoke was needed:
   - Firing a full eval run on every prompt-version creation is a recurring
     bill in both money and minutes — the same tunable-knob problem P19 already
     flags for judge sampling, not a new one.
+
+**E — the agent emitted no Langfuse traces or observations at all. ✅ done
+2026-08-30.** Langfuse was wired for prompt management only: no `@observe`, no
+`start_observation`, no `propagate_attributes` anywhere in `src/agent`. Two
+consequences. There was no production view of quality, cost or latency per
+prompt version despite already paying for Langfuse — and, decisively, **Langfuse's
+LLM-as-a-Judge evaluators attach to *observations***, so with none emitted there
+was nothing for a judge to run on. This, not A–D, was the real blocker on P19.
+
+It also invalidated a claim in [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md)
+("`langfuse.score(trace_id, …)` attaches the score to the existing trace" — there
+was no such trace; `run_evals.py` fabricates one), corrected there on 2026-08-30.
+
+*Built:* `k8fy/tracing.py` — one generation observation per Pattern-A call linked
+to the Langfuse prompt object, and one per chat turn carrying the **full
+conversation history**, because evaluators only see data on the observation they
+match. Observation-level, not trace-level: trace-level evaluators are legacy and
+stop producing results on Langfuse Cloud after **2026-11-16**. Shipped behind
+`LANGFUSE_TRACING_ENABLED` (default off) and enabled in the dev deployment.
+
+*One bug it introduced, found in production and fixed:* `observe()` caught the
+exception thrown in at `yield` and yielded again, which Python reports as
+"generator didn't stop after throw()" — and that RuntimeError **replaced** the
+real error, masking an Anthropic 401 behind a meaningless message. Setup failures
+are swallowed; body failures now propagate untouched, with three regression
+tests. The lesson generalises: the existing test only covered *setup* failure,
+the easy half of "never swallow the caller's error".
+
+**F — `traces` had no `session_id`. ✅ done 2026-08-30.** P19's design says an
+agent reviews prior *conversations*, but the evaluable record was per-query with
+no conversation key: evidence (`traces`) and conversation text
+(`chat_sessions.messages`) could not be joined. "What context should have been
+available earlier" is inherently multi-turn and was therefore not expressible at
+all. The chat handler had the session id in scope and simply never passed it.
+
+*Built:* `traces.session_id` with a partial index, plumbed through `logTrace`, and
+the backend now forwards the session id to the agent so a conversation's Langfuse
+observations group into one session.
 
 **Sequencing (agreed 2026-08-29):**
 
