@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listServiceDependencies, type ServiceDependency } from "../api";
 
@@ -27,6 +27,15 @@ import { listServiceDependencies, type ServiceDependency } from "../api";
 // rather than importing a second palette.
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // ~30 scan cycles at the 30s burst interval
+
+// /admin/tracked returns "namespace/service" pairs — the same source the
+// observability search box uses. Namespaces are its distinct prefixes.
+async function fetchNamespaces(): Promise<string[]> {
+  const res = await fetch("/admin/tracked");
+  if (!res.ok) return [];
+  const pairs = (await res.json()) as string[] | null;
+  return [...new Set((pairs ?? []).map(p => p.split("/")[0]).filter(Boolean))].sort();
+}
 
 function relTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -157,10 +166,25 @@ function EdgeList({
 }
 
 export function TopologyPanel() {
-  const [namespace, setNamespace] = useState("payments");
-  const [applied, setApplied] = useState("payments");
+  const [applied, setApplied] = useState("");
+  const [typed, setTyped] = useState("");
   const [focus, setFocus] = useState<string | null>(null);
   const [showMermaid, setShowMermaid] = useState(false);
+
+  // Poll while empty (discovery may not have pushed inventory yet), then back
+  // off — the same pattern SearchInput uses against this endpoint.
+  const { data: namespaces = [] } = useQuery({
+    queryKey: ["tracked-namespaces"],
+    queryFn: fetchNamespaces,
+    refetchInterval: (q) => ((q.state.data ?? []).length === 0 ? 3000 : 30000),
+  });
+
+  // Pick a default once, without fighting a later choice: prefer the namespace
+  // that actually has test traffic, else the first tracked one.
+  useEffect(() => {
+    if (applied || namespaces.length === 0) return;
+    setApplied(namespaces.includes("payments") ? "payments" : namespaces[0]);
+  }, [namespaces, applied]);
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["service-dependencies", applied],
@@ -183,21 +207,39 @@ export function TopologyPanel() {
           </p>
         </div>
         <div className="adm-filters">
-          <input
-            className="adm-date-input"
-            value={namespace}
-            onChange={e => setNamespace(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter") { setApplied(namespace); setFocus(null); } }}
-            placeholder="namespace"
-            aria-label="Namespace"
-          />
-          <button
-            className="adm-btn adm-btn--ghost"
-            type="button"
-            onClick={() => { setApplied(namespace); setFocus(null); }}
-          >
-            Load
-          </button>
+          {namespaces.length > 0 ? (
+            <select
+              className="adm-date-input"
+              value={applied}
+              onChange={e => { setApplied(e.target.value); setFocus(null); }}
+              aria-label="Namespace"
+            >
+              {!namespaces.includes(applied) && applied && <option value={applied}>{applied}</option>}
+              {namespaces.map(ns => <option key={ns} value={ns}>{ns}</option>)}
+            </select>
+          ) : (
+            // Free text until discovery has pushed inventory — otherwise an
+            // empty dropdown would make the panel unusable rather than just
+            // unpopulated.
+            <>
+              <input
+                className="adm-date-input"
+                value={typed}
+                onChange={e => setTyped(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter" && typed) { setApplied(typed); setFocus(null); } }}
+                placeholder="namespace"
+                aria-label="Namespace"
+              />
+              <button
+                className="adm-btn adm-btn--ghost"
+                type="button"
+                disabled={!typed}
+                onClick={() => { setApplied(typed); setFocus(null); }}
+              >
+                Load
+              </button>
+            </>
+          )}
           <button className="adm-btn adm-btn--ghost" type="button" onClick={() => refetch()}>
             {isFetching ? "Refreshing…" : "Refresh"}
           </button>
