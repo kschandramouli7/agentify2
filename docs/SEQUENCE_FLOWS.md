@@ -15,6 +15,12 @@ Diagrams are in [Mermaid](https://mermaid.js.org) — rendered by GitHub, VS Cod
 
 ---
 
+> These diagrams answer **"in what order, for one path"**. For **"what exists,
+> and which parts does each flow touch"**, open
+> [`architecture-map.html`](architecture-map.html) — one component map with all
+> 16 flows overlaid on demand, including the ones with no sequence diagram here
+> (mining, remediation, semantic memory, the prompt gate).
+
 ## 1. End-to-end overview — all paths
 
 Shows the Tier-1 fast-path, the Tier-2 skill dispatch, and which strategy each

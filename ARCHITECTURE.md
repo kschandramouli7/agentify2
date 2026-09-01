@@ -5,6 +5,16 @@
 > describes the *product behavior* (policies, specs, decisions about what the
 > system does). Start here to understand the implementation.
 
+> **Start here for the whole picture:** [`docs/architecture-map.html`](docs/architecture-map.html)
+> — one interactive map of every component with each of the 16 data flows
+> traceable one at a time. Open it directly in a browser (no build, no server,
+> no network). This file carries the layer-by-layer written detail; the map
+> carries the shape.
+>
+> For strict ordering and concurrency of a single path, see
+> [`docs/SEQUENCE_FLOWS.md`](docs/SEQUENCE_FLOWS.md).
+
+
 ## 1. Runtime architecture (layers and data flow)
 
 ```

@@ -115,6 +115,10 @@ See [ADR 0004](context-mesh/decisions/0004-tech-stack-polyglot-go-python-typescr
 **Documentation:**
 - **API:** OpenAPI/Swagger schema (auto-generated from Go handlers + Pydantic models).
 - **Database:** schema diagram and ER relationships (in `docs/`).
+- **Whole-system map:** `docs/architecture-map.html` — every component in one
+  interactive map, with each of the 16 data flows traceable one at a time
+  (endpoints, model-call cost and the governing ADR per flow). Self-contained;
+  open it in a browser. Read this before proposing anything cross-cutting.
 - **Deployment:** `docs/DEPLOYMENT.md` — step-by-step AWS setup and runbooks.
 - **Operating the cluster:** `docs/CLOUDSHELL_RUNBOOK.md` — logs, in-cluster psql
   (RDS is in the VPC), port-forward, secrets, restarts. Verified commands.

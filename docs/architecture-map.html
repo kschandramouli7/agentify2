@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Every agentify component in one map, with each of its 16 data flows traceable one at a time.">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  img { max-width: 100%; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<title>Agentify Architecture Map</title>
+<style>
+/* ── Tokens ──────────────────────────────────────────────────────────────────
+   Light is the complete palette on bare :root; dark redefines only what
+   changes, guarded so an explicit light choice wins, and again under
+   [data-theme] so the toggle works in both directions. */
+:root {
+  --bg:        #f6f7f9;
+  --panel:     #ffffff;
+  --surface:   #f0f2f5;
+  --surface-2: #e6e9ee;
+  --border:    #d8dce3;
+  --border-br: #c2c8d2;
+  --text:      #1a1d23;
+  --muted:     #5d6472;
+  --dim:       #8b93a1;
+  --accent:    #2563c9;
+  --accent-lt: #1d4ea8;
+  --accent-dim:#dce7fa;
+  --ok:        #197a4b;
+  --warn:      #8a5a00;
+  --warn-bg:   #fdf3dc;
+  --warn-bd:   #e8cf95;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#0e1116; --panel:#151a21; --surface:#1b212a; --surface-2:#232b36;
+    --border:#2a323d; --border-br:#3a4350; --text:#e6e9ee; --muted:#9aa3b2; --dim:#6b7484;
+    --accent:#6aa2ff; --accent-lt:#9bc0ff; --accent-dim:#1b2c48;
+    --ok:#4ec98a; --warn:#e0b25e; --warn-bg:#2a2213; --warn-bd:#4d3d1b;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:#0e1116; --panel:#151a21; --surface:#1b212a; --surface-2:#232b36;
+  --border:#2a323d; --border-br:#3a4350; --text:#e6e9ee; --muted:#9aa3b2; --dim:#6b7484;
+  --accent:#6aa2ff; --accent-lt:#9bc0ff; --accent-dim:#1b2c48;
+  --ok:#4ec98a; --warn:#e0b25e; --warn-bg:#2a2213; --warn-bd:#4d3d1b;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.55; }
+.wrap { max-width: 1500px; margin: 0 auto; padding: 26px 22px 60px; }
+h1 { font-size: 21px; margin: 0 0 6px; letter-spacing: -0.01em; }
+.lede { margin: 0 0 4px; font-size: 13.5px; color: var(--muted); max-width: 86ch; }
+.lede strong { color: var(--text); }
+code { font-family: var(--mono); font-size: 0.9em; background: var(--surface); padding: 1px 4px; border-radius: 3px; }
+.caveat {
+  margin: 14px 0 22px; padding: 10px 13px; font-size: 12.5px; line-height: 1.6;
+  background: var(--warn-bg); border: 1px solid var(--warn-bd);
+  border-left: 3px solid var(--warn); border-radius: 6px; max-width: 100ch;
+}
+.layout { display: grid; grid-template-columns: 268px minmax(0,1fr); gap: 20px; align-items: start; }
+@media (max-width: 940px) { .layout { grid-template-columns: 1fr; } }
+
+/* ── Flow picker ─────────────────────────────────────────────────────────── */
+.flows { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px; position: sticky; top: 14px; }
+.flows h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); margin: 0 0 4px; }
+.flows__hint { font-size: 11.5px; color: var(--muted); margin: 0 0 10px; }
+.grp { font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 12px 0 5px; }
+.grp:first-of-type { margin-top: 2px; }
+.flow-btn {
+  display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left;
+  background: none; border: 1px solid transparent; border-radius: 6px;
+  padding: 5px 7px; margin-bottom: 1px; color: var(--text);
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.flow-btn:hover { background: var(--surface); }
+.flow-btn[aria-pressed="true"] { background: var(--accent-dim); border-color: var(--accent); color: var(--accent-lt); font-weight: 600; }
+.flow-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.flow-btn__dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); flex: none; transform: translateY(-2px); }
+.flow-btn[aria-pressed="true"] .flow-btn__dot { background: var(--accent); }
+.flow-btn__cost { margin-left: auto; font-size: 10.5px; color: var(--dim); font-weight: 400; white-space: nowrap; }
+.clear { margin-top: 10px; width: 100%; font-size: 12px; padding: 6px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-family: inherit; cursor: pointer; }
+.clear:hover { border-color: var(--border-br); color: var(--text); }
+
+/* ── Map ─────────────────────────────────────────────────────────────────── */
+.map { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 6px 6px 2px; }
+.map__scroll { overflow-x: auto; }
+svg.map__svg { display: block; width: 100%; height: auto; min-width: 900px; }
+.frame { fill: var(--surface); stroke: var(--border); stroke-width: 1; }
+.frame-label { fill: var(--dim); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; }
+.node rect { fill: var(--panel); stroke: var(--border-br); stroke-width: 1; transition: stroke .12s, fill .12s; }
+.node__name { fill: var(--text); font-size: 12.5px; font-weight: 600; }
+.node__sub  { fill: var(--dim);  font-size: 10px; }
+.node--on rect { stroke: var(--accent); stroke-width: 2; fill: var(--accent-dim); }
+.node--off { opacity: .34; }
+.edge__line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.edge__head { fill: var(--accent); }
+.step-badge circle { fill: var(--accent); }
+.step-badge text { fill: var(--panel); font-size: 9.5px; font-weight: 700; font-family: var(--mono); }
+.self-badge circle { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 2.5 2; }
+.self-badge text { fill: var(--accent); font-size: 9.5px; font-weight: 700; font-family: var(--mono); }
+.empty-note { fill: var(--dim); font-size: 12px; }
+
+/* ── Steps ───────────────────────────────────────────────────────────────── */
+.steps { margin-top: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.steps__head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.steps__title { font-size: 14px; font-weight: 700; margin: 0; }
+.steps__meta { font-size: 11.5px; color: var(--muted); }
+.steps__meta code { font-size: 10.5px; }
+.steps__why { font-size: 12.5px; color: var(--muted); margin: 4px 0 12px; max-width: 92ch; }
+ol.steps__list { margin: 0; padding: 0; list-style: none; counter-reset: s; }
+ol.steps__list li { counter-increment: s; display: grid; grid-template-columns: 22px 190px minmax(0,1fr); gap: 10px; padding: 5px 0; border-top: 1px solid var(--border); font-size: 12.5px; align-items: baseline; }
+ol.steps__list li:first-child { border-top: none; }
+ol.steps__list li::before { content: counter(s); font-family: var(--mono); font-size: 10.5px; font-weight: 700; color: var(--accent); background: var(--accent-dim); border-radius: 4px; text-align: center; padding: 1px 0; }
+.hop { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.hop--self { color: var(--dim); font-style: italic; }
+@media (max-width: 700px) { ol.steps__list li { grid-template-columns: 22px minmax(0,1fr); } .hop { grid-column: 2; } }
+
+details.alt { margin-top: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
+details.alt summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+details.alt table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+details.alt th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); padding: 6px 8px; border-bottom: 1px solid var(--border); }
+details.alt td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+details.alt tr td:first-child { color: var(--muted); white-space: nowrap; }
+.foot { margin-top: 22px; font-size: 12px; color: var(--muted); }
+</style>
+
+<div class="wrap">
+  <h1>Agentify Architecture Map</h1>
+  <p class="lede">
+    Every component of the platform, and <strong>each data flow traced one at a time</strong>.
+    Pick a flow on the left: the components it touches light up, its hops are numbered on the
+    map, and the ordered steps appear below with the real endpoint each one calls.
+  </p>
+
+  <p class="caveat">
+    <strong>Why one flow at a time, and not all of them at once.</strong> There are 16 flows over
+    18 components. Drawn simultaneously that is roughly 90 edges — a hairball that answers nothing.
+    So the map stays static and legible, and the flows are overlaid on demand. This is a
+    <em>structural</em> view: it shows what exists and which parts each flow touches, not precise
+    ordering or concurrency. For strict sequence and timing, see
+    <code>docs/SEQUENCE_FLOWS.md</code>, which holds eight sequence diagrams.
+  </p>
+
+  <div class="layout">
+    <nav class="flows" aria-label="Data flows">
+      <h2>Data flows</h2>
+      <p class="flows__hint">16 flows · click to trace one</p>
+      <div id="flowList"></div>
+      <button class="clear" id="clearBtn" type="button">Show structure only</button>
+    </nav>
+
+    <div>
+      <div class="map">
+        <div class="map__scroll">
+          <svg id="svg" viewBox="0 0 1280 820" role="img" aria-labelledby="mapTitle mapDesc">
+            <title id="mapTitle">Agentify component map</title>
+            <desc id="mapDesc">Eighteen components in five bands: clients, the agentify namespace,
+              the AWS data plane, external services, and observed clusters. Select a flow to trace
+              its path. The table at the bottom of the page carries every flow and step as text.</desc>
+          </svg>
+        </div>
+      </div>
+
+      <section class="steps" id="steps" aria-live="polite"></section>
+    </div>
+  </div>
+
+  <details class="alt">
+    <summary>All 16 flows as text (accessible alternative to the diagram)</summary>
+    <div id="altTable"></div>
+  </details>
+
+  <p class="foot">
+    Generated from the code, not from memory: endpoints come from
+    <code>src/backend/internal/api/router.go</code> and <code>src/agent/app.py</code>; flow shapes from
+    <code>docs/SEQUENCE_FLOWS.md</code>, the ADRs in <code>context-mesh/decisions/</code>, and the
+    skills in <code>src/agent/k8fy/skills/</code>.
+  </p>
+</div>
+
+<script>
+// ── The map ─────────────────────────────────────────────────────────────────
+// Hardcoded coordinates rather than a measured/auto layout: 18 nodes in fixed
+// bands is a design decision, not something an algorithm should re-derive on
+// every render, and it keeps the picture stable between visits.
+const NODES = {
+  operator: { x:  40, y:  40, w:170, h:56, name:"Operator",           sub:"browser" },
+  alb:      { x: 250, y:  40, w:170, h:56, name:"ALB / Ingress",       sub:"AWS ALB" },
+  ci:       { x:1040, y:  40, w:200, h:56, name:"GitHub Actions",      sub:"CI · prompt gate" },
+
+  fe:       { x:  70, y: 194, w:210, h:56, name:"Frontend",            sub:"React + Vite" },
+  be:       { x: 340, y: 194, w:240, h:56, name:"Backend · Hub",       sub:"Go · net/http" },
+  ag:       { x: 650, y: 194, w:240, h:56, name:"Agent",               sub:"Python · FastAPI · 11 skills" },
+
+  pg:       { x:  70, y: 374, w:250, h:56, name:"Postgres",            sub:"+ pgvector" },
+  ddb:      { x: 360, y: 374, w:180, h:56, name:"DynamoDB",            sub:"config / metadata" },
+  sm:       { x: 580, y: 374, w:210, h:56, name:"Secrets Manager",     sub:"keys & creds" },
+  wv:       { x: 830, y: 374, w:170, h:56, name:"Weaviate",            sub:"vector pod" },
+  s3:       { x:1040, y: 374, w:170, h:56, name:"S3",                  sub:"shipped logs" },
+
+  ant:      { x:  70, y: 534, w:210, h:56, name:"Anthropic",           sub:"Opus · reasoning" },
+  lf:       { x: 320, y: 534, w:200, h:56, name:"Langfuse",            sub:"prompts + traces" },
+  vy:       { x: 560, y: 534, w:200, h:56, name:"Voyage AI",           sub:"embeddings" },
+  ath:      { x: 800, y: 534, w:230, h:56, name:"Athena / Glue",       sub:"log warehouse" },
+
+  ds:       { x:  70, y: 694, w:230, h:56, name:"Discovery collector", sub:"per cluster · Python" },
+  k8s:      { x: 340, y: 694, w:190, h:56, name:"K8s API",             sub:"in-cluster RBAC" },
+  vault:    { x: 570, y: 694, w:180, h:56, name:"Vault",               sub:"PKI engine" },
+  wl:       { x: 790, y: 694, w:250, h:56, name:"Workloads",           sub:"payments test services" },
+};
+
+const FRAMES = [
+  { x: 46, y: 152, w:1190, h:118, label:"agentify namespace · EKS Fargate" },
+  { x: 46, y: 332, w:1190, h:118, label:"AWS data plane" },
+  { x: 46, y: 492, w:1190, h:118, label:"External services" },
+  { x: 46, y: 652, w:1190, h:118, label:"Observed clusters (fleet)" },
+];
+
+// ── The flows ───────────────────────────────────────────────────────────────
+// `to: null` marks work a component does internally — no edge is drawn, the
+// node is badged instead. Pretending an internal decision is a network hop
+// would be the easiest way to make this diagram lie.
+const FLOWS = [
+{ group:"Query paths", id:"tier1", name:"Tier-1 fast path", cost:"0 model calls", ref:"ADR 0006",
+  why:"A structured question with a deterministic answer never reaches the model. Sub-millisecond, free, confidence 1.0.",
+  steps:[
+    {a:"operator", b:"fe",  t:'asks "is payment-api healthy?"'},
+    {a:"fe", b:"be",        t:"POST /api/query {question, context}"},
+    {a:"be", b:null,        t:"inferIntent() → health_check"},
+    {a:"be", b:"pg",        t:"RouteToPods() then parallel pod-data fetch"},
+    {a:"be", b:null,        t:"tryDeterministic() answers from the data — no agent call at all"},
+    {a:"be", b:"fe",        t:"QueryResponse · tier1 · confidence 1.0"},
+]},
+{ group:"Query paths", id:"patternA", name:"Pattern A — diagnose", cost:"1 Opus call", ref:"spec 005 · ADR 0023",
+  why:"Everything the skill needs is knowable up front, so it prefetches in parallel and makes exactly one model call. No tool loop.",
+  steps:[
+    {a:"fe", b:"be",  t:'POST /api/query "why is payment-worker failing?"'},
+    {a:"be", b:"ag",  t:"POST /reason {intent: diagnose}"},
+    {a:"ag", b:"be",  t:"POST /api/agent/fetch ×N — health, events, logs, certs, dependencies, in parallel"},
+    {a:"ag", b:"be",  t:"GET /api/resolve-cluster — fleet fan-out adds one cluster-scoped prefetch per match"},
+    {a:"ag", b:"lf",  t:"resolve prompt k8fy/diagnose @production (60s cache, 60s negative cache)"},
+    {a:"ag", b:"ant", t:"one Opus call, structured output"},
+    {a:"ag", b:"lf",  t:"record the observation"},
+    {a:"ag", b:"be",  t:"AgentResponse {findings, likely_cause, recommended_actions}"},
+    {a:"be", b:"pg",  t:"INSERT traces (tier2, prompt_name, prompt_version)"},
+    {a:"be", b:"fe",  t:"rendered as a DiagnosisReport"},
+]},
+{ group:"Query paths", id:"patternB", name:"Pattern B — agentic loop", cost:"1–N Opus calls", ref:"spec 010",
+  why:"The fallback for questions whose data needs cannot be known in advance. The model drives, calling tools until it can answer — capped at 5 iterations.",
+  steps:[
+    {a:"fe", b:"be",  t:"POST /api/query (general_query / metrics_query)"},
+    {a:"be", b:"ag",  t:"POST /reason → SkillRouter finds no skill, uses K8fyAgent"},
+    {a:"ag", b:"ant", t:"Opus call with tools attached"},
+    {a:"ag", b:"be",  t:"POST /api/agent/fetch — one per tool call, looping"},
+    {a:"ag", b:"ant", t:"final answer once no more tools are requested"},
+    {a:"ag", b:"be",  t:"AgentResponse + tool_calls for provenance"},
+]},
+
+{ group:"Chat", id:"chat", name:"Chat turn", cost:"2 model calls", ref:"P19 gap E",
+  why:"A free-form tool loop produces prose, then a second schema-constrained call restructures it into sections the UI can render. The two are never combined — this codebase never puts tools and a strict schema in one call.",
+  steps:[
+    {a:"fe", b:"be",  t:"POST /api/chat/sessions/{id}/messages"},
+    {a:"be", b:"pg",  t:"load the session's full history"},
+    {a:"be", b:"ag",  t:"POST /reason-chat {messages, session_id}"},
+    {a:"ag", b:"ant", t:"free-form tool-calling loop (no schema)"},
+    {a:"ag", b:"be",  t:"POST /api/agent/fetch per tool call"},
+    {a:"ag", b:"ant", t:"second call — restructure prose into CHAT_REASONING_SCHEMA"},
+    {a:"ag", b:"lf",  t:"one observation for the whole turn, grouped by session"},
+    {a:"ag", b:"be",  t:"AgentResponse {answer, details}"},
+    {a:"be", b:"pg",  t:"UPDATE chat_sessions · INSERT traces"},
+]},
+{ group:"Chat", id:"deps", name:"Dependency question", cost:"0 model calls", ref:"P18 #2 · ADR 0029",
+  why:"“What are the upstream and downstream dependencies of X?” is a graph traversal with one correct answer, already in Postgres. Routing it deterministically also guarantees the edges reach the UI — the chat structuring call rebuilds details from prose and would otherwise discard them.",
+  steps:[
+    {a:"fe", b:"be",  t:'POST /api/chat/…/messages "upstream and downstream of payment-api"'},
+    {a:"be", b:"ag",  t:"POST /reason-chat"},
+    {a:"ag", b:null,  t:'_chat_route() → "dependencies" (only if the turn asks about nothing else)'},
+    {a:"ag", b:"be",  t:"GET /admin/tracked — resolve the namespace from the question; chat sessions carry none"},
+    {a:"ag", b:"be",  t:"GET /api/service-dependencies?namespace=payments"},
+    {a:"ag", b:null,  t:"compose the answer and the blast radius deterministically — no model call"},
+    {a:"ag", b:"be",  t:"tier1 + details.service_graph"},
+    {a:"be", b:"fe",  t:"drawn as the dependency flow diagram"},
+]},
+{ group:"Chat", id:"run", name:"Chat “Run” button", cost:"0 model calls", ref:"SEQUENCE_FLOWS §7",
+  why:"A recommended action the operator chooses to execute. It goes straight to the agent's allow-listed live tools — no collector relay, because it targets the local cluster.",
+  steps:[
+    {a:"fe", b:"be",  t:"POST /api/live-query {tool, arguments}"},
+    {a:"be", b:"ag",  t:"POST /live-tool-call — validated against an explicit allow-list"},
+    {a:"ag", b:"k8s", t:"live read: pods, logs, events, describe"},
+    {a:"ag", b:"be",  t:"raw tool result"},
+    {a:"be", b:"fe",  t:"rendered by result shape, never as raw JSON"},
+]},
+
+{ group:"Fleet & mining", id:"fanout", name:"Live fan-out across clusters", cost:"0 model calls", ref:"ADR 0028",
+  why:"The Hub never dials into a cluster. Each collector opens an outbound socket and the Hub relays requests down it, so no inbound access or cross-account credential is ever needed.",
+  steps:[
+    {a:"ds", b:"be",  t:"GET /api/collector/connect — persistent outbound websocket, one per cluster"},
+    {a:"ag", b:"be",  t:"GET /api/resolve-cluster — which clusters run this service"},
+    {a:"ag", b:"be",  t:"POST /api/live-fetch {cluster_id, tool, args}"},
+    {a:"be", b:"ds",  t:"relay over that cluster's open socket"},
+    {a:"ds", b:"k8s", t:"live read inside the target cluster"},
+    {a:"ds", b:"be",  t:"result back up the socket, then to the agent"},
+]},
+{ group:"Fleet & mining", id:"inventory", name:"Inventory push", cost:"every 60s", ref:"P18 #1 · ADR 0029",
+  why:"The collector reports what exists; the Hub never asks. Service selectors ride along so the centralized miner can attribute callers without a live cluster.",
+  steps:[
+    {a:"ds", b:"k8s", t:"list namespaces, services (name + selector), deployments, statefulsets"},
+    {a:"ds", b:"be",  t:"POST /api/cluster-inventory"},
+    {a:"ds", b:"be",  t:"POST /api/cluster-health · POST /api/cluster-ingress"},
+    {a:"be", b:"pg",  t:"upsert cluster_services with selector JSONB"},
+]},
+{ group:"Fleet & mining", id:"mining", name:"Live dependency mining", cost:"every 60s", ref:"P18 #2",
+  why:"Edges are mined from LOG TEXT, not observed on the network. An edge exists only where a caller logged the callee's hostname — so the graph is always a lower bound.",
+  steps:[
+    {a:"ds", b:"k8s", t:"list services, then the first 5 pods, then their last 200 log lines"},
+    {a:"ds", b:null,  t:"redact secrets, then extract_service_mentions() — qualified or bare hostnames, validated against the live Service list"},
+    {a:"ds", b:"be",  t:"POST /api/service-dependencies per edge; CollectorToken derives tenant + cluster"},
+    {a:"be", b:"pg",  t:"upsert service_dependencies — evidence_count += 1"},
+]},
+{ group:"Fleet & mining", id:"glue", name:"Glue / Athena mining", cost:"hourly", ref:"ADR 0029",
+  why:"Breadth, not latency. A cluster that ships logs but was never onboarded for live scanning still contributes edges. Reuses the same extraction function as the live miner rather than reimplementing it.",
+  steps:[
+    {a:"ag", b:"be",  t:"GET /admin/integrations — enumerate fleet clusters and namespaces"},
+    {a:"ag", b:"be",  t:"GET /api/cluster-service-selectors?cluster_id=&namespace="},
+    {a:"ag", b:"ath", t:"Athena query filtered by cluster_id, namespace and the current hour partition"},
+    {a:"ath", b:"s3", t:"scans the shipped log objects"},
+    {a:"ag", b:null,  t:"parse raw CRI lines, group by pod, resolve from_service from stored selectors"},
+    {a:"ag", b:"be",  t:"POST /api/service-dependencies with an explicit cluster_id"},
+]},
+
+{ group:"Memory & actions", id:"memory", name:"Semantic memory", cost:"1 embedding", ref:"P8",
+  why:"Past diagnoses are recalled by meaning, not keyword. Every failure mode here is deliberately silent — a missing memory must never break a diagnosis.",
+  steps:[
+    {a:"be", b:"ag",  t:"POST /embed after a tier2 diagnose (async, off the response path)"},
+    {a:"ag", b:"vy",  t:"Voyage embedding, 512 dimensions"},
+    {a:"be", b:"pg",  t:"INSERT incident_embeddings (pgvector, FK → traces.id)"},
+    {a:"ag", b:"be",  t:"GET /api/incidents/similar on the next diagnose"},
+    {a:"be", b:"pg",  t:"IVFFlat cosine search, over-fetch then dedupe by headline"},
+]},
+{ group:"Memory & actions", id:"remediation", name:"Remediation", cost:"human-approved", ref:"ADR 0020",
+  why:"The model only ever proposes. Execution is a separate, deterministic dispatch reached exclusively after a human approves — it never decides, only executes.",
+  steps:[
+    {a:"ag", b:"be",  t:"POST /api/incidents/respond — a proposal, with blast radius and evidence"},
+    {a:"be", b:"pg",  t:"INSERT remediation proposal (pending)"},
+    {a:"fe", b:"be",  t:"GET /admin/remediation — operator reviews"},
+    {a:"fe", b:"be",  t:"POST /admin/remediation/{id}/approve"},
+    {a:"be", b:"ag",  t:"POST /reason {intent: execute_remediation}"},
+    {a:"ag", b:"k8s", t:"restart / scale / rollback — zero model calls on this path"},
+]},
+{ group:"Memory & actions", id:"cert", name:"Vault cert renewal", cost:"0 model calls", ref:"spec 011",
+  why:"Another deterministic skill path: the decision was already made, so renewal issues a cert and writes the Secret without asking a model anything.",
+  steps:[
+    {a:"fe", b:"be",  t:"POST /admin/certs/renew"},
+    {a:"be", b:"ag",  t:"POST /reason {intent: renew_cert, action: renew}"},
+    {a:"ag", b:"vault", t:"issue a new certificate from the PKI engine"},
+    {a:"ag", b:"k8s", t:"update the TLS Secret in place"},
+    {a:"ag", b:"be",  t:"result — no LLM involved"},
+]},
+
+{ group:"Platform", id:"storage", name:"Event ingest & storage routing", cost:"policy-driven", ref:"storage-strategy",
+  why:"Where an event lands is a policy decision, not a hardcoded route — the design-time policy in context-mesh/ decides per event which store type receives it.",
+  steps:[
+    {a:"ds", b:"be",  t:"POST /api/ingest {event}"},
+    {a:"be", b:null,  t:"storage-strategy policy picks the store type for this event"},
+    {a:"be", b:"pg",  t:"relational + time-series rows"},
+    {a:"be", b:"wv",  t:"vector store for semantic lookup"},
+    {a:"be", b:"ddb", t:"low-latency config and pod metadata"},
+]},
+{ group:"Platform", id:"gate", name:"Prompt promotion gate", cost:"CI only", ref:"ADR 0030",
+  why:"Prompts are data served from Langfuse, not code in the container. A candidate version must beat the production baseline on the eval set before a label moves — editing the fallback string in the repo changes nothing that ships.",
+  steps:[
+    {a:"ci", b:"be",  t:"POST /admin/eval/query {prompt_name, prompt_version|label}"},
+    {a:"be", b:"ag",  t:"POST /reason with the pin in context; the trace is marked is_eval"},
+    {a:"ag", b:"lf",  t:"resolve the PINNED version, cache bypassed"},
+    {a:"ag", b:"ant", t:"scored run against the eval dataset"},
+    {a:"ci", b:"lf",  t:"scores recorded as a dataset run / experiment"},
+    {a:"ci", b:"lf",  t:"on pass, promote the label to production — no restart needed"},
+]},
+{ group:"Platform", id:"config", name:"Secrets & startup config", cost:"at boot", ref:"—",
+  why:"Nothing is hardcoded and no secret is logged. Note the sharp edge: updating Secrets Manager does NOT reach a running pod — the value is read from env, sourced from a Kubernetes Secret that only the deploy workflow recreates.",
+  steps:[
+    {a:"be", b:"sm",  t:"read DB credentials and collector tokens"},
+    {a:"ag", b:"sm",  t:"read the Anthropic key — unwrapped and validated before use"},
+    {a:"be", b:"ddb", t:"read pod profiles and thresholds"},
+    {a:"operator", b:"alb", t:"reaches the console over the ALB; the hostname is account-specific"},
+    {a:"alb", b:"fe", t:"routes / to the frontend and /api, /admin to the backend"},
+]},
+];
+
+// ── Rendering ───────────────────────────────────────────────────────────────
+const SVG_NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("svg");
+let active = null;
+
+function el(tag, attrs = {}, text) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+/** Attach on the sides that face each other, so an edge never crosses its own
+ *  endpoint box. Vertical when the vertical gap dominates — which it does for
+ *  every cross-band hop, the common case here. */
+function anchors(a, b) {
+  const ac = { x: a.x + a.w / 2, y: a.y + a.h / 2 };
+  const bc = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+  const dx = bc.x - ac.x, dy = bc.y - ac.y;
+  if (Math.abs(dy) > Math.abs(dx) * 0.7) {
+    return [{ x: ac.x, y: dy > 0 ? a.y + a.h : a.y },
+            { x: bc.x, y: dy > 0 ? b.y : b.y + b.h }, "v"];
+  }
+  return [{ x: dx > 0 ? a.x + a.w : a.x, y: ac.y },
+          { x: dx > 0 ? b.x : b.x + b.w, y: bc.y }, "h"];
+}
+
+function pathOf(p, q, kind, offset) {
+  // Offset perpendicular to travel, so an A→B and a B→A in the same flow stay
+  // separately readable instead of sitting on top of each other.
+  const o = offset || 0;
+  const P = kind === "v" ? { x: p.x + o, y: p.y } : { x: p.x, y: p.y + o };
+  const Q = kind === "v" ? { x: q.x + o, y: q.y } : { x: q.x, y: q.y + o };
+  const c = kind === "v" ? (Q.y - P.y) * 0.5 : (Q.x - P.x) * 0.5;
+  const C1 = kind === "v" ? { x: P.x, y: P.y + c } : { x: P.x + c, y: P.y };
+  const C2 = kind === "v" ? { x: Q.x, y: Q.y - c } : { x: Q.x - c, y: Q.y };
+  const d = `M ${P.x} ${P.y} C ${C1.x} ${C1.y}, ${C2.x} ${C2.y}, ${Q.x} ${Q.y}`;
+  // Exact point on the cubic, so a badge nudged off centre still sits ON the
+  // line rather than beside it.
+  const at = t => {
+    const u = 1 - t;
+    return {
+      x: u*u*u*P.x + 3*u*u*t*C1.x + 3*u*t*t*C2.x + t*t*t*Q.x,
+      y: u*u*u*P.y + 3*u*u*t*C1.y + 3*u*t*t*C2.y + t*t*t*Q.y,
+    };
+  };
+  return { d, at };
+}
+
+/** True when a point lands inside a node box, so a badge can be moved off it.
+ *  Endpoints are excluded — an edge legitimately starts and ends at a box. */
+function hitsANode(pt, exclude) {
+  const PAD = 6;
+  for (const [id, n] of Object.entries(NODES)) {
+    if (exclude.includes(id)) continue;
+    if (pt.x > n.x - PAD && pt.x < n.x + n.w + PAD &&
+        pt.y > n.y - PAD && pt.y < n.y + n.h + PAD) return true;
+  }
+  return false;
+}
+
+function render() {
+  svg.replaceChildren(
+    el("title", { id: "mapTitle" }, "Agentify component map"),
+    el("desc", { id: "mapDesc" },
+      "Eighteen components in five bands. Select a flow to trace its path. " +
+      "The table at the bottom of the page carries every flow and step as text."),
+  );
+
+  const defs = el("defs");
+  const m = el("marker", { id: "ah", viewBox: "0 0 8 8", refX: "7", refY: "4",
+                           markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+  m.appendChild(el("path", { d: "M 0 0 L 8 4 L 0 8 z", class: "edge__head" }));
+  defs.appendChild(m);
+  svg.appendChild(defs);
+
+  for (const f of FRAMES) {
+    svg.appendChild(el("rect", { x: f.x, y: f.y, width: f.w, height: f.h, rx: 10, class: "frame" }));
+    svg.appendChild(el("text", { x: f.x + 14, y: f.y + 18, class: "frame-label" }, f.label));
+  }
+
+  const flow = FLOWS.find(f => f.id === active);
+  const badges = [];   // rendered AFTER the nodes — see the note below
+  const touched = new Set();
+  const selfSteps = new Map();
+  const pairs = new Map();
+
+  if (flow) {
+    flow.steps.forEach((s, i) => {
+      touched.add(s.a);
+      if (s.b === null) {
+        if (!selfSteps.has(s.a)) selfSteps.set(s.a, []);
+        selfSteps.get(s.a).push(i + 1);
+        return;
+      }
+      touched.add(s.b);
+      const key = `${s.a}>${s.b}`;
+      if (!pairs.has(key)) pairs.set(key, { a: s.a, b: s.b, nums: [] });
+      pairs.get(key).nums.push(i + 1);
+    });
+
+    for (const p of pairs.values()) {
+      const A = NODES[p.a], B = NODES[p.b];
+      const [from, to, kind] = anchors(A, B);
+      const hasReverse = pairs.has(`${p.b}>${p.a}`);
+      const off = hasReverse ? (p.a < p.b ? -11 : 11) : 0;
+      const { d, at } = pathOf(from, to, kind, off);
+      svg.appendChild(el("path", { d, class: "edge__line", "marker-end": "url(#ah)" }));
+
+      // A cross-band edge's midpoint often lands on an unrelated box (Agent →
+      // Langfuse passes straight through the data plane), so walk along the
+      // curve until the badge is clear of every non-endpoint node.
+      let spot = at(0.5);
+      for (const t of [0.5, 0.36, 0.64, 0.26, 0.74, 0.16, 0.84]) {
+        const cand = at(t);
+        if (!hitsANode(cand, [p.a, p.b])) { spot = cand; break; }
+      }
+      badges.push({ spot, label: p.nums.join(",") });
+    }
+  }
+
+  for (const [id, n] of Object.entries(NODES)) {
+    const on = touched.has(id);
+    const cls = "node" + (flow ? (on ? " node--on" : " node--off") : "");
+    const g = el("g", { class: cls });
+    g.appendChild(el("title", {}, `${n.name} — ${n.sub}`));
+    g.appendChild(el("rect", { x: n.x, y: n.y, width: n.w, height: n.h, rx: 8 }));
+    g.appendChild(el("text", { x: n.x + n.w / 2, y: n.y + 24, "text-anchor": "middle", class: "node__name" }, n.name));
+    g.appendChild(el("text", { x: n.x + n.w / 2, y: n.y + 40, "text-anchor": "middle", class: "node__sub" }, n.sub));
+    if (selfSteps.has(id)) {
+      const nums = selfSteps.get(id).join(",");
+      const b = el("g", { class: "self-badge" });
+      b.appendChild(el("circle", { cx: n.x + n.w - 8, cy: n.y + 8, r: 10 }));
+      b.appendChild(el("text", { x: n.x + n.w - 8, y: n.y + 11.4, "text-anchor": "middle" }, nums));
+      g.appendChild(b);
+    }
+    svg.appendChild(g);
+  }
+
+  // Badges last, deliberately. Nodes paint over the edge LINES, which is what
+  // you want at an endpoint, but painting over the step NUMBERS made them
+  // vanish behind DynamoDB and Secrets Manager.
+  for (const b of badges) {
+    const g = el("g", { class: "step-badge" });
+    const r = Math.max(9, (9 + b.label.length * 4.2) / 2);
+    g.appendChild(el("circle", { cx: b.spot.x, cy: b.spot.y, r }));
+    g.appendChild(el("text", { x: b.spot.x, y: b.spot.y + 3.4, "text-anchor": "middle" }, b.label));
+    svg.appendChild(g);
+  }
+
+  if (!flow) {
+    svg.appendChild(el("text", { x: 640, y: 800, "text-anchor": "middle", class: "empty-note" },
+      "Structure only — pick a flow to trace its path"));
+  }
+  renderSteps(flow);
+}
+
+function renderSteps(flow) {
+  const host = document.getElementById("steps");
+  host.replaceChildren();
+  if (!flow) {
+    const p = document.createElement("p");
+    p.className = "steps__why";
+    p.style.margin = "0";
+    p.textContent = "No flow selected. The map above shows every component and how they are grouped; "
+      + "choose a flow on the left to see which of them it touches and in what order.";
+    host.appendChild(p);
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "steps__head";
+  const h = document.createElement("h3");
+  h.className = "steps__title";
+  h.textContent = flow.name;
+  const meta = document.createElement("span");
+  meta.className = "steps__meta";
+  meta.textContent = `${flow.cost} · ${flow.ref}`;
+  head.append(h, meta);
+
+  const why = document.createElement("p");
+  why.className = "steps__why";
+  why.textContent = flow.why;
+
+  const ol = document.createElement("ol");
+  ol.className = "steps__list";
+  flow.steps.forEach(s => {
+    const li = document.createElement("li");
+    const hop = document.createElement("span");
+    if (s.b === null) {
+      hop.className = "hop hop--self";
+      hop.textContent = `${NODES[s.a].name} (internal)`;
+    } else {
+      hop.className = "hop";
+      hop.textContent = `${NODES[s.a].name} → ${NODES[s.b].name}`;
+    }
+    const what = document.createElement("span");
+    what.textContent = s.t;
+    li.append(hop, what);
+    ol.appendChild(li);
+  });
+  host.append(head, why, ol);
+}
+
+// ── Flow picker ─────────────────────────────────────────────────────────────
+const list = document.getElementById("flowList");
+let lastGroup = null;
+for (const f of FLOWS) {
+  if (f.group !== lastGroup) {
+    const g = document.createElement("div");
+    g.className = "grp";
+    g.textContent = f.group;
+    list.appendChild(g);
+    lastGroup = f.group;
+  }
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "flow-btn";
+  b.setAttribute("aria-pressed", "false");
+  b.dataset.id = f.id;
+  const dot = document.createElement("span");
+  dot.className = "flow-btn__dot";
+  const name = document.createElement("span");
+  name.textContent = f.name;
+  const cost = document.createElement("span");
+  cost.className = "flow-btn__cost";
+  cost.textContent = f.cost;
+  b.append(dot, name, cost);
+  b.addEventListener("click", () => select(f.id === active ? null : f.id));
+  list.appendChild(b);
+}
+document.getElementById("clearBtn").addEventListener("click", () => select(null));
+
+function select(id) {
+  active = id;
+  for (const b of list.querySelectorAll(".flow-btn")) {
+    b.setAttribute("aria-pressed", String(b.dataset.id === active));
+  }
+  render();
+  // Remember the last flow per viewer as a convenience only; the page must
+  // render correctly with nothing stored (private windows, blocked site data).
+  try { localStorage.setItem("agentify-map-flow", active ?? ""); } catch (e) { /* ignore */ }
+}
+
+// ── Text alternative ────────────────────────────────────────────────────────
+(function buildAlt() {
+  const rows = FLOWS.map(f => {
+    const steps = f.steps.map((s, i) =>
+      `<tr><td>${i === 0 ? `<strong>${f.name}</strong>` : ""}</td>` +
+      `<td>${i + 1}</td>` +
+      `<td>${s.b === null ? NODES[s.a].name + " (internal)" : NODES[s.a].name + " → " + NODES[s.b].name}</td>` +
+      `<td>${s.t.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td></tr>`).join("");
+    return steps;
+  }).join("");
+  document.getElementById("altTable").innerHTML =
+    `<table><thead><tr><th>Flow</th><th>#</th><th>Hop</th><th>What happens</th></tr></thead><tbody>${rows}</tbody></table>`;
+})();
+
+let restored = "";
+try { restored = localStorage.getItem("agentify-map-flow") || ""; } catch (e) { restored = ""; }
+select(FLOWS.some(f => f.id === restored) ? restored : null);
+</script>
+
+</body>
+</html>
