@@ -43,30 +43,70 @@ The answer carries a **Service dependencies** section rendering the same
 diagram, focused on the service you named, plus the upstream/downstream sets in
 words and the blast radius.
 
-**The graph is fetched deterministically, not left to the model.** A keyword
-match on the latest user turn (`dependenc`, `upstream`, `downstream`,
-`who calls`, `blast radius`, `callers`, `call graph`, …) triggers a direct
-`GET /api/service-dependencies` for the session's namespace, and the edges are
-attached to the reply as `details.service_graph`. Two reasons:
+### The turn is routed, not just decorated
 
-- reading the graph back is a traversal, not synthesis — the same argument ADR
-  0029 makes for mining it ("a plain extraction task; no Claude call belongs in
-  this pipeline");
-- `_structure_chat_answer` rebuilds `details` from the model's **prose**, so any
-  edge not attached explicitly is lost before the UI sees it. A paraphrase
-  cannot be drawn.
+A **pure** dependency question never reaches the model. `_chat_route()` in
+`src/agent/k8fy/agent.py` returns `"dependencies"`, the agent reads the graph
+from `GET /api/service-dependencies` and composes the answer itself, and the
+turn comes back as **`tier1`** — no model call, no tokens, no cost, no
+latency beyond one database read.
 
-The graph also attaches when the model calls `get_service_dependencies` itself
-while answering something else — in that case it is still the same section,
-below the actual answer.
+Three reasons, and the second is the load-bearing one:
 
-Which service gets focused is resolved by matching the question text against the
-graph's own service names, longest first, so `payment-api` is never collapsed to
-`payment`; failing that, the session's context service. It cannot focus a
-service the graph does not contain.
+- reading the graph back is a traversal with one correct answer — the same
+  argument ADR 0029 makes for mining it ("a plain extraction task; no Claude
+  call belongs in this pipeline");
+- `_structure_chat_answer` rebuilds `details` from the model's **prose**, so
+  edges the model saw in a tool result were being discarded before the UI could
+  draw them. A paraphrase is not drawable;
+- a model asked to restate counts can get them wrong. These counts are already
+  easy to misread (§3) without adding a paraphrase step.
 
-Only the **latest** user turn is inspected. A conversation that discussed
-dependencies five turns ago does not attach a graph to every later answer.
+### What is *not* routed, deliberately
+
+Routing only fires when the question is about the call graph **and nothing
+else**. If the turn also mentions health, logs, certs, metrics, changes,
+remediation, or uses diagnostic phrasing (`why`, `root cause`, `broken`, …), it
+goes to the model as normal — and the graph is still attached to the answer, so
+nothing is lost.
+
+That precedence mirrors Go's `inferIntent()`, which checks diagnostic phrasing
+first: *"why is payment-api slow, does it depend on vault?"* is a diagnosis, and
+the graph is context for it, not the answer. The deterministic path holds no
+health, log, cert or metric data, so answering that question from the graph
+alone would silently drop half of it.
+
+| Question | Route |
+|---|---|
+| what are the upstream and downstream dependencies of payment-api? | `tier1`, deterministic |
+| who calls payment-api? | `tier1`, deterministic |
+| show me the call graph for payments | `tier1`, deterministic |
+| why is payment-api slow, does it depend on vault? | model, graph attached |
+| what are payment-api's dependencies and is it healthy? | model, graph attached |
+| what changed in payment-api's dependencies recently? | model, graph attached |
+
+It also falls through to the model when there is **no graph** for the
+namespace — a bare "no evidence" would be a dead end, while the model can
+explain why the namespace is empty (§4).
+
+### Details that matter if you change this
+
+- **The turn is still traced.** The route sits inside `reason_chat`, below its
+  decorators, so a deterministic turn is recorded as a conversation turn like
+  any other (P19 gap E). A route placed in the FastAPI layer would have been
+  marginally cheaper and would have lost that.
+- **A `tier1` answer carries no prompt provenance.** `@_with_system_prompt`
+  stamps `prompt_name`/`prompt_version` on every response; it now skips `tier1`,
+  because attributing a deterministic answer to a prompt version would distort
+  what the promotion gate measures ([PROMPT_LIFECYCLE.md](PROMPT_LIFECYCLE.md)).
+- **Go logs the tier the agent reports**, defaulting to `tier2` when the field
+  is absent, so an older agent build still records correctly.
+- **Focus** is resolved by matching the question against the graph's own service
+  names, longest first, so `payment-api` is never collapsed to `payment`;
+  failing that, the session's context service. It cannot focus a service the
+  graph does not contain.
+- **Only the latest user turn is inspected**, so a conversation that discussed
+  dependencies five turns ago does not attach a graph to every later answer.
 
 ## 2. What the panel shows
 
@@ -139,6 +179,10 @@ function, so the matching rule below is true of all of them.
 Live mining is the **faster** signal; Glue mining is the **broader** one (a
 cluster that ships logs but was never onboarded for live scanning still
 contributes). Neither backfills.
+
+Three *readers* consume the table: the Dependencies tab, the deterministic chat
+route (§1b), and every Pattern-A skill's prefetch — which is why ADR 0029 could
+add the Glue miner with no changes to any call site.
 
 `extract_service_mentions` is duplicated verbatim between
 `src/agent/k8fy/` and `src/adapters/discovery/` — a deliberate copy, per ADR

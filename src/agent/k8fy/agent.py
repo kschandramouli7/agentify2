@@ -54,8 +54,20 @@ def _with_system_prompt(method):
         finally:
             _active_prompt.reset(token)
         if isinstance(result, AgentResponse):
-            result.prompt_name = rp.name
-            result.prompt_version = rp.version
+            # A tier1 answer was produced deterministically, with no model call
+            # and therefore no prompt. Stamping one would attribute it to a
+            # version that did not produce it — and prompt_version is what
+            # PROMPT_LIFECYCLE.md's gate measures a candidate by, so false
+            # attribution here silently distorts promotion decisions.
+            #
+            # The prompt is still RESOLVED above, before the method knows it can
+            # answer deterministically. That is a cached lookup in the normal
+            # case, and keeping the route inside the decorated method is
+            # deliberate: the turn stays traced as a conversation turn (P19
+            # gap E), which a route that bypassed the decorators would lose.
+            if result.tier != "tier1":
+                result.prompt_name = rp.name
+                result.prompt_version = rp.version
         return result
 
     return wrapper
@@ -436,6 +448,181 @@ def _focus_service(messages: List[Dict[str, Any]], context: Dict[str, Any], serv
             return name
     ctx_service = context.get("service")
     return ctx_service if isinstance(ctx_service, str) and ctx_service in services else None
+
+
+# Concerns that need synthesis. A question touching any of these goes to the
+# model even when it also mentions dependencies, because the deterministic
+# answer below can ONLY talk about the call graph — it has no health, log, cert
+# or metric data, and answering "what are payment-api's dependencies and is it
+# healthy?" with a graph alone would silently drop half the question.
+#
+# Diagnostic phrasing leads the list for the same reason Go's inferIntent()
+# checks it first: "why is payment-api slow, does it depend on vault?" is a
+# diagnosis, and the graph is context for it, not the answer.
+_NEEDS_SYNTHESIS_KEYWORDS = (
+    # diagnostic phrasing — mirrors inferIntent()'s own first block
+    "why", "what's wrong", "whats wrong", "what is wrong", "root cause",
+    "root-cause", "diagnos", "investigate", "going on", "going wrong", "broken",
+    # other data domains this deterministic path holds nothing about
+    "health", "healthy", "unhealthy", "degraded", "crash", "oom", "restart",
+    "log", "error", "cert", "expir", "vault", "pki",
+    "metric", "cpu", "memory", "latency", "slow", "timeout",
+    "deploy", "rollout", "changed", "scale", "rollback", "fix", "remediat",
+)
+
+
+def _chat_route(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """Which deterministic route, if any, should answer this chat turn.
+
+    Returns "dependencies" only when the latest turn is asking about the call
+    graph AND about nothing else. Deliberately conservative: a false negative
+    costs one model call and still shows the graph (reason_chat attaches it
+    either way), while a false positive answers a question the caller did not
+    ask and drops the part it cannot see.
+    """
+    latest = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content")
+            latest = content if isinstance(content, str) else json.dumps(content)
+            break
+    lowered = latest.lower()
+    if not any(kw in lowered for kw in _DEPENDENCY_QUESTION_KEYWORDS):
+        return None
+    if any(kw in lowered for kw in _NEEDS_SYNTHESIS_KEYWORDS):
+        return None
+    return "dependencies"
+
+
+def _hop_phrase(dist: int) -> str:
+    return "direct" if dist == 1 else f"{dist} hops"
+
+
+def _reach(edges: List[Dict[str, Any]], start: str, forward: bool) -> Dict[str, int]:
+    """Hop distance to everything reachable from `start`.
+
+    BFS, so a service reachable by both a short and a long path gets the short
+    one — the honest reading of "how close is this". Mirrors the UI's reach();
+    both are breadth-first over the same edges, so the prose and the picture
+    cannot disagree.
+    """
+    nxt: Dict[str, List[str]] = {}
+    for e in edges:
+        k, v = (e["from_service"], e["to_service"]) if forward else (e["to_service"], e["from_service"])
+        nxt.setdefault(k, []).append(v)
+    dist = {start: 0}
+    frontier = [start]
+    while frontier:
+        following = []
+        for node in frontier:
+            for n in nxt.get(node, []):
+                if n in dist:
+                    continue
+                dist[n] = dist[node] + 1
+                following.append(n)
+        frontier = following
+    dist.pop(start, None)
+    return dist
+
+
+def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
+    """Prose + `details` for a dependency question, with no model call.
+
+    "What are the upstream and downstream dependencies of X" is a graph
+    traversal with one correct answer, so a model adds latency, cost and a
+    chance of paraphrasing the numbers wrong. It buys nothing: the caveats that
+    make this data honest are fixed text, and the shape is drawn by the UI.
+    """
+    edges = graph["dependencies"]
+    namespace = graph["namespace"]
+    focus = graph.get("focus")
+    services = sorted({e[k] for e in edges for k in ("from_service", "to_service")})
+    callers_of = {s: sorted({e["from_service"] for e in edges if e["to_service"] == s}) for s in services}
+    callees_of = {s: sorted({e["to_service"] for e in edges if e["from_service"] == s}) for s in services}
+
+    caveat = (
+        f"Mined from pod logs in {namespace}, so this is a lower bound: an edge exists only "
+        "where a caller logged the callee's hostname. A missing edge means no evidence, not "
+        "no dependency."
+    )
+
+    if focus:
+        up_direct = callers_of.get(focus, [])
+        down_direct = callees_of.get(focus, [])
+        up_all = _reach(edges, focus, forward=False)
+        down_all = _reach(edges, focus, forward=True)
+
+        def _count(n: int, noun: str) -> str:
+            return "nothing" if n == 0 else f"{n} {noun}{'' if n == 1 else 's'}"
+
+        headline = (
+            f"{focus} is called by {_count(len(up_direct), 'service')} "
+            f"and calls {_count(len(down_direct), 'service')}."
+        )
+        lines = [
+            headline,
+            "",
+            f"Upstream — services observed calling {focus}: "
+            + (", ".join(up_direct) if up_direct else "none observed"),
+            f"Downstream — services {focus} calls: "
+            + (", ".join(down_direct) if down_direct else "none observed"),
+        ]
+        findings = [
+            f"Upstream (direct): {', '.join(up_direct) if up_direct else 'none observed'}",
+            f"Downstream (direct): {', '.join(down_direct) if down_direct else 'none observed'}",
+        ]
+        if up_all:
+            blast = ", ".join(
+                f"{svc} ({_hop_phrase(d)})" for svc, d in sorted(up_all.items(), key=lambda kv: (kv[1], kv[0]))
+            )
+            lines += ["", f"If {focus} fails, {len(up_all)} service"
+                          f"{'' if len(up_all) == 1 else 's'} would be affected: {blast}."]
+            findings.append(f"Blast radius if {focus} fails: {len(up_all)} service"
+                            f"{'' if len(up_all) == 1 else 's'} — {blast}")
+        else:
+            lines += ["", f"Nothing here was observed calling {focus}, so no upstream impact is known."]
+            findings.append(f"No service was observed calling {focus} — no known upstream impact")
+        if len(down_all) > len(down_direct):
+            findings.append(
+                f"{focus} transitively reaches {len(down_all)} services, including indirect dependencies"
+            )
+    else:
+        entries = [s for s in services if not callers_of.get(s)]
+        terminals = [s for s in services if not callees_of.get(s)]
+        headline = (
+            f"{namespace} has {len(services)} services with {len(edges)} observed calls between them."
+        )
+        lines = [
+            headline,
+            "",
+            "Entry points — nothing observed calling them: "
+            + (", ".join(entries) if entries else "none"),
+            "Terminal — observed calling nothing: "
+            + (", ".join(terminals) if terminals else "none"),
+            "",
+            "Name a service to see its upstream and downstream dependencies.",
+        ]
+        findings = [
+            f"{len(services)} services, {len(edges)} observed calls",
+            f"Entry points: {', '.join(entries) if entries else 'none'}",
+            f"Terminal services: {', '.join(terminals) if terminals else 'none'}",
+        ]
+
+    answer = "\n".join(lines + ["", caveat])
+    details = {
+        # No status is asserted: this is a topology report, not a health verdict,
+        # and borrowing a health word here would make the UI paint a verdict the
+        # data does not support.
+        "severity": "info",
+        "incident_summary": headline,
+        "timeline": [],
+        "findings": findings,
+        "likely_cause": None,
+        "recommendations": [],
+        "recommended_actions": [],
+        "service_graph": graph,
+    }
+    return answer, details
 
 
 async def _build_service_graph(
@@ -970,6 +1157,44 @@ class K8fyAgent:
         """
         if context is None:
             context = {}
+
+        # ── Deterministic route, before any model call ────────────────────────
+        #
+        # A pure dependency question has one correct answer and it is already
+        # in Postgres. Routing it here rather than through the tool loop makes
+        # it instant and free, removes the chance of the model paraphrasing the
+        # counts wrong, and — the reason it matters most — guarantees the graph
+        # reaches the UI, because _structure_chat_answer rebuilds details from
+        # prose and would otherwise drop the edges.
+        #
+        # Falls through to the model on ANY miss: no route, no namespace, no
+        # graph, or an unexpected failure. A dependency question with no mined
+        # evidence is better served by the model, which can explain why the
+        # namespace is empty; a bare "no data" would be a dead end.
+        if _chat_route(messages) == "dependencies":
+            try:
+                graph = await _build_service_graph(messages, context, self.backend_url)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("deterministic dependency route failed, falling back to model: %s", e)
+                graph = None
+            if graph:
+                answer, details = _dependency_answer(graph)
+                metrics.record_request("ok")
+                logger.info(
+                    "chat answered deterministically: intent=dependencies namespace=%s focus=%s edges=%d",
+                    graph["namespace"], graph.get("focus"), len(graph["dependencies"]),
+                )
+                return AgentResponse(
+                    answer=answer,
+                    status="ok",
+                    # Certainty about the evidence, not about completeness — the
+                    # answer text states the lower-bound caveat itself.
+                    confidence=1.0,
+                    sources=["service_dependencies"],
+                    tool_calls=[],
+                    details=details,
+                    tier="tier1",
+                )
 
         system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
         chat_messages = list(messages)  # copy so we can append tool results

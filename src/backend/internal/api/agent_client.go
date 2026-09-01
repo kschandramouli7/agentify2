@@ -53,6 +53,10 @@ type AgentResponse struct {
 	CacheCreationInputTokens int64                  `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64                  `json:"cache_read_input_tokens"`
 	EstimatedCostUSD         float64                `json:"estimated_cost_usd"`
+	// Tier the agent actually used: "tier1" when it answered deterministically
+	// with no model call. Empty for every response that predates the field, so
+	// callers must default it rather than treat "" as a tier.
+	Tier                     string                 `json:"tier"`
 	PromptName               string                 `json:"prompt_name"`
 	PromptVersion            *int                   `json:"prompt_version"`
 }

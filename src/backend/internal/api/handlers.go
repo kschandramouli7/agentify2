@@ -1471,7 +1471,16 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if agentErr == nil && agentResp != nil {
-		h.logTrace(traceID, req.Content, "chat", s.Namespace, "tier2", "ok",
+		// The agent reports its own tier: a chat turn it answered
+		// deterministically (e.g. a dependency-graph question) made no model
+		// call, and recording it as tier2 would inflate both the cost rollups
+		// and any eval that scores routing. Default to tier2 — an older agent
+		// build sends no tier, and chat was tier2-only before this.
+		tier := agentResp.Tier
+		if tier == "" {
+			tier = "tier2"
+		}
+		h.logTrace(traceID, req.Content, "chat", s.Namespace, tier, "ok",
 			agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls),
 			start, agentResp, traceMeta{SessionID: s.ID, Service: s.Service})
 	}

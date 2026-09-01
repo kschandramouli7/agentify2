@@ -28,6 +28,14 @@ class AgentResponse(BaseModel):
     cache_read_input_tokens: int = 0      # tokens served from prompt cache
     estimated_cost_usd: float = 0.0
 
+    # Which tier answered. "tier1" = deterministic, no model call (and so no
+    # tokens, no cost, no prompt provenance); "tier2" = an LLM synthesis call.
+    # None means the caller should assume its own default — reason_chat is
+    # tier2 unless it says otherwise. Recorded so a free deterministic answer
+    # is not logged as a paid one, which would distort both the cost figures
+    # and any eval that scores routing.
+    tier: Optional[str] = None
+
     # Which prompt produced this answer (spec 004 provenance, ROADMAP P19 gap C).
     # prompt_version is None when the local fallback string was used — there is
     # no Langfuse version to attribute the answer to in that case.
