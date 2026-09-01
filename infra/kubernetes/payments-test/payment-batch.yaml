@@ -60,12 +60,18 @@ spec:
     spec:
       containers:
       - name: batch
-        # The 'payments' namespace's Fargate profile has NO NAT gateway — only
-        # VPC endpoints for ecr.api / ecr.dkr / kinesis-firehose (ADR 0021), so
-        # Docker Hub is unreachable and a plain `alpine:3.19` cannot be pulled.
-        # 03-vault-bootstrap.yml rewrites ACCOUNT_ID... to the real registry;
-        # the tag is mirrored by scripts/mirror_base_images.sh.
-        image: ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/agentify/log-test-base/alpine:3.19
+        # Stock Docker Hub image, matching the other payments-test manifests.
+        #
+        # ADR 0021 describes a no-NAT Fargate profile for this namespace, which
+        # would make Docker Hub unreachable and require the ECR mirror
+        # (scripts/mirror_base_images.sh, referenced by 03-vault-bootstrap.yml's
+        # ACCOUNT_ID sed). That is NOT this account: 05-payment-test.yml records
+        # that the payments subnet here has a NAT gateway, which is also why the
+        # init containers' `apk add curl jq` works and why the sed finds no
+        # placeholder to rewrite. Pointing at a mirrored tag would instead risk
+        # ImagePullBackOff whenever enable_log_platform_test has not been
+        # applied and the tag does not exist.
+        image: alpine:3.19
         env:
         # One burst per interval. Short enough that a scan cycle always finds
         # fresh evidence within the log tail (agentify-discovery reads a bounded
