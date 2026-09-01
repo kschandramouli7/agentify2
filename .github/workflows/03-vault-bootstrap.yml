@@ -139,12 +139,20 @@ jobs:
           sed -i "s|ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com|${REGISTRY}|g" \
             infra/kubernetes/payments-test/payment-service.yaml \
             infra/kubernetes/payments-test/payment-worker.yaml \
-            infra/kubernetes/payments-test/payment-api.yaml
+            infra/kubernetes/payments-test/payment-api.yaml \
+            infra/kubernetes/payments-test/payment-batch.yaml
 
           # Deployments with Vault Agent Injector annotations
           kubectl apply -f infra/kubernetes/payments-test/payment-service.yaml
           kubectl apply -f infra/kubernetes/payments-test/payment-worker.yaml
           kubectl apply -f infra/kubernetes/payments-test/payment-api.yaml
+
+          # payment-batch: the batch caller that gives service-dependency
+          # discovery something to find. Both miners mine LOG TEXT for
+          # "<service>.<namespace>" mentions validated against the live Service
+          # list, and until this existed no test workload called another service
+          # or logged its name — so the whole pipeline ran against nothing.
+          kubectl apply -f infra/kubernetes/payments-test/payment-batch.yaml
 
           # Cert rotator removed — renewal is now on-demand via UI button / chat
 

@@ -72,6 +72,11 @@ spec:
         # itself never changes.
         - name: CRASH_LOOP
           value: "false"
+        # How often the outbound burst runs. Short enough that a scan cycle
+        # always finds fresh evidence in the log tail; long enough to stay
+        # negligible.
+        - name: CALL_INTERVAL_SECONDS
+          value: "30"
         command:
         - /bin/sh
         - -c
@@ -86,9 +91,27 @@ spec:
             sleep 5
             exit 1
           fi
+          # Outbound burst, every CALL_INTERVAL_SECONDS.
+          #
+          # Service-dependency discovery mines LOG TEXT, not network traffic
+          # (agentify-discovery's _scan_namespace and the Glue miner both look
+          # for "<service>.<namespace>[.svc.cluster.local]" and validate the
+          # match against the live Service list). So the FQDN must be echoed —
+          # making the call without logging it produces no edge at all.
+          #
+          # The hostname is logged whether or not the call succeeds, on purpose:
+          # an unreachable dependency is still a dependency, and that is exactly
+          # the case an operator most wants surfaced.
           while true; do
             echo "payment-worker running — certs from Vault PKI"
-            sleep 30
+            for target in payment-api.payments.svc.cluster.local payment.payments.svc.cluster.local; do
+              if wget -q -O- --no-check-certificate -T 3 "https://$target/" >/dev/null 2>&1; then
+                echo "calling https://$target/ ok"
+              else
+                echo "calling https://$target/ unreachable"
+              fi
+            done
+            sleep "${CALL_INTERVAL_SECONDS:-30}"
           done
         volumeMounts:
         - name: vault-secrets
@@ -105,3 +128,28 @@ spec:
       - name: vault-secrets
         emptyDir: {}
       restartPolicy: Always
+---
+# payment-worker had no Service, which made it invisible to dependency mining:
+# both miners resolve from_service by matching a pod's labels against Service
+# selectors and DROP the edge when nothing matches
+#   from_service = _service_for_pod(pod["labels"], services)
+#   if not from_service: continue
+# so a worker with no Service can never be the source of an edge, however much
+# it logs. Headless (clusterIP: None) because nothing needs to load-balance to
+# it — the Service exists to make the workload nameable, which is also what
+# lets other services depend on it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-worker
+  namespace: payments
+  labels:
+    app: payment-worker
+spec:
+  clusterIP: None
+  selector:
+    app: payment-worker
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090

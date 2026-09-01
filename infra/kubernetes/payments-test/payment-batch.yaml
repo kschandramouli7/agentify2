@@ -1,0 +1,134 @@
+# payment-batch — a batch caller that exercises service-to-service discovery.
+#
+# WHY THIS EXISTS
+#
+# Service-dependency discovery (ROADMAP P18 use case #2, ADR 0029) mines LOG
+# TEXT, not network traffic: both the live per-cluster miner
+# (agentify-discovery's _scan_namespace) and the centralized Glue/Athena miner
+# look for "<service>.<namespace>[.svc.cluster.local]" in pod logs and count a
+# match only when the namespace segment matches and the service segment is in
+# the live Service list. The whole pipeline — storage, ingest, two miners,
+# tenant scoping, consumption by diagnose — was built and had nothing to find,
+# because no test workload ever called another service or logged its name.
+#
+# This workload provides that evidence, on a schedule, from a pod that stays
+# alive.
+#
+# WHY A LONG-RUNNING DEPLOYMENT AND NOT A CRONJOB
+#
+# "Batch" suggests a CronJob, but the two miners read logs from different
+# places:
+#   - the live miner reads them from RUNNING pods via the K8s API, so a CronJob
+#     pod that exits in seconds is often Completed or garbage-collected before
+#     the next scan cycle — the live miner would see nothing;
+#   - the Glue miner reads SHIPPED logs, so a CronJob would be fine there.
+# A CronJob would therefore exercise only half the system. This is a Deployment
+# that performs a burst of calls every CALL_INTERVAL_SECONDS: batch semantics,
+# a pod that is always readable, and logs that still ship to Glue.
+#
+# WHY IT IS SINGLE-CONTAINER, AND WHY THAT MATTERS
+#
+# k8s_client.get_pod_logs sends no `container` parameter, so the Kubernetes API
+# returns 400 for any multi-container pod and the function logs a warning and
+# returns "". Adding this as a sidecar to payment-api would have silently
+# disabled log reading for that pod — for dependency mining AND for the
+# diagnose skill's log tail. Hence a separate single-container workload.
+# (That limitation is worth fixing on its own: in a service-mesh cluster every
+# pod is multi-container.)
+#
+# WHY IT HAS A SERVICE
+#
+# Both miners resolve from_service by matching pod labels against Service
+# selectors and drop the edge when nothing matches. A caller with no Service is
+# unattributable, so its calls are invisible however faithfully it logs them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-batch
+  namespace: payments
+  labels:
+    app: payment-batch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-batch
+  template:
+    metadata:
+      labels:
+        app: payment-batch
+    spec:
+      containers:
+      - name: batch
+        # The 'payments' namespace's Fargate profile has NO NAT gateway — only
+        # VPC endpoints for ecr.api / ecr.dkr / kinesis-firehose (ADR 0021), so
+        # Docker Hub is unreachable and a plain `alpine:3.19` cannot be pulled.
+        # 03-vault-bootstrap.yml rewrites ACCOUNT_ID... to the real registry;
+        # the tag is mirrored by scripts/mirror_base_images.sh.
+        image: ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/agentify/log-test-base/alpine:3.19
+        env:
+        # One burst per interval. Short enough that a scan cycle always finds
+        # fresh evidence within the log tail (agentify-discovery reads a bounded
+        # number of lines), long enough to stay negligible.
+        - name: CALL_INTERVAL_SECONDS
+          value: "30"
+        # Downstream services, space-separated. Each must be a real Service in
+        # this namespace or the miner will correctly refuse to record the edge —
+        # it validates against the live Service list rather than trusting the
+        # log text.
+        - name: TARGETS
+          value: "payment-api payment payment-worker"
+        - name: NAMESPACE
+          value: "payments"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "payment-batch starting — batch caller for service-dependency discovery"
+          echo "targets: $TARGETS  interval: ${CALL_INTERVAL_SECONDS}s"
+          while true; do
+            echo "payment-batch: starting call burst"
+            for svc in $TARGETS; do
+              target="$svc.$NAMESPACE.svc.cluster.local"
+              # busybox wget: --no-check-certificate because the serving certs
+              # come from the Vault PKI test CA, -T 3 so an unreachable target
+              # cannot stall the burst.
+              if wget -q -O- --no-check-certificate -T 3 "https://$target/" >/dev/null 2>&1; then
+                echo "payment-batch: called https://$target/ ok"
+              else
+                # Logged anyway, deliberately: the edge is real whether or not
+                # the callee answers, and an unreachable dependency is exactly
+                # what an operator wants surfaced. payment-worker has no
+                # listener, so this branch is the expected one for it.
+                echo "payment-batch: called https://$target/ unreachable"
+              fi
+            done
+            echo "payment-batch: burst complete"
+            sleep "${CALL_INTERVAL_SECONDS:-30}"
+          done
+        resources:
+          requests:
+            memory: "16Mi"
+            cpu:    "5m"
+          limits:
+            memory: "64Mi"
+            cpu:    "50m"
+---
+# Exists so payment-batch's calls are attributable — see the header. Headless:
+# nothing routes to this workload, and giving it a ClusterIP would advertise an
+# endpoint that serves nothing.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-batch
+  namespace: payments
+  labels:
+    app: payment-batch
+spec:
+  clusterIP: None
+  selector:
+    app: payment-batch
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090
