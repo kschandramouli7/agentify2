@@ -94,6 +94,17 @@ type Slot =
 const slotKey = (s: Slot) => (s.kind === "node" ? `n:${s.id}` : `b:${s.edgeId}`);
 const slotHeight = (s: Slot) => (s.kind === "node" ? NODE_H : BEND_H);
 
+/** In/out degree per service, over whatever edge list is given. */
+export function degrees(edges: ServiceDependency[]): Map<string, { in: number; out: number }> {
+  const d = new Map<string, { in: number; out: number }>();
+  const at = (id: string) => d.get(id) ?? d.set(id, { in: 0, out: 0 }).get(id)!;
+  for (const e of edges) {
+    at(e.from_service).out += 1;
+    at(e.to_service).in += 1;
+  }
+  return d;
+}
+
 /**
  * Layered ("Sugiyama-style") layout.
  *
@@ -108,18 +119,21 @@ const slotHeight = (s: Slot) => (s.kind === "node" ? NODE_H : BEND_H);
  * 3. One barycenter pass orders each column (waypoints included) by the mean
  *    position of its predecessors, so edges cross less and the waypoints line
  *    up behind their own edge rather than zig-zagging.
+ *
+ * `deg` carries in/out degree from the FULL graph, not from `edges`.
+ *
+ * Focusing a service filters the edge list, and computing degree from the
+ * filtered set made the subtitle change with the view — payment-batch read
+ * "entry · calls 2" while focused and "entry · calls 3" unfocused. Degree is a
+ * property of the service, so it must not depend on what is currently drawn.
  */
-export function layout(edges: ServiceDependency[]): Layout {
+export function layout(edges: ServiceDependency[], deg: Map<string, { in: number; out: number }>): Layout {
   const parents = new Map<string, string[]>();
-  const outDeg = new Map<string, number>();
-  const inDeg = new Map<string, number>();
   const ids = new Set<string>();
   for (const e of edges) {
     ids.add(e.from_service);
     ids.add(e.to_service);
     (parents.get(e.to_service) ?? parents.set(e.to_service, []).get(e.to_service)!).push(e.from_service);
-    outDeg.set(e.from_service, (outDeg.get(e.from_service) ?? 0) + 1);
-    inDeg.set(e.to_service, (inDeg.get(e.to_service) ?? 0) + 1);
   }
 
   const depth = new Map<string, number>();
@@ -199,8 +213,8 @@ export function layout(edges: ServiceDependency[]): Layout {
       if (s.kind === "node") {
         nodes.set(s.id, {
           id: s.id, layer: li, x, y,
-          inDeg: inDeg.get(s.id) ?? 0,
-          outDeg: outDeg.get(s.id) ?? 0,
+          inDeg: deg.get(s.id)?.in ?? 0,
+          outDeg: deg.get(s.id)?.out ?? 0,
         });
       } else {
         // Waypoint sits mid-column, so a routed edge reads as passing between
@@ -325,8 +339,11 @@ export function DependencyFlow({
     [visible],
   );
 
+  // From the full edge list on purpose — see layout()'s note on `deg`.
+  const deg = useMemo(() => degrees(edges), [edges]);
+
   const tooBig = nodeCount > MAX_NODES || visible.length > MAX_EDGES;
-  const l = useMemo(() => layout(tooBig ? [] : visible), [visible, tooBig]);
+  const l = useMemo(() => layout(tooBig ? [] : visible, deg), [visible, tooBig, deg]);
 
   if (tooBig) {
     return (

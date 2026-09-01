@@ -364,6 +364,111 @@ REMEDIATION_REASONING_SCHEMA: Dict[str, Any] = {
 }
 
 
+# ── Dependency questions in chat ──────────────────────────────────────────────
+#
+# "What are the upstream and downstream dependencies of payment-api?" is a graph
+# traversal, not a synthesis task — the same reasoning ADR 0029 applies to
+# mining ("a plain extraction task; no Claude call belongs in this pipeline")
+# applies to reading the graph back.
+#
+# So the edges are fetched DETERMINISTICALLY rather than left to the tool loop.
+# The model may well call get_service_dependencies on its own, but "may" is not
+# good enough for a question the user asked explicitly, and the tool result is
+# summarised into prose by _structure_chat_answer, which loses the edges the UI
+# needs to draw the graph. Prefetching also matches the established Pattern A
+# idiom — DiagnoseSkill already prefetches this exact call.
+#
+# Keyword detection rather than a model classifier: Go's inferIntent() already
+# routes every non-chat query this way, so this is the codebase's existing
+# convention, it costs nothing, and it cannot fail open into a paid call.
+_DEPENDENCY_QUESTION_KEYWORDS = (
+    "dependenc",       # dependency, dependencies
+    "depends on",
+    "depend on",
+    "upstream",
+    "downstream",
+    "who calls",
+    "what calls",
+    "calls what",
+    "call graph",
+    "callers",
+    "callees",
+    "blast radius",
+    "service graph",
+    "service topology",
+    "impacted if",
+    "affected if",
+)
+
+
+def _looks_like_dependency_question(messages: List[Dict[str, Any]]) -> bool:
+    """True when the latest user turn is asking about the call graph.
+
+    Only the latest turn is considered: a conversation that touched
+    dependencies ten turns ago should not attach a graph to every later answer.
+    """
+    latest = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content")
+            latest = content if isinstance(content, str) else json.dumps(content)
+            break
+    lowered = latest.lower()
+    return any(kw in lowered for kw in _DEPENDENCY_QUESTION_KEYWORDS)
+
+
+def _focus_service(messages: List[Dict[str, Any]], context: Dict[str, Any], services: List[str]) -> Optional[str]:
+    """Which service the question is about, for the UI to focus.
+
+    Resolved by matching the question text against the graph's OWN service
+    names — so it cannot invent a service, and it handles "payment-api" being
+    named in the question while the session's context service is something
+    else. Longest name first, so "payment-api" wins over "payment".
+    """
+    latest = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content")
+            latest = (content if isinstance(content, str) else json.dumps(content)).lower()
+            break
+    for name in sorted(services, key=len, reverse=True):
+        if name.lower() in latest:
+            return name
+    ctx_service = context.get("service")
+    return ctx_service if isinstance(ctx_service, str) and ctx_service in services else None
+
+
+async def _build_service_graph(
+    messages: List[Dict[str, Any]], context: Dict[str, Any], backend_url: str,
+) -> Optional[Dict[str, Any]]:
+    """The namespace's mined graph plus which service to focus, or None.
+
+    Best-effort throughout: a missing graph must never turn a chat answer into
+    an error, so every failure path returns None and the answer stands on its
+    prose alone.
+    """
+    namespace = context.get("namespace")
+    if not isinstance(namespace, str) or not namespace:
+        return None
+    try:
+        from k8fy.service_topology import fetch_service_dependencies
+
+        edges = await fetch_service_dependencies(namespace, backend_url)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("chat service-graph prefetch failed for namespace=%s: %s", namespace, e)
+        return None
+    if not edges:
+        return None
+    services = sorted({
+        str(e[k]) for e in edges for k in ("from_service", "to_service") if e.get(k)
+    })
+    return {
+        "namespace": namespace,
+        "focus": _focus_service(messages, context, services),
+        "dependencies": edges,
+    }
+
+
 # Schema for reason_chat()'s second, structuring-only call (no tools attached
 # — see _structure_chat_answer). Restructures the free-form prose answer the
 # unconstrained tool-calling loop already produced into the same sectioned
@@ -912,6 +1017,24 @@ class K8fyAgent:
                 metrics.record_tool_iterations(iterations)
 
                 details, structure_usage = await self._structure_chat_answer(final_text, context)
+
+                # Attach the mined call graph so the UI can DRAW it, not just
+                # read a paraphrase of it. Two triggers, deliberately:
+                #   - the question asked about dependencies (the user's intent
+                #     is explicit; do not make it contingent on the model);
+                #   - or the model called get_service_dependencies itself, in
+                #     which case the graph is already relevant to its answer.
+                # details may be {} when structuring failed; the graph still
+                # attaches, because a drawable graph is useful even when the
+                # prose could not be sectioned.
+                if _looks_like_dependency_question(messages) or any(
+                    tc.name == "get_service_dependencies" for tc in tool_calls_made
+                ):
+                    graph = await _build_service_graph(messages, context, self.backend_url)
+                    if graph:
+                        details = dict(details or {})
+                        details["service_graph"] = graph
+
                 total_in_tok      += structure_usage[0]
                 total_out_tok     += structure_usage[1]
                 total_cache_write += structure_usage[2]

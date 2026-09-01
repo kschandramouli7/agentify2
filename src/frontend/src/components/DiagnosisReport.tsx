@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { runLiveTool, type ChatMessageDetails, type RecommendedAction } from "../api";
+import { runLiveTool, type ChatMessageDetails, type RecommendedAction, type ServiceDependency } from "../api";
+import { DependencyFlow, reach } from "./DependencyFlow";
 
 function statusIcon(status: string): string {
   if (status === "healthy") return "✓";
@@ -328,6 +329,18 @@ function ActionResult({ data }: { data: Record<string, unknown> }) {
   if (Array.isArray(data.pods)) return <PodsResult pods={data.pods as PodRow[]} failed={failed} />;
   if (Array.isArray(data.certificates)) return <CertificatesResult certs={data.certificates as CertRow[]} />;
   if (Array.isArray(data.events)) return <EventsResult events={data.events as EventRow[]} failed={failed} showObject />;
+  // get_service_dependencies run as an action: draw it rather than dumping JSON.
+  if (Array.isArray(data.dependencies)) {
+    return (
+      <ServiceGraphSection
+        graph={{
+          namespace: typeof data.namespace === "string" ? data.namespace : "",
+          focus: null,
+          dependencies: data.dependencies as ServiceDependency[],
+        }}
+      />
+    );
+  }
 
   // Unrecognized shape — pretty JSON, never silently show nothing.
   return <pre className="diag-action__output diag-action__output--ok">{JSON.stringify(data, null, 2)}</pre>;
@@ -395,6 +408,89 @@ function ActionRow({ action }: { action: RecommendedAction }) {
   );
 }
 
+// ── Service dependency graph ──────────────────────────────────────────────────
+//
+// The same component the Dependencies tab uses, deliberately: a graph that
+// reads one way in the dashboard and another way in chat is two things to
+// learn, and the honesty caveats (an edge is logged evidence; the counts are
+// confidence, not volume) would have to be repeated correctly in both.
+//
+// Collapsed by default when the question was not specifically about
+// dependencies — the agent also attaches the graph when it consulted it while
+// answering something else, and that should not push the actual answer down
+// the page.
+function ServiceGraphSection({
+  graph,
+}: {
+  graph: { namespace: string; focus?: string | null; dependencies: ServiceDependency[] };
+}) {
+  const [focus, setFocus] = useState<string | null>(graph.focus ?? null);
+  const [open, setOpen] = useState(true);
+
+  const services = new Set(graph.dependencies.flatMap(e => [e.from_service, e.to_service]));
+  const selected = focus && services.has(focus) ? focus : null;
+
+  // Answer the question in words as well as in the picture. The diagram prints
+  // the blast radius for the focused service; this line states the direct
+  // upstream/downstream sets, which is literally what "what are the upstream
+  // and downstream dependencies" asks for.
+  const direct = selected
+    ? {
+        up: graph.dependencies.filter(e => e.to_service === selected).map(e => e.from_service).sort(),
+        down: graph.dependencies.filter(e => e.from_service === selected).map(e => e.to_service).sort(),
+        upAll: reach(graph.dependencies, selected, "up"),
+        downAll: reach(graph.dependencies, selected, "down"),
+      }
+    : null;
+
+  return (
+    <div className="diag-section">
+      <button
+        type="button"
+        className="diag-section__title diag-section__title--btn"
+        onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
+      >
+        <span className={`diag-section__caret${open ? "" : " diag-section__caret--closed"}`} aria-hidden="true" />
+        Service dependencies
+        <span className="diag-section__count">
+          {services.size} services · {graph.dependencies.length} observed calls
+          {selected ? ` · focused on ${selected}` : ""}
+        </span>
+      </button>
+
+      {open && (
+        <>
+          {direct && (
+            <ul className="diag-graph-summary">
+              <li>
+                <strong>Upstream</strong> (callers of {selected}):{" "}
+                {direct.up.length ? direct.up.join(", ") : <em>none observed</em>}
+                {direct.upAll.size > direct.up.length &&
+                  ` — ${direct.upAll.size} affected in total, including indirect`}
+              </li>
+              <li>
+                <strong>Downstream</strong> ({selected} calls):{" "}
+                {direct.down.length ? direct.down.join(", ") : <em>none observed</em>}
+                {direct.downAll.size > direct.down.length &&
+                  ` — ${direct.downAll.size} reached in total, including indirect`}
+              </li>
+            </ul>
+          )}
+
+          <DependencyFlow edges={graph.dependencies} focus={selected} onFocus={setFocus} />
+
+          <p className="diag-graph-note adm-muted">
+            Mined from pod logs in <code>{graph.namespace}</code> — an edge exists only where a
+            caller logged the callee's hostname, so a missing edge means <em>no evidence</em>,
+            not <em>no dependency</em>.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Main report ───────────────────────────────────────────────────────────────
 
 export function DiagnosisReport({ details }: { details: ChatMessageDetails }) {
@@ -423,6 +519,10 @@ export function DiagnosisReport({ details }: { details: ChatMessageDetails }) {
       )}
 
       <Section title="Recommendations" items={details.recommendations ?? []} defaultOpen={false} />
+
+      {(details.service_graph?.dependencies ?? []).length > 0 && (
+        <ServiceGraphSection graph={details.service_graph!} />
+      )}
 
       {(details.recommended_actions ?? []).length > 0 && (
         <div className="diag-section">

@@ -105,6 +105,17 @@ export interface ChatMessageDetails {
   likely_cause?: string | null;
   recommendations?: string[];
   recommended_actions?: RecommendedAction[];
+  /**
+   * The mined call graph, attached by the agent when the question was about
+   * dependencies (or when it consulted the graph itself). Present so the chat
+   * answer can DRAW the graph rather than paraphrase it — the same edges the
+   * Dependencies tab renders, and the same component draws them.
+   */
+  service_graph?: {
+    namespace: string;
+    focus?: string | null;
+    dependencies: ServiceDependency[];
+  };
 }
 
 export interface ChatMessage {

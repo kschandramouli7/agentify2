@@ -2359,6 +2359,68 @@ code {
   color: var(--text);
 }
 
+/* Collapsible section header used by the in-chat dependency graph. Matches
+   .diag-section__title's type so an expandable section and a static one read
+   as the same rank. */
+.diag-section__title--btn {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  margin-bottom: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.diag-section__title--btn:hover { color: var(--accent-light); }
+/* Drawn, not typed: the ▾/▸ glyphs fell back to a dot in the app's font stack
+   and read as a list bullet. */
+.diag-section__caret {
+  width: 0;
+  height: 0;
+  border-left: 4.5px solid transparent;
+  border-right: 4.5px solid transparent;
+  border-top: 5.5px solid var(--muted);
+  transform: translateY(-1px);
+  transition: transform 120ms ease;
+  flex: none;
+}
+.diag-section__caret--closed { transform: rotate(-90deg) translateX(1px); }
+.diag-section__count { color: var(--muted); font-weight: 400; font-size: 12px; }
+
+/* The upstream/downstream answer in words. The picture shows the shape; this
+   states the sets, which is what the question literally asked for. */
+.diag-graph-summary {
+  margin: 2px 0 10px;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text);
+}
+.diag-graph-summary strong { color: var(--text); }
+.diag-graph-summary em { color: var(--muted); font-style: normal; }
+
+.diag-graph-note { margin: 2px 0 0; font-size: 11.5px; line-height: 1.5; }
+.diag-graph-note code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--surface);
+}
+
+/* Inside a chat bubble the diagram has far less width than the dashboard
+   panel, so let it scroll on its own and stop centring it — a left-anchored
+   graph is easier to read when it is wider than its container. */
+.diag-section .flow__scroll { justify-content: flex-start; }
+.diag-section .flow { margin: 4px 0 8px; }
+
 .diag-callout {
   display: flex;
   flex-direction: column;

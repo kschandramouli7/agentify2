@@ -33,6 +33,41 @@ kubectl port-forward -n agentify svc/agentify-backend 18080:8080 &
 cd src/frontend && VITE_BACKEND_URL=http://localhost:18080 npm run dev
 ```
 
+## 1b. Asking in chat
+
+You do not have to open the tab. Ask in the Chat page:
+
+> what are the upstream and downstream dependencies for payment-api?
+
+The answer carries a **Service dependencies** section rendering the same
+diagram, focused on the service you named, plus the upstream/downstream sets in
+words and the blast radius.
+
+**The graph is fetched deterministically, not left to the model.** A keyword
+match on the latest user turn (`dependenc`, `upstream`, `downstream`,
+`who calls`, `blast radius`, `callers`, `call graph`, …) triggers a direct
+`GET /api/service-dependencies` for the session's namespace, and the edges are
+attached to the reply as `details.service_graph`. Two reasons:
+
+- reading the graph back is a traversal, not synthesis — the same argument ADR
+  0029 makes for mining it ("a plain extraction task; no Claude call belongs in
+  this pipeline");
+- `_structure_chat_answer` rebuilds `details` from the model's **prose**, so any
+  edge not attached explicitly is lost before the UI sees it. A paraphrase
+  cannot be drawn.
+
+The graph also attaches when the model calls `get_service_dependencies` itself
+while answering something else — in that case it is still the same section,
+below the actual answer.
+
+Which service gets focused is resolved by matching the question text against the
+graph's own service names, longest first, so `payment-api` is never collapsed to
+`payment`; failing that, the session's context service. It cannot focus a
+service the graph does not contain.
+
+Only the **latest** user turn is inspected. A conversation that discussed
+dependencies five turns ago does not attach a graph to every later answer.
+
 ## 2. What the panel shows
 
 **Namespace picker.** Populated from `/admin/tracked`, so it lists only
@@ -41,17 +76,31 @@ present (the namespace with deliberate test traffic), else the first tracked
 one. While the list is still empty the control degrades to a free-text box —
 unpopulated, not unusable.
 
-**Stat row.** Services · Edges · Observations (summed `evidence_count`) ·
-Stale edges. "Stale" is **no new evidence in 15 minutes** — roughly 15
-Discovery scan cycles at the 60s default, so one missed cycle never trips it.
+**Stat row.** Services · Edges · Entry points · Terminal · Stale edges.
+"Stale" is **no new evidence in 15 minutes** — roughly 15 Discovery scan cycles
+at the 60s default, so one missed cycle never trips it. There is deliberately no
+"total observations" figure: a sum of cycle-sightings (see §3) is close to
+meaningless.
 
 **Flow diagram (primary).** Left-to-right layered dataflow: an arrow means
 *from calls to*. Layers come from longest-path layering, so a service sits one
-column right of its furthest upstream caller, with one barycenter pass to
-reduce crossings. Line weight *and* the printed number on each arrow are the
-observation count. Click a node (or a chip below) to focus it — the diagram then
-draws only that service's immediate callers and callees, which is what keeps it
-legible at fleet size. Cycles are legal and render as an arrow bowed underneath.
+column right of its furthest upstream caller, with one barycenter pass to reduce
+crossings. An edge that skips a column is routed through a waypoint in each
+column it crosses, so it passes *between* the intervening boxes rather than
+underneath them. Each node's subtitle is its in/out degree, or its role when one
+side is zero — `entry` (nothing observed calling it) or `terminal` (observed
+calling nothing). Degrees are always computed over the whole graph, so they do
+not change when you focus.
+
+Line weight is **confidence in three bands**, not volume — see §3. The count is
+printed on every arrow regardless.
+
+Click a node (or a chip below) to focus it. Focus draws the **transitive**
+closure with hop distance, not one hop, and states the blast radius in prose:
+*"if payment-api fails, 2 services upstream are affected: payment-batch
+(direct), payment-worker (direct)."* One hop answers "who calls this"; during an
+incident the question is "who breaks with it". Cycles are legal and render as an
+arrow bowed underneath.
 
 Past **24 nodes or 60 edges** the diagram deliberately refuses to draw and tells
 you to focus a service or read the table. A picture of 200 edges is a hairball,
@@ -70,11 +119,11 @@ observation counts.
 
 ### How it is coloured, and why so little
 
-There are no categorical series in this data, so no hue means "identity."
-`evidence_count` is a magnitude → one channel (width) with the number always
-printed. Freshness is a state → the app's reserved status tokens, always with a
-word (`fresh` / `stale`), never colour alone. Both reuse the existing CSS token
-system, so dark mode and the rest of the console stay consistent.
+There are no categorical series in this data, so no hue means "identity." The
+accent marks the focused subgraph; hop distance is shown by opacity, not a
+second hue. Freshness is a state → the app's reserved status tokens, always with
+a word (`fresh` / `stale`), never colour alone. Everything reuses the existing
+CSS token system, so dark mode and the rest of the console stay consistent.
 
 ## 3. Where the data comes from
 
@@ -96,6 +145,28 @@ contributes). Neither backfills.
 0029 — and the Glue miner *imports* the agent copy rather than adding a third.
 **Both copies carry the same test file**, so they cannot drift silently. Change
 one, change the other.
+
+### What `evidence_count` actually measures
+
+**It is not call volume.** It is the number of scan cycles in which a miner saw
+the caller log the callee's hostname. So it tracks three things that have
+nothing to do with traffic: how chatty the caller's logging is, how long the
+edge has existed, and sampling luck (§4, items 4–5).
+
+The payments namespace demonstrates it exactly. payment-batch's three edges all
+read **187** — identical, because it logs all three targets in every burst — and
+187 × the 60s scan interval is precisely their 3h age. payment-worker's **13** is
+the same 3 hours seen in only 13 cycles, not 14× less traffic.
+
+Read it as **confidence**: how many independent times the system confirmed the
+edge is real. That is why the diagram uses three *absolute* bands (1–2 / 3–19 /
+20+) rather than a width ramp relative to the graph's maximum — 40 sightings
+means the same thing whether or not some other edge has 4000 — and why the table
+column is named "Cycles seen".
+
+The earlier design ramped line width continuously across `evidence_count`, which
+turned "payment-batch logs more" into a visual claim that its dependencies were
+far more important. Do not reintroduce that.
 
 ### The matching rule
 
@@ -203,6 +274,8 @@ its logs) and why it has its own Service (so its calls are attributable).
 ## 6. Known limits, stated plainly
 
 - **Lower bound, always.** See the note at the top.
+- **The counts are confidence, not volume.** See §3, "What `evidence_count`
+  actually measures" — the single easiest thing to misread here.
 - **No backfill.** Both miners reflect state going forward.
 - **Sampling.** 5 pods, 200 lines, per cycle.
 - **Up to an hour of lag on the Glue path**, ~60s on the live path.
