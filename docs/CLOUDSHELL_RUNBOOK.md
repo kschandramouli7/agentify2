@@ -128,6 +128,30 @@ looks like a failure but isn't.
 **The port-forward dies with the CloudShell session**, which idles out after
 about 20 minutes.
 
+## 3b. Open the ops console
+
+The ALB hostname is **account-specific and changes when the ingress is
+recreated** — never copy it into a config file. Read the current one:
+
+```bash
+kubectl get ingress agentify -n agentify \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+```
+
+Then open `http://<that-hostname>/` in a browser. `02 · Deploy` also prints it in
+its job summary as **Frontend**.
+
+To run the UI locally against that cluster (hot reload, live data):
+
+```bash
+kubectl port-forward -n agentify svc/agentify-backend 18080:8080 &
+cd src/frontend && VITE_BACKEND_URL=http://localhost:18080 npm run dev
+```
+
+`vite.config.ts` defaults to `http://localhost:8080` and takes the target from
+`VITE_BACKEND_URL`. It used to default to a hard-coded ALB name, which stopped
+resolving after the account migration and made `npm run dev` fail silently.
+
 ## 4. Secrets
 
 ```bash
