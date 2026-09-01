@@ -142,8 +142,48 @@ of truth for whether a candidate passed.
 
 ### 4. Promote
 
-In Langfuse, move the `production` label to the gated version. Live traffic picks
-it up within ~60s.
+**There is no version to specify anywhere.** Not in `prompts.py`, not in a
+manifest, not in a deploy. The agent resolves `label="production"` on every
+request, so promoting *is* moving that label — the deployed image is irrelevant
+and no restart is involved.
+
+A label points to exactly one version, so assigning `production` to v6 moves it
+off v5 in the same action.
+
+**Via the UI (recommended for a first promotion — unambiguous):**
+Langfuse → Prompts → `k8fy/diagnose` → the version you gated → set label
+`production`.
+
+**Scripted:**
+
+```python
+from langfuse import Langfuse
+lf = Langfuse(public_key=..., secret_key=..., base_url="https://us.cloud.langfuse.com")
+lf.update_prompt(name="k8fy/diagnose", version=6, new_labels=["production"])
+```
+
+`new_labels` sets the labels *for that version*, so include any you want to keep
+(e.g. `["production", "staging"]` to leave it labelled as the current candidate
+too).
+
+**Then confirm it actually took effect** — this is the only step that proves the
+whole mechanism, and it needs no deploy:
+
+```bash
+# wait ~60s for the SDK's stale-while-revalidate cache, then:
+curl -sS -X POST localhost:18080/api/query -H 'Content-Type: application/json' \
+  -d '{"question":"why is payment-worker crashing?","context":{"namespace":"payments","service":"payment-worker"}}'
+curl -sS localhost:18080/admin/traces | python3 -m json.tool | grep -m2 prompt_version
+```
+
+`prompt_version: 6` on a Tier-2 trace means live traffic is on the new version.
+The next deploy's **Verify prompt provenance** step reports the same thing.
+
+Two consequences worth expecting:
+
+- Gating `--prompt-label production` from then on tests v6, so the baseline the
+  gate compares against has moved.
+- Rolling back is the same operation in reverse (step 5) — no redeploy.
 
 ### 5. Roll back
 

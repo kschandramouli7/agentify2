@@ -116,6 +116,8 @@ See [ADR 0004](context-mesh/decisions/0004-tech-stack-polyglot-go-python-typescr
 - **API:** OpenAPI/Swagger schema (auto-generated from Go handlers + Pydantic models).
 - **Database:** schema diagram and ER relationships (in `docs/`).
 - **Deployment:** `docs/DEPLOYMENT.md` — step-by-step AWS setup and runbooks.
+- **Operating the cluster:** `docs/CLOUDSHELL_RUNBOOK.md` — logs, in-cluster psql
+  (RDS is in the VPC), port-forward, secrets, restarts. Verified commands.
 - **Semantic memory:** `docs/SEMANTIC_MEMORY.md` — how diagnose conclusions are
   embedded (Voyage), stored (`incident_embeddings` + pgvector) and retrieved, why
   every failure mode is silent, and how to verify it is actually working.
