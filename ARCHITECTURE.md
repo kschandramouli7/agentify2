@@ -5,15 +5,118 @@
 > describes the *product behavior* (policies, specs, decisions about what the
 > system does). Start here to understand the implementation.
 
-> **Start here for the whole picture:** [`docs/architecture-map.html`](docs/architecture-map.html)
-> — one interactive map of every component with each of the 16 data flows
-> traceable one at a time. Open it directly in a browser (no build, no server,
-> no network). This file carries the layer-by-layer written detail; the map
-> carries the shape.
->
-> For strict ordering and concurrency of a single path, see
-> [`docs/SEQUENCE_FLOWS.md`](docs/SEQUENCE_FLOWS.md).
+## 0. Critical traffic flow — the whole system in one picture
 
+```mermaid
+flowchart TB
+  %% Agentify — critical traffic flow. Every connection appears once, labelled
+  %% with its PURPOSE; the endpoints behind each label are in the table below.
+  %% Drawing the 16 individual flows as lanes would put ~90 edges here — see
+  %% docs/architecture-map.html, which overlays them one at a time instead.
+
+  OP(["Operator"])
+
+  subgraph HUB["① agentify control plane · EKS Fargate"]
+    ALB["ALB / Ingress"]
+    FE["Frontend<br/>React"]
+    BE["Backend · Hub<br/>Go"]
+    AG["Agent<br/>Python · 11 skills"]
+  end
+
+  subgraph FLEET["② Observed clusters · one collector each"]
+    DS["Discovery<br/>collector"]
+    K8S["K8s API"]
+    VLT["Vault PKI"]
+  end
+
+  subgraph DATA["③ State · AWS data plane"]
+    PG[("Postgres<br/>+ pgvector")]
+    DDB[("DynamoDB")]
+    SM[["Secrets<br/>Manager"]]
+  end
+
+  subgraph EXT["④ External services"]
+    ANT{{"Anthropic<br/>Opus"}}
+    LF{{"Langfuse"}}
+    VY{{"Voyage"}}
+    ATH{{"Athena / Glue"}}
+  end
+
+  OP  -->|"HTTPS"| ALB
+  ALB -->|"static"| FE
+  ALB -->|"API"| BE
+  FE  -->|"asks · chats · runs actions"| BE
+  BE  -->|"reason · chat · live tools · embed"| AG
+  AG  -->|"fetch data · read graph · recall"| BE
+
+  BE  -->|"traces · chat · graph · vectors"| PG
+  BE  -->|"profiles · thresholds"| DDB
+  BE  -->|"creds"| SM
+  AG  -->|"API key"| SM
+
+  AG  -->|"reasoning"| ANT
+  AG  -->|"prompts · traces"| LF
+  AG  -->|"embeddings"| VY
+  AG  -->|"log mining · hourly"| ATH
+
+  AG  -->|"live tools · remediate · renew"| K8S
+  AG  -->|"issue cert"| VLT
+  DS  -->|"list · logs · describe"| K8S
+  DS  ==>|"ingest · inventory · edges"| BE
+  BE  -.->|"relayed live-fetch"| DS
+
+  classDef store fill:#eef2f8,stroke:#7f95b8,color:#111
+  classDef ext   fill:#f4eef9,stroke:#a189bd,color:#111
+  classDef svc   fill:#e6eefb,stroke:#5f8ac9,color:#111
+  classDef actor fill:#fff,stroke:#7c8492,color:#111
+  class PG,DDB,SM store
+  class ANT,LF,VY,ATH ext
+  class ALB,FE,BE,AG,DS,K8S,VLT svc
+  class OP actor
+```
+
+**Read it as a map of connections, not of requests.** Every connection appears
+exactly once, labelled with what it carries. That is what keeps a single picture
+legible: the 16 individual flows drawn as separate lanes would be ~90 edges. To
+follow one flow end to end, open
+[`docs/architecture-map.html`](docs/architecture-map.html), which overlays them
+one at a time; for strict ordering, [`docs/SEQUENCE_FLOWS.md`](docs/SEQUENCE_FLOWS.md).
+
+### What each connection actually carries
+
+| Connection | Label | Endpoints |
+|---|---|---|
+| Operator → ALB | HTTPS | the ALB hostname is account-specific and changes when the ingress is recreated — never hardcode it |
+| ALB → Frontend / Backend | static · API | `/` to the UI; `/api/*` and `/admin/*` to the Hub |
+| Frontend → Backend | asks · chats · runs actions | `POST /api/query`, `POST /api/chat/sessions/{id}/messages`, `POST /api/live-query`, `POST /admin/remediation/{id}/approve`, `POST /admin/certs/renew` |
+| Backend → Agent | reason · chat · live tools · embed | `POST /reason`, `POST /reason-chat`, `POST /live-tool-call`, `POST /embed` |
+| Agent → Backend | fetch data · read graph · recall | `POST /api/agent/fetch`, `GET /api/service-dependencies`, `GET /api/incidents/similar`, `GET /api/resolve-cluster`, `GET /api/cluster-service-selectors`, `GET /admin/tracked`, `POST /api/live-fetch` |
+| Backend → Postgres | traces · chat · graph · vectors | `traces`, `chat_sessions`, `service_dependencies`, `incident_embeddings` (pgvector), `cluster_services` |
+| Backend → DynamoDB | profiles · thresholds | pod profiles and tuning values, kept out of code |
+| Backend / Agent → Secrets Manager | creds · API key | DB credentials, collector tokens, the Anthropic key. **Updating a secret does not reach a running pod** — the value is read from env, sourced from a K8s Secret only the deploy workflow recreates |
+| Agent → Anthropic | reasoning | one Opus call per Pattern-A skill; 1–N for the Pattern-B loop; **zero** for every deterministic path |
+| Agent → Langfuse | prompts · traces | prompts are resolved per request by label, not baked into the image; one observation per call or chat turn |
+| Agent → Voyage | embeddings | 512-dim vector per diagnosis, for semantic recall |
+| Agent → Athena/Glue | log mining · hourly | the centralized dependency miner, scanning the current hour partition |
+| Agent → K8s API | live tools · remediate · renew | live reads, approved remediation, TLS Secret writes |
+| Agent → Vault | issue cert | PKI engine, on demand |
+| Collector → K8s API | list · logs · describe | 5 pods per namespace, last 200 log lines per scan |
+| **Collector → Backend** (bold) | ingest · inventory · edges | `GET /api/collector/connect` (outbound WSS), `POST /api/ingest`, `/api/cluster-inventory`, `/api/cluster-health`, `/api/cluster-ingress`, `/api/service-dependencies` |
+| Backend ⇢ Collector (dotted) | relayed live-fetch | the Hub **never dials a cluster**. It answers down the socket the collector opened, so no inbound access or cross-account credential is ever needed |
+
+### The five critical paths through it
+
+| # | Path | Route | Model calls |
+|---|---|---|---|
+| 1 | **Ask — fast path** | Operator → ALB → FE → BE → Postgres → BE → FE | **0** — answered deterministically |
+| 2 | **Ask — reasoned** | … → BE → Agent ⇄ BE (parallel prefetch) → Langfuse → Anthropic → BE → Postgres → FE | **1** |
+| 3 | **Chat** | FE → BE → Agent ⇄ BE (tool loop) → Anthropic ×2 → Langfuse → BE → Postgres | **2**, or **0** for a dependency question |
+| 4 | **Continuous ingest** | Collector → K8s API → Collector → BE → Postgres, every 60s | **0** |
+| 5 | **Act** | Agent proposes → BE → Postgres → *human approves* → BE → Agent → K8s API | **0** on the execute leg |
+
+Latency and cost live almost entirely in paths 2 and 3. Paths 1, 4 and 5 touch no
+model at all — which is the point of [ADR 0006](context-mesh/decisions/0006-two-tier-query-path.md)
+and of every deterministic skill since.
 
 ## 1. Runtime architecture (layers and data flow)
 
