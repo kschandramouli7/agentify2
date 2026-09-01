@@ -1668,6 +1668,22 @@ directly.
 
 ---
 
+## Operational backlog (not features — chores with a date attached)
+
+Small, non-feature actions that must not be lost between P-items.
+
+| # | Action | Why | Raised |
+|---|---|---|---|
+| OPS-1 | **Rotate the Langfuse API key pair** | The secret key was pasted into an editor buffer and a Claude Code transcript on 2026-08-30. Create a new pair in Langfuse → Settings → API Keys and **delete the old one** — creating a new key does not revoke the exposed one. Then update the `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` GitHub secrets, run `04 · Bootstrap Langfuse Secret` (writes them to Secrets Manager, which is where the agent reads from — the manifest sets no `LANGFUSE_*` env), `kubectl rollout restart deploy/agentify-agent -n agentify` (settings and the client are cached per process), then verify a Tier-2 trace still reports a non-null `prompt_version`. A `null` there means the agent is silently on local fallbacks. | 2026-08-30 |
+| OPS-2 | **Set `EVAL_AUTH_TOKEN`** | The prompt promotion gate returns 503 until it is set, now that an empty token fails closed outside dev ([ADR 0030](decisions/0030-version-pinned-prompt-evaluation.md) amendment). Same value in `infra/kubernetes/backend.yaml` (preferably a `secretKeyRef`) and the repo's Actions secrets. | 2026-09-01 |
+| OPS-3 | **`REMEDIATION_AUTH_TOKEN` and `COLLECTOR_TOKEN` still treat empty as open** | Remediation is **write-capable** (restart / scale / rollback, [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) Phase 3), so an unset token is a larger exposure than the one OPS-2 closes. Changing the posture revises ADR 0020, so it needs a decision rather than a patch. | 2026-09-01 |
+| OPS-4 | **Add a Voyage AI payment method** | Currently 3 RPM / 10K TPM. Embed writes are async and skipped on failure, so nothing breaks — vectors are simply dropped as diagnose volume rises ([SEMANTIC_MEMORY.md](../docs/SEMANTIC_MEMORY.md)). | 2026-08-31 |
+| OPS-5 | **`payment-worker` has zero ready replicas** | The agent flagged it `critical` and correlated it to the 11:36 payments deploy. It is also why two eval items report `degraded`, so the eval baseline is measuring a broken cluster. | 2026-09-01 |
+| OPS-6 | **Migrate `scripts/run_evals.py` and `scripts/seed_eval_dataset.py` off langfuse v2** | They use the v2 dataset API (`lf.trace`, `item.link`, `score`) while the agent pins `>=4.14`. That split caused two separate failures on 2026-08-30 — a dead prompt REST path and a missing `create_score` — each of which reported success while doing nothing. See [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md)'s correction. | 2026-08-31 |
+| OPS-7 | **Local AWS SSO / kubeconfig for account `637423369012`** | Unresolved; CloudShell is the working path ([CLOUDSHELL_RUNBOOK.md](../docs/CLOUDSHELL_RUNBOOK.md)). The Microsoft `myapps` tile URL cannot be an `sso_start_url` — `aws sso login` needs an IAM Identity Center portal URL, verified 2026-08-30. | 2026-08-30 |
+
+---
+
 ## Frontend — ops console (not a reviewer P-item; foundational gap)
 
 **Status (v1 scaffolded, 2026-06-04):** `src/frontend/` — Vite + React + TypeScript
