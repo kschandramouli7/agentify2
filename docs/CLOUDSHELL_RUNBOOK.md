@@ -88,6 +88,13 @@ SELECT intent, tier, prompt_name, prompt_version, is_eval, created_at
 -- conversation grouping
 SELECT session_id, count(*) FROM traces WHERE session_id <> '' GROUP BY 1;
 
+-- service-to-service dependency edges (ROADMAP P18 use case #2, ADR 0029).
+-- Mined from LOG TEXT, so an edge only appears when the caller logs the
+-- callee's DNS name — payment-worker and payment-batch do this on a 30s burst.
+-- evidence_count climbing on repeat runs proves the upsert path, not just insert.
+SELECT namespace, from_service, to_service, evidence_count, last_seen
+  FROM service_dependencies ORDER BY last_seen DESC;
+
 -- is pgvector present at all
 SELECT extname FROM pg_extension;
 ```
