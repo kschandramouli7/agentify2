@@ -2856,6 +2856,28 @@ code {
   min-width: 2ch;
 }
 
+/* The bar is coverage, so its fill tracks the same three bands the diagram's
+   line weight uses. Status tokens are correct here: "rarely caught" IS a state
+   worth flagging, and it always ships with the percentage and a word in the
+   tooltip, never colour alone. */
+.topo-evidence--rare .topo-evidence__fill { background: var(--warn); }
+.topo-evidence--new  .topo-evidence__fill { background: var(--dim); }
+
+/* The finding, not a decoration: an edge the miner rarely catches means it is
+   probably missing edges entirely, so this sits above the diagram rather than
+   in a tooltip. */
+.topo-gap {
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: var(--r-sm);
+}
+.topo-gap .adm-badge { margin-right: 2px; }
+
 .topo-focus { margin: 12px 0 16px; }
 .topo-focus__services {
   display: flex;
@@ -2952,6 +2974,11 @@ code {
 }
 
 .flow__line { fill: none; stroke: var(--dim); transition: stroke 120ms ease; }
+/* Freshness in the diagram, which previously only showed in the table: a
+   dependency going cold looked identical to one confirmed a minute ago. Dashes
+   rather than a colour — colour is spoken for by focus, and status hues are
+   reserved. */
+.flow__line--stale { stroke-dasharray: 5 4; }
 .flow__edge--on .flow__line { stroke: var(--accent); }
 .flow__arrowhead { fill: var(--dim); }
 .flow__arrowhead--on { fill: var(--accent); }

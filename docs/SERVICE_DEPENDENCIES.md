@@ -247,15 +247,47 @@ read **187** — identical, because it logs all three targets in every burst —
 187 × the 60s scan interval is precisely their 3h age. payment-worker's **13** is
 the same 3 hours seen in only 13 cycles, not 14× less traffic.
 
-Read it as **confidence**: how many independent times the system confirmed the
-edge is real. That is why the diagram uses three *absolute* bands (1–2 / 3–19 /
-20+) rather than a width ramp relative to the graph's maximum — 40 sightings
-means the same thing whether or not some other edge has 4000 — and why the table
-column is named "Cycles seen".
+### Confidence is coverage, not the count
 
-The earlier design ramped line width continuously across `evidence_count`, which
+The count alone is still ambiguous, which took two attempts to get right.
+
+Absolute bands on the raw count (1–2 / 3–19 / 20+) were the second attempt, and
+real data broke them: payment-batch's edges read **318** over a 5.0h lifetime —
+299 scans, so confirmed in essentially every one — while payment-worker's read
+**17** over 5.8h, or 350 scans, confirmed in **1 scan in 20**. Both fell in the
+same "20+, consistently observed" band. A count with no duration cannot
+distinguish "always seen" from "seen a lot, over a very long time".
+
+So the band is **coverage**: observed sightings over the edge's own lifetime in
+scans. Scale-free, and it answers the useful question — is this dependency
+continuously re-confirmed, or does the miner mostly miss it?
+
+| Coverage | Band | Line |
+|---|---|---|
+| ≥ 75% | confirmed in nearly every scan | thickest |
+| 25–75% | confirmed intermittently | medium |
+| < 25% | rarely caught — the miner mostly misses this call | thinnest |
+| lifetime < 3 scans | too new to judge | medium |
+
+Coverage is **approximate on purpose** and clamped to 100%: three producers push
+at different cadences (60s live, hourly Glue, plus each diagnose), so sightings
+can exceed elapsed scans. It is shown as a band and a ratio, never as a precise
+figure.
+
+**A low-coverage edge is a finding, not a styling detail.** If the miner catches
+a call it *knows about* in 5% of scans, it is very likely missing calls it never
+catches at all — so the panel says so above the diagram rather than leaving it in
+a tooltip. In the payments namespace, `payment-worker`'s two edges are exactly
+this case, while the panel's "Stale edges: 0 · all fresh" reads reassuringly:
+freshness and coverage are different questions, and both matter.
+
+Freshness is now visible in the diagram too — a stale edge is dashed. Previously
+it showed only in the table, so a dependency going cold looked identical to one
+confirmed a minute ago.
+
+The first attempt ramped line width continuously across `evidence_count`, which
 turned "payment-batch logs more" into a visual claim that its dependencies were
-far more important. Do not reintroduce that.
+far more important. Do not reintroduce either that or the raw-count bands.
 
 ### The matching rule
 

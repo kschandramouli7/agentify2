@@ -53,17 +53,68 @@ const PAD = 18;
 const MAX_NODES = 24;
 const MAX_EDGES = 60;
 
-// Absolute confidence bands. Thresholds are in scan-cycle observations, so
-// they carry a fixed meaning: a couple of sightings could be sampling noise,
-// tens of sightings is a standing fact about the system.
-export const BANDS = [
-  { min: 20, width: 3.0, label: "consistently observed" },
-  { min: 3,  width: 2.0, label: "seen repeatedly" },
-  { min: 0,  width: 1.25, label: "seen once or twice — could be sampling" },
-] as const;
+// How consistently an edge is observed, which is what "confidence" should have
+// meant all along.
+//
+// v3 banded the RAW COUNT on absolute thresholds. That is ambiguous, and the
+// payments data proves it: payment-batch's edges read 318 over a 5.0h lifetime
+// (299 scans → confirmed in ~every one) while payment-worker's read 17 over
+// 5.8h (350 scans → confirmed in 1 of 20). Both landed in the same "20+,
+// consistently observed" band. A count with no duration cannot distinguish
+// "always seen" from "seen a lot, over a very long time".
+//
+// So the band is now COVERAGE — observed scans over the edge's own lifetime.
+// That is scale-free and says the useful thing: is this dependency continuously
+// re-confirmed, or does the miner mostly miss it?
+//
+// Approximate on purpose: three producers push at different cadences (60s live,
+// hourly Glue, plus each diagnose), so coverage can exceed 1 and is clamped.
+// It is presented as a band and a ratio, never as a precise percentage.
+const SCAN_INTERVAL_MS = 60_000; // SCAN_INTERVAL_SECONDS in discovery.yaml
 
-export function band(count: number) {
-  return BANDS.find(b => count >= b.min) ?? BANDS[BANDS.length - 1];
+// Below this many scans of lifetime, coverage is noise — a brand-new edge seen
+// once is 100% covered and means nothing.
+const MIN_SCANS_FOR_COVERAGE = 3;
+
+export type Confidence = {
+  key: "continuous" | "intermittent" | "rare" | "new";
+  width: number;
+  label: string;
+  scans: number | null;      // null when the lifetime is too short to judge
+  coverage: number | null;
+};
+
+export function confidence(e: ServiceDependency): Confidence {
+  const first = new Date(e.first_seen).getTime();
+  const last = new Date(e.last_seen).getTime();
+  const spanScans = Number.isFinite(first) && Number.isFinite(last) && last > first
+    ? Math.round((last - first) / SCAN_INTERVAL_MS)
+    : 0;
+
+  if (spanScans < MIN_SCANS_FOR_COVERAGE) {
+    return { key: "new", width: 1.75, label: "too new to judge", scans: null, coverage: null };
+  }
+  const coverage = Math.min(1, e.evidence_count / spanScans);
+  if (coverage >= 0.75) {
+    return { key: "continuous", width: 3.0, label: "confirmed in nearly every scan", scans: spanScans, coverage };
+  }
+  if (coverage >= 0.25) {
+    return { key: "intermittent", width: 2.0, label: "confirmed intermittently", scans: spanScans, coverage };
+  }
+  return { key: "rare", width: 1.25, label: "rarely caught — the miner mostly misses this call", scans: spanScans, coverage };
+}
+
+/** Edges the miner catches in under a quarter of scans. Their existence means
+ *  the graph is probably missing OTHER edges entirely, which is the actionable
+ *  reading — so callers surface this rather than only styling the line. */
+export function rarelyObserved(edges: ServiceDependency[]): ServiceDependency[] {
+  return edges.filter(e => confidence(e).key === "rare");
+}
+
+const STALE_AFTER_MS = 15 * 60 * 1000; // matches TopologyPanel's threshold
+
+function isStale(e: ServiceDependency): boolean {
+  return Date.now() - new Date(e.last_seen).getTime() > STALE_AFTER_MS;
 }
 
 type Node = {
@@ -415,17 +466,24 @@ export function DependencyFlow({
             // Emphasise the edges that actually touch the focused service; the
             // rest are the paths carrying impact onward and stay recessive.
             const on = !focus || e.from_service === focus || e.to_service === focus;
-            const bd = band(e.evidence_count);
+            const c = confidence(e);
+            const stale = isStale(e);
             const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? []);
             return (
               <g key={e.id} className={`flow__edge${on ? " flow__edge--on" : ""}`}>
                 <title>
                   {`${e.from_service} → ${e.to_service}\n` +
-                   `${e.evidence_count} scan cycles observed this call (${bd.label}).\n` +
-                   `This counts sightings in logs, not requests — it is confidence, not volume.\n` +
+                   (c.scans === null
+                     ? `Seen ${e.evidence_count}x; too new to judge how consistently.\n`
+                     : `Seen in ${e.evidence_count} of ~${c.scans} scans since it was first ` +
+                       `observed (${Math.round((c.coverage ?? 0) * 100)}%) — ${c.label}.\n`) +
+                   `This counts sightings in logs, not requests: confidence, not traffic volume.\n` +
+                   (stale ? "STALE: no new evidence in over 15 minutes.\n" : "") +
                    `Last seen ${new Date(e.last_seen).toLocaleString()}`}
                 </title>
-                <path d={d} className="flow__line" strokeWidth={bd.width}
+                <path d={d}
+                      className={`flow__line${stale ? " flow__line--stale" : ""}`}
+                      strokeWidth={c.width}
                       markerEnd={`url(#${on ? "flow-arrow-on" : "flow-arrow"})`} />
                 {/* Printed, never implied by thickness alone — and set
                     horizontally rather than on a textPath, which rotated the
@@ -480,19 +538,29 @@ export function DependencyFlow({
       <div className="flow__legend adm-muted">
         <span><span className="flow__key flow__key--dir" aria-hidden="true" /> left to right = call direction</span>
         <span className="flow__legend-group" aria-hidden="true">
-          {BANDS.slice().reverse().map(b => (
-            <span key={b.min} className="flow__key-band">
+          {[
+            { w: 3.0, t: "every scan" },
+            { w: 2.0, t: "intermittent" },
+            { w: 1.25, t: "rarely caught" },
+          ].map(b => (
+            <span key={b.t} className="flow__key-band">
               <svg width="26" height="8" aria-hidden="true">
-                <line x1="0" y1="4" x2="26" y2="4" className="flow__line" strokeWidth={b.width} />
+                <line x1="0" y1="4" x2="26" y2="4" className="flow__line" strokeWidth={b.w} />
               </svg>
-              {b.min === 0 ? "1–2" : b.min === 3 ? "3–19" : "20+"}
+              {b.t}
             </span>
           ))}
+          <span className="flow__key-band">
+            <svg width="26" height="8" aria-hidden="true">
+              <line x1="0" y1="4" x2="26" y2="4" className="flow__line flow__line--stale" strokeWidth={2} />
+            </svg>
+            going stale
+          </span>
         </span>
         <span>
-          the number on each arrow is how many scan cycles saw the call —{" "}
-          <strong>confidence, not traffic volume</strong>. Click a service to trace what it
-          reaches and what breaks with it.
+          Line weight is how <strong>consistently</strong> the call is observed across the
+          edge's own lifetime — not how much traffic it carries. The number is the raw
+          sighting count. Click a service to trace what it reaches and what breaks with it.
           {focus && <> · <button type="button" className="topo-link" onClick={() => onFocus(null)}>show everything</button></>}
         </span>
       </div>
