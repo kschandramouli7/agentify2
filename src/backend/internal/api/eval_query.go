@@ -41,12 +41,27 @@ func isEvalRequest(r *http.Request) bool {
 	return v
 }
 
-// SetEvalAuthToken configures the bearer token for POST /admin/eval/query.
+// SetEvalAuthToken configures the bearer token for POST /admin/eval/query and
+// the environment that decides what an EMPTY token means.
 //
 // Set after construction rather than as another NewHandler parameter, which
 // already takes sixteen.
-func (h *Handler) SetEvalAuthToken(token string) {
+func (h *Handler) SetEvalAuthToken(token, env string) {
 	h.evalAuthToken = token
+	h.evalEnv = strings.ToLower(strings.TrimSpace(env))
+
+	switch {
+	case token != "":
+		// configured; nothing to say
+	case h.evalEnv == "dev" || h.evalEnv == "":
+		h.logger.Warn("EVAL_AUTH_TOKEN not set — POST /admin/eval/query is OPEN. " +
+			"Allowed because ENV is dev; anyone who can reach the backend can make " +
+			"the agent answer using an arbitrary prompt version")
+	default:
+		h.logger.Error("EVAL_AUTH_TOKEN not set — POST /admin/eval/query is DISABLED "+
+			"because ENV is not dev. Set EVAL_AUTH_TOKEN to enable version-pinned "+
+			"evaluation (the prompt promotion gate needs it)", "env", h.evalEnv)
+	}
 }
 
 // checkEvalAuth authorises POST /admin/eval/query.
@@ -58,13 +73,19 @@ func (h *Handler) SetEvalAuthToken(token string) {
 // Adding it there instead would cover /api/query and the ingest path too, which
 // is a larger decision than this endpoint should make.
 //
-// An unset token means open, matching the posture already used for
-// REMEDIATION_AUTH_TOKEN and COLLECTOR_TOKEN. That is a deliberate consistency
-// choice and it does mean a deployment that forgets EVAL_AUTH_TOKEN exposes the
-// pin.
+// An unset token FAILS CLOSED outside dev (revised 2026-09-01).
+//
+// ADR 0030 originally made an empty token mean "open", for consistency with
+// REMEDIATION_AUTH_TOKEN and COLLECTOR_TOKEN. Consistency with an insecure
+// default is still an insecure default: the deployed cluster ran with the token
+// unset, so anyone who could reach the backend could make the agent answer using
+// an arbitrary prompt version. Since the deployment already sets ENV=prod, the
+// safe posture costs nothing — an empty token now permits the endpoint only when
+// ENV is dev (or unset, i.e. a local run), and disables it otherwise.
 func (h *Handler) checkEvalAuth(r *http.Request) bool {
 	if h.evalAuthToken == "" {
-		return true // unauthenticated (dev only)
+		// Open for local development only; disabled anywhere else.
+		return h.evalEnv == "dev" || h.evalEnv == ""
 	}
 	const prefix = "Bearer "
 	auth := r.Header.Get("Authorization")
@@ -86,6 +107,13 @@ func (h *Handler) HandleEvalQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.checkEvalAuth(r) {
+		if h.evalAuthToken == "" {
+			// Distinguish "misconfigured" from "wrong credential" — otherwise an
+			// operator chases a token problem that does not exist.
+			h.logger.Warn("eval query rejected: endpoint disabled (EVAL_AUTH_TOKEN unset, ENV is not dev)")
+			http.Error(w, "eval endpoint disabled: EVAL_AUTH_TOKEN is not configured", http.StatusServiceUnavailable)
+			return
+		}
 		h.logger.Warn("eval query rejected: bad or missing bearer token")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

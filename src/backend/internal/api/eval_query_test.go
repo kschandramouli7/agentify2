@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -14,10 +15,33 @@ import (
 // route.
 
 func TestCheckEvalAuth(t *testing.T) {
-	t.Run("unset token means open, matching the collector/remediation posture", func(t *testing.T) {
-		h := &Handler{evalAuthToken: ""}
-		if !h.checkEvalAuth(httptest.NewRequest("POST", "/admin/eval/query", nil)) {
-			t.Error("expected open when no token is configured")
+	// An empty token FAILS CLOSED outside dev. The deployed cluster ran with the
+	// token unset and ENV=prod, so "empty means open" left the prompt-pin lever
+	// reachable by anyone who could reach the backend.
+	t.Run("unset token is open in dev only", func(t *testing.T) {
+		for _, env := range []string{"dev", ""} {
+			h := &Handler{evalAuthToken: "", evalEnv: env}
+			if !h.checkEvalAuth(httptest.NewRequest("POST", "/admin/eval/query", nil)) {
+				t.Errorf("env=%q: expected open for local development", env)
+			}
+		}
+	})
+
+	t.Run("unset token is DISABLED outside dev", func(t *testing.T) {
+		for _, env := range []string{"prod", "staging", "production", "PROD"} {
+			h := &Handler{evalAuthToken: "", evalEnv: strings.ToLower(env)}
+			if h.checkEvalAuth(httptest.NewRequest("POST", "/admin/eval/query", nil)) {
+				t.Errorf("env=%q: an unset token must not open the endpoint", env)
+			}
+		}
+	})
+
+	t.Run("a configured token works regardless of env", func(t *testing.T) {
+		h := &Handler{evalAuthToken: "s3cret", evalEnv: "prod"}
+		r := httptest.NewRequest("POST", "/admin/eval/query", nil)
+		r.Header.Set("Authorization", "Bearer s3cret")
+		if !h.checkEvalAuth(r) {
+			t.Error("a correct token must be accepted in prod")
 		}
 	})
 
@@ -39,7 +63,7 @@ func TestCheckEvalAuth(t *testing.T) {
 		"token as substring": "Bearer s3cretX",
 	} {
 		t.Run("rejected: "+name, func(t *testing.T) {
-			h := &Handler{evalAuthToken: "s3cret"}
+			h := &Handler{evalAuthToken: "s3cret", evalEnv: "prod"}
 			r := httptest.NewRequest("POST", "/admin/eval/query", nil)
 			if header != "" {
 				r.Header.Set("Authorization", header)
@@ -51,8 +75,21 @@ func TestCheckEvalAuth(t *testing.T) {
 	}
 }
 
+func TestHandleEvalQueryDisabledWhenTokenUnsetOutsideDev(t *testing.T) {
+	// 503 rather than 401: the caller's credential is not the problem, the
+	// deployment's configuration is. Conflating them sends an operator chasing a
+	// token issue that does not exist.
+	h := &Handler{evalAuthToken: "", evalEnv: "prod", logger: slog.Default()}
+	w := httptest.NewRecorder()
+	h.HandleEvalQuery(w, httptest.NewRequest("POST", "/admin/eval/query",
+		bytes.NewReader([]byte(`{"question":"q"}`))))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
 func TestHandleEvalQueryRejectsUnauthorized(t *testing.T) {
-	h := &Handler{evalAuthToken: "s3cret", logger: slog.Default()}
+	h := &Handler{evalAuthToken: "s3cret", evalEnv: "prod", logger: slog.Default()}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/admin/eval/query",
 		bytes.NewReader([]byte(`{"question":"why is it crashing"}`)))

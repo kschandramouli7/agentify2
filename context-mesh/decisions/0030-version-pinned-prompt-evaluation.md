@@ -144,3 +144,40 @@ endpoint that reuses the real deployed code path**. Do not add the override to
   capability lands ([ADR 0008](0008-multi-provider-model-routing.md) territory).
   At that point the pin stops being an eval-only concern and should be folded
   into that mechanism rather than kept as a parallel path.
+
+## Amendment (2026-09-01) — an unset token now fails closed outside dev
+
+Appended per this directory's append-only rule. Decision point 2 above said:
+
+> An unset token means open, matching the posture already used for
+> `REMEDIATION_AUTH_TOKEN` and `COLLECTOR_TOKEN`. That is a deliberate
+> consistency choice and it does mean a deployment that forgets
+> `EVAL_AUTH_TOKEN` exposes the pin.
+
+That is exactly what happened. The endpoint shipped, `EVAL_AUTH_TOKEN` was never
+set, and the deployed cluster ran with `POST /admin/eval/query` open — so anyone
+who could reach the backend could make the agent answer using an arbitrary prompt
+version. **Consistency with an insecure default is still an insecure default**,
+and the original wording treated the exposure as a documented consequence rather
+than a problem to solve.
+
+**Revised:** an empty `EVAL_AUTH_TOKEN` permits the endpoint only when `ENV` is
+`dev` (or unset, i.e. a local run). Anywhere else the endpoint is **disabled** and
+returns `503` with `eval endpoint disabled: EVAL_AUTH_TOKEN is not configured`.
+
+- `503`, not `401`, on purpose: the caller's credential is not the problem, the
+  deployment's configuration is. Returning `401` sends an operator chasing a
+  token issue that does not exist.
+- The safe posture costs nothing here, because `infra/kubernetes/backend.yaml`
+  already sets `ENV=prod`. Local development keeps working with no token.
+- Startup logs the state either way: a `Warn` when the endpoint is open in dev, an
+  `Error` when it is disabled outside dev — so "the gate returns 503" is
+  self-explanatory rather than a mystery.
+
+**Not changed, and worth stating plainly:** `REMEDIATION_AUTH_TOKEN` and
+`COLLECTOR_TOKEN` still treat empty as open, and the remediation surface is
+**write-capable** — restart, scale, rollback ([ADR
+0020](0020-phase-3-remediation-with-approval-gate.md) Phase 3). An unset token
+there is a materially larger exposure than the one this amendment closes.
+Changing it would revise ADR 0020's decision rather than this one, so it is
+raised here rather than done silently.

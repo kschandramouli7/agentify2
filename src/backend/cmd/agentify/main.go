@@ -142,7 +142,7 @@ func main() {
 	handler := api.NewHandler(orch, cfg.AgentServiceURL, redactor, integrationStore, traceStore, pricingStore, chatStore, remediationStore, remediationCfg, serviceDepsStore, clusterServiceStore, clusterIngressStore, clusterHealthStore, secretsMgr, cfg.IntegrationSecretsPrefix, logger)
 	// Version-pinned evaluation endpoint (ADR 0030). Set after construction
 	// because NewHandler already takes sixteen parameters.
-	handler.SetEvalAuthToken(cfg.EvalAuthToken)
+	handler.SetEvalAuthToken(cfg.EvalAuthToken, cfg.Env)
 
 	// Proactive investigation loop (spec 009). Opt-in: requires INVESTIGATION_ENABLED
 	// and a webhook URL; otherwise the loop never starts.

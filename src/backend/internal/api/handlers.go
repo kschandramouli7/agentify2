@@ -36,7 +36,8 @@ type Handler struct {
 	chatStore                ChatStore        // nil when postgres is not provisioned
 	remediationStore         RemediationStore // nil when postgres is not provisioned
 	remediationConfig        RemediationConfig
-	evalAuthToken            string                 // POST /admin/eval/query bearer token (ADR 0030); "" = open, dev only
+	evalAuthToken            string                 // POST /admin/eval/query bearer token (ADR 0030)
+	evalEnv                  string                 // ENV; an empty token is honoured only when this is "dev"
 	serviceDepsStore         ServiceDependencyStore // nil when postgres is not provisioned
 	collectorHub             *CollectorHub          // fleet collectors' persistent connections (ADR 0022 Decision #7 / ROADMAP P18 use case #9)
 	clusterServiceStore      ClusterServiceStore    // service->cluster registry (ROADMAP P16 / ADR 0023); nil when postgres is not provisioned

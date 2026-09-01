@@ -385,7 +385,7 @@ traffic.
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | AWS Secrets Manager `agentify/dev/langfuse`, bootstrapped by `04-bootstrap-langfuse-secret.yml` | Absent → all prompts use fallbacks, cleanly |
 | `LANGFUSE_BASE_URL` | same | Defaults to `https://us.cloud.langfuse.com` |
 | `LANGFUSE_TRACING_ENABLED` | `infra/kubernetes/agent.yaml` | Emits observations for reasoning calls (P19 gap E). Code default is off |
-| `EVAL_AUTH_TOKEN` | `infra/kubernetes/backend.yaml` + Actions secret | Guards `/admin/eval/query`. Empty = open |
+| `EVAL_AUTH_TOKEN` | `infra/kubernetes/backend.yaml` + Actions secret | Guards `/admin/eval/query`. Empty **disables** the endpoint (503) unless `ENV=dev` — revised 2026-09-01, see ADR 0030's amendment. The promotion gate needs it set. |
 | `langfuse` SDK | `src/agent/requirements.txt` | Pinned `>=4.14.0,<5.0.0`. CI's eval scripts install `<3.0.0` separately — they use the v2 dataset API |
 
 ## References
