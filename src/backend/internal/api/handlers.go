@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -198,6 +199,19 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	// For MVP: use simple heuristics to determine intent
 	intent := inferIntent(req.Question)
 
+	// The dependency graph is answered BEFORE the pod lookup, on purpose.
+	//
+	// It lives in service_dependencies, not in any storage pod, so routing it
+	// through the normal path meant a namespace with a perfectly good mined
+	// graph but no registered pods hit the `len(pods) == 0` bail below and got
+	// "No data available for this query" — never reaching the skill that could
+	// answer it. Everything after this point exists to assemble pod data the
+	// dependency answer does not use.
+	if intent == "dependencies" {
+		h.answerDependencies(w, r, req, intent, namespace, service, traceID, isEval, start)
+		return
+	}
+
 	// Route to pods and fetch data. Not cluster-scoped: this is the initial
 	// /api/query routing (ADR 0024 scopes the agent's per-tool
 	// /api/agent/fetch path, not this one — see HandleAgentFetch).
@@ -291,8 +305,17 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	telemetry.AgentCallsTotal.WithLabelValues("ok").Inc()
-	telemetry.QueriesTotal.WithLabelValues(intent, "tier2", "ok").Inc()
-	telemetry.QueryDuration.WithLabelValues("tier2").Observe(time.Since(start).Seconds())
+	// The agent reports its own tier: some intents (dependencies) it answers
+	// deterministically with no model call, and recording that as tier2 would
+	// inflate the cost rollups and mislead any eval that scores routing. Default
+	// to tier2 — an older agent image sends no tier, and this path was tier2-only
+	// before the field existed.
+	agentTier := agentResp.Tier
+	if agentTier == "" {
+		agentTier = "tier2"
+	}
+	telemetry.QueriesTotal.WithLabelValues(intent, agentTier, "ok").Inc()
+	telemetry.QueryDuration.WithLabelValues(agentTier).Observe(time.Since(start).Seconds())
 
 	// Return agent response. Pass the agent's status through so the frontend
 	// can render error/degraded cards correctly. Fall back to "ok" only when
@@ -316,9 +339,9 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		ToolCalls:  toolCalls,
 		Details:    agentResp.Details,
 		Intent:     intent,
-		Tier:       "tier2",
+		Tier:       agentTier,
 	}
-	h.logTrace(traceID, req.Question, intent, namespace, "tier2", agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, traceMeta{IsEval: isEval, Service: service})
+	h.logTrace(traceID, req.Question, intent, namespace, agentTier, agentStatus, agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls), start, agentResp, traceMeta{IsEval: isEval, Service: service})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -709,7 +732,134 @@ func inferIntent(question string) string {
 			return "metrics_history"
 		}
 	}
+	// Service dependencies (ROADMAP P18 use case #2). LAST on purpose: the
+	// deterministic answer can only talk about the mined call graph, so any
+	// question that also touches another domain must go to the branch that owns
+	// that domain — and reaching here already means none of them matched.
+	//
+	// Diagnostic phrasing is handled by the first block above, so "why is
+	// payment-api slow, does it depend on vault?" is a diagnosis with the graph
+	// as context, never a topology report. That precedence is deliberate and
+	// mirrors the chat router's (_chat_route in src/agent/k8fy/agent.py).
+	if isDependencyQuestion(lower) {
+		return "dependencies"
+	}
 	return "general_query"
+}
+
+// Keyword sets for isDependencyQuestion, as word-PREFIX matches (`\b` + stem),
+// not bare substring matches.
+//
+// The distinction is not cosmetic: with plain strings.Contains, "log" matched
+// "topo(log)y", so "service topology for payments" was excluded from the
+// deterministic route as if it had asked about logs. "technology", "logical" and
+// "catalog" fail the same way. Anchoring at a word boundary while still matching
+// forward means "log" catches "logs" and "expir" catches "expiring", without
+// catching a stem buried mid-word.
+var (
+	dependencyKeywordRE = regexp.MustCompile(`\b(dependenc|depends on|depend on|upstream|downstream|who calls|what calls|calls what|call graph|caller|callee|blast radius|service graph|service topology|impacted if|affected if)`)
+
+	// Concerns the deterministic answer holds no data for. A question mixing any
+	// of these with a graph keyword needs synthesis, so it must fall through to
+	// the branch that owns that domain (or to general_query) rather than be
+	// answered from the call graph alone.
+	needsSynthesisRE = regexp.MustCompile(`\b(health|unhealthy|degraded|crash|oom|restart|log|error|cert|expir|vault|pki|metric|cpu|memory|latency|slow|timeout|deploy|rollout|changed|scale|rollback|fix|remediat)`)
+)
+
+// isDependencyQuestion reports whether the question is asking about the service
+// call graph and nothing else.
+//
+// The exclusion set is NOT redundant with inferIntent's earlier branches: those
+// cover health, certs, metrics and change history, but not logs, remediation
+// verbs, or symptom words like "slow" / "timeout" / "error".
+//
+// Kept in sync with _DEPENDENCY_QUESTION_KEYWORDS / _NEEDS_SYNTHESIS_KEYWORDS in
+// src/agent/k8fy/agent.py — the chat path applies the same rule, and one
+// documented rule that behaves differently per entry point would be worse than
+// no rule at all.
+func isDependencyQuestion(lower string) bool {
+	if !dependencyKeywordRE.MatchString(lower) {
+		return false
+	}
+	return !needsSynthesisRE.MatchString(lower)
+}
+
+// answerDependencies serves the `dependencies` intent (ROADMAP P18 use case #2).
+//
+// It fetches no pod data — the answer comes entirely from the mined graph, which
+// the agent's DependencyGraphSkill reads and formats deterministically (no model
+// call, so it reports tier1). This handler exists mainly to bypass the pod
+// lookup, whose "no data" bail would otherwise swallow the question.
+//
+// The question text is forwarded in the agent context because the skill resolves
+// WHICH service to report on from it. AgentClient.Reason takes a `question`
+// parameter it has never forwarded — a gap that is wider than this intent: every
+// skill's prompt is told to "answer the operator's question" while
+// _build_user_message sends only intent + context + data, so no skill has ever
+// seen it. Fixing that generally changes Tier-2 model input for every intent and
+// would move the eval baselines the promotion gate compares against
+// (docs/PROMPT_LIFECYCLE.md), so it deserves its own gated run rather than
+// riding along here.
+func (h *Handler) answerDependencies(
+	w http.ResponseWriter, r *http.Request, req QueryRequest,
+	intent, namespace, service, traceID string, isEval bool, start time.Time,
+) {
+	agentContext := make(map[string]interface{}, len(req.Context)+1)
+	for k, v := range req.Context {
+		agentContext[k] = v
+	}
+	if _, present := agentContext["question"]; !present {
+		agentContext["question"] = req.Question
+	}
+
+	agentStart := time.Now()
+	agentResp, err := h.agentClient.Reason(req.Question, intent, map[string]interface{}{}, agentContext, traceID)
+	telemetry.AgentCallDuration.Observe(time.Since(agentStart).Seconds())
+	if err != nil {
+		h.logger.Warn("dependency intent: agent call failed", "error", err)
+		telemetry.AgentCallsTotal.WithLabelValues("error").Inc()
+		telemetry.QueriesTotal.WithLabelValues(intent, "tier1", "error").Inc()
+		h.logTrace(traceID, req.Question, intent, namespace, "tier1", "error", nil, 0, nil, start, nil, traceMeta{IsEval: isEval, Service: service})
+		writeJSON(w, http.StatusOK, QueryResponse{
+			Answer:     "The dependency graph is temporarily unavailable.",
+			Status:     "error",
+			Confidence: 0,
+			Sources:    []string{},
+			TraceID:    traceID,
+			Intent:     intent,
+		})
+		return
+	}
+
+	telemetry.AgentCallsTotal.WithLabelValues("ok").Inc()
+	// Default to tier1 rather than tier2 here: this route only ever reaches a
+	// skill that makes no model call, so an older agent image that omits the
+	// field is still tier1.
+	tier := agentResp.Tier
+	if tier == "" {
+		tier = "tier1"
+	}
+	telemetry.QueriesTotal.WithLabelValues(intent, tier, "ok").Inc()
+	telemetry.QueryDuration.WithLabelValues(tier).Observe(time.Since(start).Seconds())
+
+	status := agentResp.Status
+	if status == "" {
+		status = "ok"
+	}
+	h.logTrace(traceID, req.Question, intent, namespace, tier, status,
+		agentResp.Sources, agentResp.Confidence, toolCallNames(agentResp.ToolCalls),
+		start, agentResp, traceMeta{IsEval: isEval, Service: service})
+
+	writeJSON(w, http.StatusOK, QueryResponse{
+		Answer:     agentResp.Answer,
+		Status:     status,
+		Confidence: agentResp.Confidence,
+		Sources:    agentResp.Sources,
+		TraceID:    traceID,
+		Details:    agentResp.Details,
+		Intent:     intent,
+		Tier:       tier,
+	})
 }
 
 // buildPodQuery derives the backend query map from the request context.

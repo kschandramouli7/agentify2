@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from k8fy.agent import (  # noqa: E402
     _build_service_graph,
     _chat_route,
+    _latest_user_text,
     _dependency_answer,
     _focus_service,
     _looks_like_dependency_question,
@@ -381,3 +382,159 @@ async def test_deterministic_answer_is_not_stamped_with_a_prompt_version(monkeyp
     assert resp.tier == "tier1"
     assert resp.prompt_name is None
     assert resp.prompt_version is None
+
+
+# ── Word-boundary matching ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("question", [
+    "service topology for payments",
+    "what is the call graph topology of payments",
+])
+def test_a_stem_inside_a_word_does_not_exclude(question):
+    """Regression: plain substring matching meant "log" matched "topo(log)y", so
+    a topology question was treated as a question about logs and never routed.
+    "technology", "logical" and "catalog" fail the same way."""
+    assert _chat_route(_user(question)) == "dependencies"
+
+
+@pytest.mark.parametrize("question", [
+    "dependencies of payment-api, show its logs",
+    "dependencies of payment-api and the error rate",
+    "what depends on payment-api - scale it up",
+])
+def test_the_same_stem_as_its_own_word_still_excludes(question):
+    assert _chat_route(_user(question)) is None
+
+
+def test_latest_user_text_handles_every_shape():
+    assert _latest_user_text([{"role": "user", "content": "hi"}]) == "hi"
+    assert _latest_user_text([]) == ""
+    assert _latest_user_text([{"role": "assistant", "content": "x"}]) == ""
+    # Tool-result turns carry a list; it must be stringified, not crash.
+    assert "tool_result" in _latest_user_text(
+        [{"role": "user", "content": [{"type": "tool_result", "content": "x"}]}]
+    )
+
+
+def test_go_and_python_agree_on_the_routing_rule():
+    """The rule is documented once (docs/SERVICE_DEPENDENCIES.md §1b) and
+    implemented twice — inferIntent/isDependencyQuestion in Go for /api/query,
+    _chat_route here for chat. These cases are the ones asserted verbatim in
+    src/backend/internal/api/intent_test.go; if the two drift, the docs are
+    wrong for one of the entry points."""
+    routes = [
+        ("what are the upstream and downstream dependencies for payment-api?", "dependencies"),
+        ("who calls payment-api?", "dependencies"),
+        ("what calls into payment?", "dependencies"),
+        ("show me the call graph for payments", "dependencies"),
+        ("which services depend on payment?", "dependencies"),
+        ("list the callers and callees of payment", "dependencies"),
+        ("what's the blast radius of payment-api going down", "dependencies"),
+        ("what is impacted if payment-api stops", "dependencies"),
+        ("service topology for payments", "dependencies"),
+        ("why is payment-api slow, does it depend on vault?", None),
+        ("what's wrong with payment-api's dependencies?", None),
+        ("investigate what payment-api depends on", None),
+        ("what are payment-api's dependencies and is it healthy?", None),
+        ("do payment-api's dependencies have expiring certs?", None),
+        ("what changed in payment-api's dependencies recently?", None),
+        ("dependencies of payment-api - also show me its logs", None),
+        ("what depends on payment-api and should I restart it?", None),
+        ("is payment-api's dependency on payment causing the timeout?", None),
+        ("show cpu for payment-api's upstream services", None),
+        ("is payment healthy?", None),
+        ("list the pods", None),
+    ]
+    mismatches = [
+        (q, want, _chat_route(_user(q))) for q, want in routes if _chat_route(_user(q)) != want
+    ]
+    assert not mismatches, f"chat router disagrees with Go on: {mismatches}"
+
+
+# ── The skill (the /api/query entry point) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dependency_skill_answers_without_a_model_call(monkeypatch):
+    from k8fy.skills.dependency_graph import DependencyGraphSkill
+
+    async def fake_fetch(namespace, backend_url):
+        return EDGES
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+
+    skill = DependencyGraphSkill.__new__(DependencyGraphSkill)
+    skill.backend_url = "http://backend"
+
+    resp = await DependencyGraphSkill.reason(
+        skill, "dependencies", {},
+        {"namespace": "payments", "question": "dependencies of payment-api"},
+    )
+    assert resp.tier == "tier1"
+    assert resp.estimated_cost_usd == 0.0
+    assert resp.details["service_graph"]["focus"] == "payment-api"
+    assert "payment-batch, payment-worker" in resp.answer
+    # A deterministic answer must claim no prompt — the promotion gate scores
+    # candidates by prompt_version.
+    assert resp.prompt_version is None
+
+
+@pytest.mark.asyncio
+async def test_dependency_skill_explains_an_empty_namespace(monkeypatch):
+    """The reasons a namespace legitimately has no edges are known and finite,
+    so listing the likely ones beats a model guess — and beats a bare "no data",
+    which reads as a broken feature."""
+    from k8fy.skills.dependency_graph import DependencyGraphSkill
+
+    async def empty(namespace, backend_url):
+        return []
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", empty)
+
+    skill = DependencyGraphSkill.__new__(DependencyGraphSkill)
+    skill.backend_url = "http://backend"
+    resp = await DependencyGraphSkill.reason(
+        skill, "dependencies", {}, {"namespace": "payments", "question": "who calls payment?"},
+    )
+    assert resp.tier == "tier1"
+    assert "No service-dependency evidence" in resp.answer
+    assert "no Kubernetes Service" in resp.answer      # the second-likeliest cause
+    assert "multi-container" in resp.answer            # OPS-9, the one that bites next
+    assert resp.details == {}                          # nothing to draw
+
+
+@pytest.mark.asyncio
+async def test_dependency_skill_reads_the_question_from_data_too(monkeypatch):
+    """Go forwards the question in context; a caller that puts it in data must
+    still resolve focus rather than silently answering namespace-wide."""
+    from k8fy.skills.dependency_graph import DependencyGraphSkill
+
+    async def fake_fetch(namespace, backend_url):
+        return EDGES
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+    skill = DependencyGraphSkill.__new__(DependencyGraphSkill)
+    skill.backend_url = "http://backend"
+    resp = await DependencyGraphSkill.reason(
+        skill, "dependencies", {"question": "upstream of payment-worker"}, {"namespace": "payments"},
+    )
+    assert resp.details["service_graph"]["focus"] == "payment-worker"
+
+
+def test_the_router_registers_the_dependencies_intent():
+    """Read as text rather than imported: constructing SkillRouter instantiates
+    every skill (needing a Claude client), and importing it pulls in modules that
+    use 3.10+ union syntax. The registration line is the whole assertion."""
+    router_src = (Path(__file__).resolve().parents[1] / "k8fy" / "skills" / "router.py").read_text()
+    assert '"dependencies": DependencyGraphSkill()' in router_src
+    assert "from k8fy.skills.dependency_graph import DependencyGraphSkill" in router_src
+
+
+def test_the_skill_avoids_310_only_syntax():
+    """The agent image runs 3.11, but the repo's own test env is 3.9 and several
+    modules are already unimportable there. A new module should not add to that
+    pile — it is the difference between this file running locally and not."""
+    src = (Path(__file__).resolve().parents[1] / "k8fy" / "skills" / "dependency_graph.py").read_text()
+    assert "Dict[str, Any] | None" not in src
+    assert "Optional[Dict[str, Any]]" in src

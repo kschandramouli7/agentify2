@@ -73,7 +73,18 @@ export interface QueryResponse {
     // Diagnosis (Tier-2) — new k8fy/diagnose format
     incident_summary?: string;
     timeline?: string[];
+    // Service dependencies (intent "dependencies", answered deterministically —
+    // tier1, no model call). Same shape the chat path attaches, so the same
+    // component draws it.
+    service_graph?: {
+      namespace: string;
+      focus?: string | null;
+      dependencies: ServiceDependency[];
+    };
   };
+  // Which tier answered: "tier1" means deterministic, no model call.
+  tier?: string;
+  intent?: string;
 }
 
 export interface Pod {

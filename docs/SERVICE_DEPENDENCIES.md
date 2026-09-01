@@ -108,6 +108,50 @@ explain why the namespace is empty (§4).
 - **Only the latest user turn is inspected**, so a conversation that discussed
   dependencies five turns ago does not attach a graph to every later answer.
 
+## 1c. Asking via the API
+
+`inferIntent()` now classifies a pure graph question as the **`dependencies`**
+intent, so `POST /api/query` answers it the same way chat does — the same
+`DependencyGraphSkill`, the same prose, the same `details.service_graph`, and
+`tier1`.
+
+```bash
+curl -sS -X POST localhost:18080/api/query -H 'Content-Type: application/json' \
+  -d '{"question":"what are the upstream and downstream dependencies for payment-api?",
+       "context":{"namespace":"payments"}}' | python3 -m json.tool
+```
+
+The response carries `"tier": "tier1"` and `"intent": "dependencies"` — proof it
+cost nothing and involved no model.
+
+**This intent bypasses the pod lookup**, unlike every other one.
+`HandleQuery` normally routes to storage pods first and returns *"No data
+available for this query"* when none match. The graph lives in
+`service_dependencies`, not in any pod, so a namespace with a good mined graph
+and no registered pods was hitting that bail and never reaching the skill. The
+route therefore runs immediately after intent classification, before any pod
+work (`answerDependencies`).
+
+The routing rule is the **same** as chat's (§1b) and is implemented twice —
+`isDependencyQuestion` in Go for this path, `_chat_route` in Python for chat.
+Both are exercised by the same table of questions, in
+`src/backend/internal/api/intent_test.go` and
+`src/agent/tests/test_chat_service_graph.py`, so drift fails a test rather than
+quietly making this document wrong for one entry point.
+
+> **Keyword stems are matched at a word boundary, not as bare substrings.** With
+> plain substring matching, `log` matched `topo`**`log`**`y`, so "service
+> topology for payments" was excluded as if it had asked about logs —
+> `technology`, `logical` and `catalog` fail the same way. Anchoring at a word
+> boundary while still matching forward keeps `log` → `logs` and `expir` →
+> `expiring` working.
+
+**There is currently no free-text UI for `/api/query`.** `AskPanel` is wired to
+render the graph but is not mounted in `App.tsx`; the mounted surfaces
+(`ServiceEvaluator`) only send fixed questions. So this path is reachable by API
+clients and the eval harness, and **the chat page is the UI** for asking. Mounting
+`AskPanel` is a one-line change if a free-text box is wanted.
+
 ## 2. What the panel shows
 
 **Namespace picker.** Populated from `/admin/tracked`, so it lists only
@@ -180,9 +224,10 @@ Live mining is the **faster** signal; Glue mining is the **broader** one (a
 cluster that ships logs but was never onboarded for live scanning still
 contributes). Neither backfills.
 
-Three *readers* consume the table: the Dependencies tab, the deterministic chat
-route (§1b), and every Pattern-A skill's prefetch — which is why ADR 0029 could
-add the Glue miner with no changes to any call site.
+Four *readers* consume the table: the Dependencies tab, the deterministic chat
+route (§1b), the `dependencies` intent on `/api/query` (§1c), and every
+Pattern-A skill's prefetch — which is why ADR 0029 could add the Glue miner with
+no changes to any call site.
 
 `extract_service_mentions` is duplicated verbatim between
 `src/agent/k8fy/` and `src/adapters/discovery/` — a deliberate copy, per ADR

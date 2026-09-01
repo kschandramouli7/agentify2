@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from k8fy.agent import K8fyAgent, get_k8fy_agent
 from k8fy.skills.cert_audit import CertAuditSkill
 from k8fy.skills.change_history import ChangeHistorySkill
+from k8fy.skills.dependency_graph import DependencyGraphSkill
 from k8fy.skills.deployment_guardian import DeploymentGuardianSkill
 from k8fy.skills.diagnose import DiagnoseSkill
 from k8fy.skills.health_check import HealthSkill
@@ -40,6 +41,10 @@ class SkillRouter:
             "incident_respond":   IncidentResponderSkill(),
             "execute_remediation": RemediationExecutorSkill(),
             "deploy_guardian_check": DeploymentGuardianSkill(),
+            # Deterministic, no-LLM like execute_remediation: the mined call
+            # graph has one correct answer, so reading it back needs no model
+            # (ROADMAP P18 #2, docs/SERVICE_DEPENDENCIES.md).
+            "dependencies": DependencyGraphSkill(),
         }
         # Fallback: full K8fyAgent for general_query or anything new.
         self._fallback: Optional[K8fyAgent] = None

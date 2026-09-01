@@ -3,6 +3,7 @@
 import functools
 import json
 import logging
+import re
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
@@ -393,40 +394,62 @@ REMEDIATION_REASONING_SCHEMA: Dict[str, Any] = {
 # Keyword detection rather than a model classifier: Go's inferIntent() already
 # routes every non-chat query this way, so this is the codebase's existing
 # convention, it costs nothing, and it cannot fail open into a paid call.
-_DEPENDENCY_QUESTION_KEYWORDS = (
-    "dependenc",       # dependency, dependencies
-    "depends on",
-    "depend on",
-    "upstream",
-    "downstream",
-    "who calls",
-    "what calls",
-    "calls what",
-    "call graph",
-    "callers",
-    "callees",
-    "blast radius",
-    "service graph",
-    "service topology",
-    "impacted if",
-    "affected if",
+# Matched as word PREFIXES (\b + stem), not bare substrings.
+#
+# Not cosmetic: with plain `in`, "log" matched "topo(log)y", so "service
+# topology for payments" was treated as a question about logs and excluded from
+# the deterministic route. "technology", "logical" and "catalog" fail the same
+# way. Anchoring at a word boundary while still matching forward means "log"
+# catches "logs" and "expir" catches "expiring", without catching a stem buried
+# mid-word.
+#
+# Kept in sync with dependencyKeywordRE / needsSynthesisRE in
+# src/backend/internal/api/handlers.go — /api/query and chat must apply the same
+# rule, since the docs describe it once.
+_DEPENDENCY_QUESTION_RE = re.compile(
+    r"\b(dependenc|depends on|depend on|upstream|downstream|who calls|what calls"
+    r"|calls what|call graph|caller|callee|blast radius|service graph"
+    r"|service topology|impacted if|affected if)"
+)
+
+# Concerns that need synthesis. A question touching any of these goes to the
+# model even when it also mentions dependencies, because the deterministic
+# answer can ONLY talk about the call graph — it has no health, log, cert or
+# metric data, and answering "what are payment-api's dependencies and is it
+# healthy?" with a graph alone would silently drop half the question.
+#
+# Diagnostic phrasing leads the list for the same reason Go's inferIntent()
+# checks it first: "why is payment-api slow, does it depend on vault?" is a
+# diagnosis, and the graph is context for it, not the answer.
+_NEEDS_SYNTHESIS_RE = re.compile(
+    r"\b(why|what's wrong|whats wrong|what is wrong|root cause|root-cause"
+    r"|diagnos|investigate|going on|going wrong|broken"
+    r"|health|unhealthy|degraded|crash|oom|restart|log|error|cert|expir|vault|pki"
+    r"|metric|cpu|memory|latency|slow|timeout"
+    r"|deploy|rollout|changed|scale|rollback|fix|remediat)"
 )
 
 
-def _looks_like_dependency_question(messages: List[Dict[str, Any]]) -> bool:
-    """True when the latest user turn is asking about the call graph.
+def _latest_user_text(messages: List[Dict[str, Any]]) -> str:
+    """The most recent user turn, as text.
 
-    Only the latest turn is considered: a conversation that touched
+    Only the latest turn is ever considered: a conversation that touched
     dependencies ten turns ago should not attach a graph to every later answer.
     """
-    latest = ""
     for m in reversed(messages):
         if m.get("role") == "user":
             content = m.get("content")
-            latest = content if isinstance(content, str) else json.dumps(content)
-            break
-    lowered = latest.lower()
-    return any(kw in lowered for kw in _DEPENDENCY_QUESTION_KEYWORDS)
+            return content if isinstance(content, str) else json.dumps(content)
+    return ""
+
+
+def _looks_like_dependency_question(messages: List[Dict[str, Any]]) -> bool:
+    """True when the latest user turn is asking about the call graph at all.
+
+    Broader than _chat_route: this decides whether to ATTACH the graph to an
+    answer, which is useful even for a mixed question the model must handle.
+    """
+    return bool(_DEPENDENCY_QUESTION_RE.search(_latest_user_text(messages).lower()))
 
 
 def _focus_service(messages: List[Dict[str, Any]], context: Dict[str, Any], services: List[str]) -> Optional[str]:
@@ -437,12 +460,7 @@ def _focus_service(messages: List[Dict[str, Any]], context: Dict[str, Any], serv
     named in the question while the session's context service is something
     else. Longest name first, so "payment-api" wins over "payment".
     """
-    latest = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            content = m.get("content")
-            latest = (content if isinstance(content, str) else json.dumps(content)).lower()
-            break
+    latest = _latest_user_text(messages).lower()
     for name in sorted(services, key=len, reverse=True):
         if name.lower() in latest:
             return name
@@ -480,16 +498,10 @@ def _chat_route(messages: List[Dict[str, Any]]) -> Optional[str]:
     either way), while a false positive answers a question the caller did not
     ask and drops the part it cannot see.
     """
-    latest = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            content = m.get("content")
-            latest = content if isinstance(content, str) else json.dumps(content)
-            break
-    lowered = latest.lower()
-    if not any(kw in lowered for kw in _DEPENDENCY_QUESTION_KEYWORDS):
+    lowered = _latest_user_text(messages).lower()
+    if not _DEPENDENCY_QUESTION_RE.search(lowered):
         return None
-    if any(kw in lowered for kw in _NEEDS_SYNTHESIS_KEYWORDS):
+    if _NEEDS_SYNTHESIS_RE.search(lowered):
         return None
     return "dependencies"
 
