@@ -52,6 +52,92 @@ type RunState = "idle" | "running" | "ok" | "error";
 // falls back to pretty-printed JSON so a new/changed tool shape never shows
 // nothing.
 
+// ── What actually ran ────────────────────────────────────────────────────────
+// These tools call the Kubernetes API directly (see live_tools.py) — they do NOT
+// shell out to kubectl. Both are shown on purpose: the API path is the truth,
+// and the kubectl line is what an operator would type to reproduce it. Labelling
+// a kubectl command as "the query" would be a small lie that costs trust the
+// first time someone runs it and sees different output.
+type ToolExplain = { api: string; kubectl: string; why: string };
+
+function explainTool(tool: string, args: Record<string, unknown>): ToolExplain | null {
+  const ns = String(args.namespace ?? "");
+  const pod = String(args.pod ?? "");
+  const nsPath = encodeURIComponent(ns);
+  switch (tool) {
+    case "live_list_pods":
+      return {
+        api: `GET /api/v1/namespaces/${nsPath}/pods`,
+        kubectl: `kubectl get pods -n ${ns}`,
+        why: "Lists every pod in the namespace with its phase, readiness and restart count.",
+      };
+    case "live_get_events":
+      return {
+        api: `GET /api/v1/namespaces/${nsPath}/events` +
+             (pod ? `?fieldSelector=involvedObject.name=${encodeURIComponent(pod)}` : ""),
+        kubectl: pod
+          ? `kubectl get events -n ${ns} --field-selector involvedObject.name=${pod}`
+          : `kubectl get events -n ${ns}`,
+        why: pod
+          ? "Recent Kubernetes events for this pod — scheduling, image pulls and restarts appear here first."
+          : "Recent Kubernetes events across the namespace, newest first.",
+      };
+    case "live_describe_pod":
+      return {
+        api: `GET /api/v1/namespaces/${nsPath}/pods/${encodeURIComponent(pod)}`,
+        kubectl: `kubectl describe pod -n ${ns} ${pod}`,
+        why: "Container images, per-container state and pod conditions — why a pod is not Ready.",
+      };
+    case "live_get_pod_logs": {
+      const container = args.container ? ` -c ${String(args.container)}` : "";
+      const previous = args.previous ? " --previous" : "";
+      const tail = args.tail_lines ? ` --tail=${String(args.tail_lines)}` : "";
+      return {
+        api: `GET /api/v1/namespaces/${nsPath}/pods/${encodeURIComponent(pod)}/log`,
+        kubectl: `kubectl logs -n ${ns} ${pod}${container}${previous}${tail}`,
+        why: args.previous
+          ? "Logs from the PREVIOUS container instance — what it printed before it died."
+          : "A bounded tail of the pod's current logs. Secrets are redacted before leaving the cluster.",
+      };
+    }
+    case "live_get_certificates":
+      return {
+        api: `GET /api/v1/namespaces/${nsPath}/secrets (type=kubernetes.io/tls)`,
+        kubectl: `kubectl get secrets -n ${ns} --field-selector type=kubernetes.io/tls`,
+        why: "TLS secrets with expiry dates. Days-until-expiry is computed here, never by the model.",
+      };
+    default:
+      return null;
+  }
+}
+
+// A registry host plus a deep path makes every row unreadable and pushes the tag
+// — the part that matters — off the end. Keep the last two segments.
+function shortImage(image?: string): string {
+  if (!image) return "–";
+  const parts = image.split("/");
+  return parts.length <= 2 ? image : `…/${parts.slice(-2).join("/")}`;
+}
+
+// Kubernetes repeats an event every back-off cycle. Collapse identical
+// reason+message pairs into one row with a count, keeping the newest timestamp,
+// so an ImagePullBackOff loop reads as one line rather than a dozen.
+function dedupeEvents(events: EventRow[]): (EventRow & { occurrences: number })[] {
+  const out: (EventRow & { occurrences: number })[] = [];
+  const index = new Map<string, number>();
+  for (const e of events) {
+    const key = `${e.reason ?? ""}|${e.message ?? ""}|${e.involved_object ?? ""}`;
+    const at = index.get(key);
+    if (at === undefined) {
+      index.set(key, out.length);
+      out.push({ ...e, occurrences: 1 });
+    } else {
+      out[at].occurrences += 1;
+    }
+  }
+  return out;
+}
+
 type PodRow = { name: string; node?: string; phase?: string; ready?: boolean; restart_count?: number; cluster_id?: string };
 type EventRow = { type?: string; reason?: string; message?: string; last_timestamp?: string; involved_object?: string; cluster_id?: string };
 type CertRow = { name: string; common_name?: string; expiry_date?: string; days_until_expiry?: number; cluster_id?: string };
@@ -108,23 +194,50 @@ function PodsResult({ pods, failed }: { pods: PodRow[]; failed: { cluster_id: st
   );
 }
 
-function EventsResult({ events, failed }: { events: EventRow[]; failed: { cluster_id: string; error: string }[] }) {
+function truncate(text: string | undefined, max: number): string {
+  if (!text) return "";
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+}
+
+function EventsResult({
+  events, failed, limit = 5, showObject = false,
+}: {
+  events: EventRow[];
+  failed: { cluster_id: string; error: string }[];
+  limit?: number;
+  // The pod name is already in the action's title and the describe header, so
+  // repeating involved_object on every row is noise. Only useful for a
+  // namespace-wide event list, where the rows really are different objects.
+  showObject?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
   if (events.length === 0) {
     return <div className="diag-result-empty">No recent events.<FanoutFailures failed={failed} /></div>;
   }
+  const deduped = dedupeEvents(events);
+  const shown = expanded ? deduped : deduped.slice(0, limit);
   return (
     <div>
       <ul className="diag-result-events">
-        {events.map((e, i) => (
+        {shown.map((e, i) => (
           <li key={i} className={`diag-result-events__item diag-result-events__item--${e.type === "Warning" ? "warn" : "muted"}`}>
             <span className="diag-result-events__reason">{e.reason ?? e.type ?? "Event"}</span>
-            {e.involved_object && <span className="diag-result-table__mono diag-result-events__object"> {e.involved_object}</span>}
+            {e.occurrences > 1 && <span className="diag-result-events__cluster"> ×{e.occurrences}</span>}
+            {showObject && e.involved_object && <span className="diag-result-table__mono diag-result-events__object"> {e.involved_object}</span>}
             {e.cluster_id && <span className="diag-result-events__cluster"> · {e.cluster_id}</span>}
-            <div className="diag-result-events__message">{e.message}</div>
+            {/* Full text on hover — an image-pull error repeats the whole
+                registry path three times and buries the one word that matters. */}
+            <div className="diag-result-events__message" title={e.message}>{truncate(e.message, 180)}</div>
             {e.last_timestamp && <div className="diag-result-events__time">{e.last_timestamp}</div>}
           </li>
         ))}
       </ul>
+      {deduped.length > shown.length && (
+        <button type="button" className="diag-result-more" onClick={() => setExpanded(true)}>
+          show {deduped.length - shown.length} more
+        </button>
+      )}
       <FanoutFailures failed={failed} />
     </div>
   );
@@ -182,7 +295,7 @@ function DescribePodResult({ data }: { data: Record<string, unknown> }) {
             {containers.map(c => (
               <tr key={c.name}>
                 <td className="diag-result-table__mono">{c.name}</td>
-                <td className="diag-result-table__mono diag-result-table__muted">{c.image ?? "–"}</td>
+                <td className="diag-result-table__mono diag-result-table__muted" title={c.image}>{shortImage(c.image)}</td>
                 <td>{c.ready ? "✓" : "✗"}</td>
                 <td className={c.restart_count ? "diag-result-table__warn" : undefined}>{c.restart_count ?? 0}</td>
                 <td>{c.last_state && c.last_state !== "unknown" ? `${c.state} (was ${c.last_state})` : c.state}</td>
@@ -200,7 +313,9 @@ function DescribePodResult({ data }: { data: Record<string, unknown> }) {
           ))}
         </ul>
       )}
-      <EventsResult events={events} failed={[]} />
+      {/* Tighter cap here: the "check events" action already renders the full
+          list, so repeating it in full made the two actions near-identical. */}
+      <EventsResult events={events} failed={[]} limit={3} />
     </div>
   );
 }
@@ -212,7 +327,7 @@ function ActionResult({ data }: { data: Record<string, unknown> }) {
   if (Array.isArray(data.containers)) return <DescribePodResult data={data} />;
   if (Array.isArray(data.pods)) return <PodsResult pods={data.pods as PodRow[]} failed={failed} />;
   if (Array.isArray(data.certificates)) return <CertificatesResult certs={data.certificates as CertRow[]} />;
-  if (Array.isArray(data.events)) return <EventsResult events={data.events as EventRow[]} failed={failed} />;
+  if (Array.isArray(data.events)) return <EventsResult events={data.events as EventRow[]} failed={failed} showObject />;
 
   // Unrecognized shape — pretty JSON, never silently show nothing.
   return <pre className="diag-action__output diag-action__output--ok">{JSON.stringify(data, null, 2)}</pre>;
@@ -241,6 +356,8 @@ function ActionRow({ action }: { action: RecommendedAction }) {
     }
   }
 
+  const explain = explainTool(action.tool, action.arguments ?? {});
+
   return (
     <div className="diag-action">
       <div className="diag-action__row">
@@ -255,6 +372,21 @@ function ActionRow({ action }: { action: RecommendedAction }) {
           {state === "running" ? "Running…" : "Run"}
         </button>
       </div>
+      {/* Shown BEFORE running, not after: an operator should be able to see what
+          a button will do before pressing it. The API path is what actually
+          executes; the kubectl line is the reproducible equivalent, labelled as
+          such rather than pretending kubectl ran. */}
+      {explain && (
+        <div className="diag-action__explain">
+          <div className="diag-action__why">{explain.why}</div>
+          <code className="diag-action__cmd" title="Equivalent kubectl command — for you to reproduce it">
+            {explain.kubectl}
+          </code>
+          <code className="diag-action__api" title="The Kubernetes API request this actually issues">
+            {explain.api}
+          </code>
+        </div>
+      )}
       {state === "error" && errorText && (
         <pre className="diag-action__output diag-action__output--error">{errorText}</pre>
       )}

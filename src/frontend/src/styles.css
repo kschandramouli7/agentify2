@@ -2467,6 +2467,48 @@ code {
 .diag-result-table tr:last-child td { border-bottom: none; }
 .diag-result-table__mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
 .diag-result-table__muted { color: var(--muted); }
+
+/* Recommended action: what the button will run, and why (DiagnosisReport). */
+.diag-action__explain {
+  margin: 4px 0 6px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.diag-action__why {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.diag-action__cmd,
+.diag-action__api {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  overflow-x: auto;
+  white-space: pre;
+}
+.diag-action__cmd {
+  background: var(--code-bg, rgba(127, 127, 127, 0.10));
+  color: var(--text);
+}
+.diag-action__api {
+  background: transparent;
+  color: var(--muted);
+}
+
+/* "show N more" toggle for collapsed event lists. */
+.diag-result-more {
+  background: none;
+  border: none;
+  padding: 2px 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.diag-result-more:hover { color: var(--text); }
 .diag-result-table__warn { color: var(--warn); font-weight: 600; }
 
 .diag-pod-status {
