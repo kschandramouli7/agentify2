@@ -1,22 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listServiceDependencies, type ServiceDependency } from "../api";
+import { DependencyFlow } from "./DependencyFlow";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
 //
-// WHY THERE IS NO NODE-LINK DIAGRAM HERE
+// LAYOUT: DIAGRAM FIRST, THEN DETAIL
 //
-// The obvious build is a boxes-and-arrows graph. It was rejected on the stated
-// requirement — "must degrade sanely to hundreds of edges" — because that is
-// exactly where a node-link view fails: past ~30 edges it becomes a hairball
-// that answers no question, and the layout algorithm needed to delay that is a
-// new dependency for a view that is worse than a table at the operator's actual
-// question, which is per-service ("what breaks if I restart this?").
+// The first version of this panel led with the table and deliberately had no
+// diagram, on the argument that a node-link view becomes a hairball at scale.
+// Reviewed against the real data, that was wrong: at five edges the table was
+// unreadable, because "what calls what" is a shape and a list is a bad way to
+// show a shape. The scale concern was real but is handled by DEGRADING —
+// DependencyFlow draws one hop when a service is focused and refuses to draw at
+// all past its node/edge caps — not by declining to draw.
 //
-// So: a focus view (one service, its callers and callees) is primary, a sortable
-// edge table is secondary, and a copyable Mermaid block gives the picture where
-// pictures are actually good — a doc, a PR, an incident writeup — rendered by
-// GitHub with no library shipped here.
+// So: the flow diagram is primary, the focus lists and the sortable table are the
+// detail and the text alternative, and the Mermaid block remains for docs and
+// PRs.
 //
 // COLOR
 //
@@ -278,6 +279,13 @@ export function TopologyPanel() {
               sub={graph.staleCount > 0 ? "no evidence in 15m" : "all fresh"}
             />
           </div>
+
+          <DependencyFlow
+            edges={graph.edges}
+            focus={selected}
+            onFocus={setFocus}
+            maxEvidence={graph.maxEvidence}
+          />
 
           <div className="topo-focus">
             <div className="topo-focus__services">
