@@ -2864,27 +2864,53 @@ code {
 .flow { margin: 4px 0 18px; }
 .flow__scroll {
   overflow-x: auto;
-  padding: 4px 0;
+  overflow-y: hidden;
+  padding: 2px 0 6px;
+  /* A four-node graph stretched across a 1400px panel looks broken, so the
+     diagram keeps its natural size and centres instead of filling. It still
+     scrolls when it genuinely outgrows the panel. */
+  display: flex;
+  justify-content: center;
+}
+.flow__svg { display: block; max-width: none; flex: none; }
+
+/* Blast-radius sentence. Deliberately plain prose above the diagram: the
+   answer to "who breaks with this" should be readable without decoding an
+   encoding. */
+.flow__radius {
+  margin: 0 0 10px;
+  padding: 8px 11px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-sm);
 }
-.flow__svg { display: block; max-width: none; }
 
-/* Edges: recessive by default, accent when part of the focused subgraph. */
 .flow__line { fill: none; stroke: var(--dim); transition: stroke 120ms ease; }
 .flow__edge--on .flow__line { stroke: var(--accent); }
 .flow__arrowhead { fill: var(--dim); }
 .flow__arrowhead--on { fill: var(--accent); }
 .flow__hidden-path { fill: none; stroke: none; }
 
-/* The count is text, in text ink — never the series colour. */
-.flow__count { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+/* Counts sit on the path, so give them a surface-coloured outline drawn behind
+   the glyphs — otherwise the line reads straight through the digits. */
+.flow__count {
+  fill: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
 .flow__edge--on .flow__count { fill: var(--text); }
 
 .flow__node { cursor: pointer; }
 .flow__box {
-  fill: var(--surface-2);
+  fill: var(--surface);
   stroke: var(--border-bright);
   stroke-width: 1;
   transition: stroke 120ms ease, fill 120ms ease;
@@ -2892,8 +2918,37 @@ code {
 .flow__node:hover .flow__box { stroke: var(--accent-light); }
 .flow__node:focus-visible .flow__box { stroke: var(--accent); stroke-width: 2; outline: none; }
 .flow__node--focus .flow__box { fill: var(--accent-dim); stroke: var(--accent); stroke-width: 1.5; }
-.flow__node--off { opacity: 0.4; }
+/* Hop distance without spending a second colour: reachable-but-not-adjacent
+   recedes, unreachable recedes further. */
+.flow__node--distant { opacity: 0.72; }
+.flow__node--off { opacity: 0.32; }
 .flow__label { fill: var(--text); font-size: 12px; pointer-events: none; }
+.flow__sub {
+  fill: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
 
-.flow__legend { margin: 8px 0 0; font-size: 12px; line-height: 1.5; }
+.flow__legend {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+.flow__legend-group { display: inline-flex; align-items: center; gap: 12px; }
+.flow__key-band { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.flow__key-band svg { display: block; }
+.flow__key-band .flow__line { stroke: var(--dim); }
+.flow__key--dir {
+  display: inline-block;
+  width: 26px;
+  height: 0;
+  vertical-align: middle;
+  margin-right: 4px;
+  border-top: 2px solid var(--dim);
+}
 .flow-toobig { margin-bottom: 16px; }

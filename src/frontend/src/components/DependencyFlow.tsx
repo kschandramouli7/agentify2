@@ -3,143 +3,321 @@ import { type ServiceDependency } from "../api";
 
 // Left-to-right dataflow diagram of the mined service graph.
 //
-// This replaces an earlier judgement of mine. I argued a table beat a node-link
-// view because a diagram becomes a hairball at scale — true, but it answered the
-// wrong question: at five edges the table was unreadable, and "what calls what"
-// is a shape, not a list. The scale worry is handled by degrading (see
-// MAX_NODES/MAX_EDGES below) rather than by refusing to draw.
+// HISTORY, BECAUSE IT EXPLAINS THE SHAPE
 //
-// Hand-rolled SVG rather than a graph library: layered layout for a graph this
-// size is ~40 lines, and a layout dependency would be the largest thing in the
-// bundle for one panel.
+// v1 was a table with no diagram, on the argument that node-link views become
+// hairballs. Reviewed against real data that was wrong — at five edges "what
+// calls what" was already unreadable as rows, because it is a shape. The scale
+// worry is answered by DEGRADING (focus draws a subgraph; past the caps it
+// refuses to draw) rather than by declining to draw.
 //
-// Colour, per the same rules as the rest of the panel: no categorical hues —
-// there are no series here. Edge weight encodes evidence (one channel, plus the
-// printed number), the accent hue marks the focused subgraph, and everything
-// else is recessive ink.
+// v2 encoded evidence_count as line weight. That was also wrong, and worse,
+// because it was confidently misleading — see the note on CONFIDENCE below.
+//
+// WHAT THE ENCODINGS MEAN NOW
+//
+// - Position: left-to-right is call direction. Layer = longest path from an
+//   entry point, so a service sits right of its furthest upstream caller.
+// - Node subtitle: in/out degree, or the role when one side is zero. This is
+//   what makes entry points and terminal dependencies readable at a glance
+//   without spending a colour on them.
+// - Line weight: CONFIDENCE, in three absolute bands — not volume. Never a
+//   continuous ramp again.
+// - Colour: no categorical hues, because there are no series here. The accent
+//   marks the focused subgraph; status tokens are left for status.
+//
+// CONFIDENCE, NOT VOLUME
+//
+// evidence_count is the number of scan cycles in which a miner saw the caller
+// log the callee's hostname. It is therefore a function of how chatty the
+// caller's logging is, how long the edge has existed, and sampling luck
+// (MAX_PODS_PER_NAMESPACE=5, LOG_TAIL_LINES=200) — NOT of call volume.
+//
+// The payments namespace proves it: payment-batch's three edges all read
+// exactly 187, because it logs all three targets in every burst, and 187 x the
+// 60s scan interval is precisely its 3h age. A width ramp turned that into
+// "these three dependencies are 14x more important than payment-worker's",
+// which is not a claim the data supports.
+//
+// So the bands are ABSOLUTE, not relative to the graph's max: "seen 40 times"
+// means the same thing whether or not some other edge was seen 4000 times.
 
-const NODE_W = 150;
-const NODE_H = 38;
-const COL_GAP = 76;   // horizontal space between layers
-const ROW_GAP = 22;   // vertical space between nodes in a layer
-const PAD = 16;
+const NODE_W = 158;
+const NODE_H = 46;   // two lines: name + degree/role subtitle
+const BEND_H = 20;   // a routing waypoint reserves less room than a real node
+const COL_GAP = 84;
+const ROW_GAP = 26;
+const PAD = 18;
 
 // Past this the picture stops informing and the focus view/table take over.
 const MAX_NODES = 24;
 const MAX_EDGES = 60;
 
-type Node = { id: string; layer: number; row: number; x: number; y: number };
+// Absolute confidence bands. Thresholds are in scan-cycle observations, so
+// they carry a fixed meaning: a couple of sightings could be sampling noise,
+// tens of sightings is a standing fact about the system.
+export const BANDS = [
+  { min: 20, width: 3.0, label: "consistently observed" },
+  { min: 3,  width: 2.0, label: "seen repeatedly" },
+  { min: 0,  width: 1.25, label: "seen once or twice — could be sampling" },
+] as const;
+
+export function band(count: number) {
+  return BANDS.find(b => count >= b.min) ?? BANDS[BANDS.length - 1];
+}
+
+type Node = {
+  id: string;
+  layer: number;
+  x: number;
+  y: number;
+  inDeg: number;
+  outDeg: number;
+};
+
+type Pt = { x: number; y: number };
 
 type Layout = {
   nodes: Map<string, Node>;
+  bends: Map<string, Pt[]>;  // edge id → waypoints between its endpoints
   width: number;
   height: number;
-  layers: string[][];
 };
 
+// A column holds real nodes and routing waypoints in one ordering, which is the
+// whole point: a waypoint that is not ordered alongside the nodes reserves no
+// space, and the edge then runs underneath them.
+type Slot =
+  | { kind: "node"; id: string }
+  | { kind: "bend"; edgeId: string };
+
+const slotKey = (s: Slot) => (s.kind === "node" ? `n:${s.id}` : `b:${s.edgeId}`);
+const slotHeight = (s: Slot) => (s.kind === "node" ? NODE_H : BEND_H);
+
 /**
- * Longest-path layering: a node sits one column right of its furthest upstream
- * caller. Cycles are broken by capping the walk — a service graph can legally
- * contain one (A calls B, B calls A) and the diagram must still render rather
- * than recurse forever.
+ * Layered ("Sugiyama-style") layout.
+ *
+ * 1. Longest-path layering — a node sits one column right of its furthest
+ *    upstream caller, so column index reads as dependency depth. Cycles are
+ *    broken by capping the walk; a service graph can legally contain one and
+ *    the diagram must still render rather than recurse forever.
+ * 2. An edge spanning more than one column gets a WAYPOINT in each column it
+ *    crosses. Without this, a 0→2 edge is drawn straight through whatever
+ *    occupies column 1 — which is exactly what the payments graph did, hiding
+ *    two of payment-batch's three edges behind the payment-worker box.
+ * 3. One barycenter pass orders each column (waypoints included) by the mean
+ *    position of its predecessors, so edges cross less and the waypoints line
+ *    up behind their own edge rather than zig-zagging.
  */
-function layout(edges: ServiceDependency[]): Layout {
-  const nodesIn = new Map<string, string[]>();
+export function layout(edges: ServiceDependency[]): Layout {
+  const parents = new Map<string, string[]>();
+  const outDeg = new Map<string, number>();
+  const inDeg = new Map<string, number>();
   const ids = new Set<string>();
   for (const e of edges) {
     ids.add(e.from_service);
     ids.add(e.to_service);
-    (nodesIn.get(e.to_service) ?? nodesIn.set(e.to_service, []).get(e.to_service)!).push(e.from_service);
+    (parents.get(e.to_service) ?? parents.set(e.to_service, []).get(e.to_service)!).push(e.from_service);
+    outDeg.set(e.from_service, (outDeg.get(e.from_service) ?? 0) + 1);
+    inDeg.set(e.to_service, (inDeg.get(e.to_service) ?? 0) + 1);
   }
 
   const depth = new Map<string, number>();
   const resolve = (id: string, seen: Set<string>): number => {
     const cached = depth.get(id);
     if (cached !== undefined) return cached;
-    if (seen.has(id)) return 0; // cycle — treat as a source rather than looping
+    if (seen.has(id)) return 0;
     seen.add(id);
-    const parents = nodesIn.get(id) ?? [];
-    const d = parents.length === 0 ? 0 : Math.max(...parents.map(p => resolve(p, seen))) + 1;
+    const ps = parents.get(id) ?? [];
+    const d = ps.length === 0 ? 0 : Math.max(...ps.map(p => resolve(p, seen))) + 1;
     seen.delete(id);
     depth.set(id, d);
     return d;
   };
   for (const id of ids) resolve(id, new Set());
 
-  // Group into columns, then order each column by the average row of its
-  // upstream callers (one barycenter pass) so edges cross less often.
   const maxLayer = Math.max(0, ...[...depth.values()]);
-  const layers: string[][] = Array.from({ length: maxLayer + 1 }, () => []);
-  for (const id of [...ids].sort()) layers[depth.get(id) ?? 0].push(id);
+  const layers: Slot[][] = Array.from({ length: maxLayer + 1 }, () => []);
+  for (const id of [...ids].sort()) layers[depth.get(id) ?? 0].push({ kind: "node", id });
 
-  const rowOf = new Map<string, number>();
-  layers.forEach((layerIds, li) => {
+  // Waypoints for column-skipping edges, plus the predecessor map the ordering
+  // pass needs. A waypoint's predecessor is the previous waypoint of the same
+  // edge, or the edge's source when this is the first one.
+  const predOf = new Map<string, string[]>();
+  const addPred = (k: string, p: string) =>
+    (predOf.get(k) ?? predOf.set(k, []).get(k)!).push(p);
+  for (const id of ids) for (const p of parents.get(id) ?? []) addPred(`n:${id}`, `n:${p}`);
+
+  const bendLayers = new Map<string, number[]>();
+  for (const e of edges) {
+    const a = depth.get(e.from_service) ?? 0;
+    const b = depth.get(e.to_service) ?? 0;
+    if (b - a <= 1) continue; // adjacent columns, or a back edge — no routing needed
+    const crossed: number[] = [];
+    let prev = `n:${e.from_service}`;
+    for (let li = a + 1; li < b; li++) {
+      layers[li].push({ kind: "bend", edgeId: e.id });
+      crossed.push(li);
+      addPred(`b:${e.id}`, prev);
+      prev = `b:${e.id}`;
+    }
+    bendLayers.set(e.id, crossed);
+  }
+
+  const posOf = new Map<string, number>(); // slot key → row centre, for barycentring
+  layers.forEach((slots, li) => {
     if (li > 0) {
-      layerIds.sort((a, b) => {
-        const bary = (n: string) => {
-          const parents = (nodesIn.get(n) ?? []).map(p => rowOf.get(p)).filter((v): v is number => v !== undefined);
-          return parents.length ? parents.reduce((s, v) => s + v, 0) / parents.length : 0;
+      slots.sort((s1, s2) => {
+        const bary = (s: Slot) => {
+          const ps = (predOf.get(slotKey(s)) ?? [])
+            .map(k => posOf.get(k))
+            .filter((v): v is number => v !== undefined);
+          return ps.length ? ps.reduce((acc, v) => acc + v, 0) / ps.length : 0;
         };
-        return bary(a) - bary(b) || a.localeCompare(b);
+        return bary(s1) - bary(s2) || slotKey(s1).localeCompare(slotKey(s2));
       });
     }
-    layerIds.forEach((id, ri) => rowOf.set(id, ri));
+    // Provisional centres so the next column has something to barycentre on.
+    let y = 0;
+    for (const s of slots) {
+      posOf.set(slotKey(s), y + slotHeight(s) / 2);
+      y += slotHeight(s) + ROW_GAP;
+    }
   });
 
-  const tallest = Math.max(1, ...layers.map(l => l.length));
+  const colHeight = (slots: Slot[]) =>
+    slots.reduce((h, s) => h + slotHeight(s), 0) + Math.max(0, slots.length - 1) * ROW_GAP;
+  const fullHeight = Math.max(NODE_H, ...layers.map(colHeight));
+
   const nodes = new Map<string, Node>();
-  layers.forEach((layerIds, li) => {
+  const bends = new Map<string, Pt[]>();
+  layers.forEach((slots, li) => {
+    const x = PAD + li * (NODE_W + COL_GAP);
     // Centre each column vertically so short columns don't hug the top.
-    const colHeight = layerIds.length * NODE_H + (layerIds.length - 1) * ROW_GAP;
-    const fullHeight = tallest * NODE_H + (tallest - 1) * ROW_GAP;
-    const yOffset = (fullHeight - colHeight) / 2;
-    layerIds.forEach((id, ri) => {
-      nodes.set(id, {
-        id,
-        layer: li,
-        row: ri,
-        x: PAD + li * (NODE_W + COL_GAP),
-        y: PAD + yOffset + ri * (NODE_H + ROW_GAP),
-      });
-    });
+    let y = PAD + (fullHeight - colHeight(slots)) / 2;
+    for (const s of slots) {
+      if (s.kind === "node") {
+        nodes.set(s.id, {
+          id: s.id, layer: li, x, y,
+          inDeg: inDeg.get(s.id) ?? 0,
+          outDeg: outDeg.get(s.id) ?? 0,
+        });
+      } else {
+        // Waypoint sits mid-column, so a routed edge reads as passing between
+        // the boxes rather than through them.
+        (bends.get(s.edgeId) ?? bends.set(s.edgeId, []).get(s.edgeId)!)
+          .push({ x: x + NODE_W / 2, y: y + BEND_H / 2 });
+      }
+      y += slotHeight(s) + ROW_GAP;
+    }
   });
 
   return {
     nodes,
-    layers,
+    bends,
     width: PAD * 2 + layers.length * NODE_W + Math.max(0, layers.length - 1) * COL_GAP,
-    height: PAD * 2 + tallest * NODE_H + Math.max(0, tallest - 1) * ROW_GAP,
+    height: PAD * 2 + fullHeight,
   };
 }
 
-function edgePath(from: Node, to: Node): string {
-  const x1 = from.x + NODE_W;
-  const y1 = from.y + NODE_H / 2;
-  const x2 = to.x;
-  const y2 = to.y + NODE_H / 2;
-  if (x2 <= x1) {
+/**
+ * Smooth path through the endpoints and any waypoints, with horizontal tangents
+ * at every joint so the segments meet without a visible kink.
+ */
+export function edgePath(from: Node, to: Node, via: Pt[]): { d: string; mid: Pt } {
+  const start: Pt = { x: from.x + NODE_W, y: from.y + NODE_H / 2 };
+  const end: Pt = { x: to.x, y: to.y + NODE_H / 2 };
+
+  if (via.length === 0 && end.x <= start.x) {
     // Back edge (a cycle, or same column): bow underneath so it stays readable
     // instead of hiding behind the nodes.
-    const dip = Math.max(Math.abs(y2 - y1), NODE_H) + 26;
-    return `M ${x1} ${y1} C ${x1 + 40} ${y1 + dip}, ${x2 - 40} ${y2 + dip}, ${x2} ${y2}`;
+    const dip = Math.max(Math.abs(end.y - start.y), NODE_H) + 26;
+    return {
+      d: `M ${start.x} ${start.y} C ${start.x + 40} ${start.y + dip}, ${end.x - 40} ${end.y + dip}, ${end.x} ${end.y}`,
+      mid: { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 + dip * 0.75 },
+    };
   }
-  const c = (x2 - x1) * 0.5;
-  return `M ${x1} ${y1} C ${x1 + c} ${y1}, ${x2 - c} ${y2}, ${x2} ${y2}`;
+
+  const pts = [start, ...via, end];
+  let d = `M ${start.x} ${start.y}`;
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i - 1];
+    const q = pts[i];
+    const c = (q.x - p.x) * 0.5;
+    d += ` C ${p.x + c} ${p.y}, ${q.x - c} ${q.y}, ${q.x} ${q.y}`;
+  }
+
+  // Label anchor: a waypoint when there is one (it is on the drawn curve by
+  // construction), else the midpoint of the single segment.
+  const mid = via.length
+    ? via[(via.length - 1) >> 1]
+    : { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+  return { d, mid };
+}
+
+/**
+ * Transitive reachability from `start`, following edges forwards
+ * (`dir: "down"` — what it depends on) or backwards (`dir: "up"` — what
+ * depends on it, i.e. the blast radius if it fails). Returns hop distance per
+ * service, which is what lets the diagram distinguish "calls this directly"
+ * from "affected two hops away".
+ *
+ * BFS, so a service reachable by both a short and a long path gets the short
+ * distance — the honest reading of "how close is this failure".
+ */
+export function reach(
+  edges: ServiceDependency[], start: string, dir: "up" | "down",
+): Map<string, number> {
+  const next = new Map<string, string[]>();
+  for (const e of edges) {
+    const [k, v] = dir === "down" ? [e.from_service, e.to_service] : [e.to_service, e.from_service];
+    (next.get(k) ?? next.set(k, []).get(k)!).push(v);
+  }
+  const dist = new Map<string, number>([[start, 0]]);
+  let frontier = [start];
+  while (frontier.length) {
+    const following: string[] = [];
+    for (const id of frontier) {
+      for (const n of next.get(id) ?? []) {
+        if (dist.has(n)) continue; // already reached at an equal-or-shorter distance
+        dist.set(n, (dist.get(id) ?? 0) + 1);
+        following.push(n);
+      }
+    }
+    frontier = following;
+  }
+  dist.delete(start);
+  return dist;
+}
+
+function roleText(n: Node): string {
+  if (n.inDeg === 0) return `entry · calls ${n.outDeg}`;
+  if (n.outDeg === 0) return `terminal · ${n.inDeg} caller${n.inDeg === 1 ? "" : "s"}`;
+  return `${n.inDeg} in · ${n.outDeg} out`;
 }
 
 export function DependencyFlow({
-  edges, focus, onFocus, maxEvidence,
+  edges, focus, onFocus,
 }: {
   edges: ServiceDependency[];
   focus: string | null;
   onFocus: (s: string | null) => void;
-  maxEvidence: number;
 }) {
-  // When focused, draw only that service's immediate neighbourhood. This is what
-  // makes a large graph usable: one hop is legible at any fleet size.
-  const visible = useMemo(() => {
-    if (!focus) return edges;
-    return edges.filter(e => e.from_service === focus || e.to_service === focus);
+  // Focus shows the TRANSITIVE neighbourhood, not one hop. One hop answers
+  // "who calls this"; the operator's actual question during an incident is
+  // "who is affected if this breaks", which is the upstream closure.
+  const { visible, upstream, downstream } = useMemo(() => {
+    if (!focus) return { visible: edges, upstream: new Map(), downstream: new Map() };
+    const up = reach(edges, focus, "up");
+    const down = reach(edges, focus, "down");
+    const keep = new Set<string>([focus, ...up.keys(), ...down.keys()]);
+    return {
+      // An edge is drawn when both ends are in the closure, so the paths that
+      // carry the impact are visible, not just the endpoints.
+      visible: edges.filter(e => keep.has(e.from_service) && keep.has(e.to_service)),
+      upstream: up,
+      downstream: down,
+    };
   }, [edges, focus]);
 
   const nodeCount = useMemo(
@@ -153,12 +331,10 @@ export function DependencyFlow({
   if (tooBig) {
     return (
       <div className="adm-empty flow-toobig">
-        <p>
-          {nodeCount} services and {visible.length} edges — too dense to draw usefully.
-        </p>
+        <p>{nodeCount} services and {visible.length} edges — too dense to draw usefully.</p>
         <p className="adm-muted">
-          Pick a service below to see just its callers and callees, or read the table.
-          A diagram of this many edges is a hairball, not an answer.
+          Pick a service below to see only what it reaches, or read the table. A diagram of
+          this many edges is a hairball, not an answer.
         </p>
       </div>
     );
@@ -166,11 +342,31 @@ export function DependencyFlow({
 
   if (visible.length === 0) return null;
 
-  const strokeFor = (count: number) =>
-    maxEvidence > 0 ? 1.25 + (count / maxEvidence) * 2.25 : 1.5;
+  const hopOf = (id: string): number | null =>
+    id === focus ? 0 : upstream.get(id) ?? downstream.get(id) ?? null;
 
   return (
     <div className="flow">
+      {focus && (
+        <p className="flow__radius">
+          If <strong>{focus}</strong> fails,{" "}
+          {upstream.size === 0 ? (
+            <>nothing here is affected — no service was observed calling it.</>
+          ) : (
+            <>
+              <strong>{upstream.size}</strong> service{upstream.size === 1 ? "" : "s"} upstream
+              {" "}{upstream.size === 1 ? "is" : "are"} affected:{" "}
+              {[...upstream.entries()]
+                .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+                .map(([s, d]) => `${s} (${d === 1 ? "direct" : `${d} hops`})`)
+                .join(", ")}
+              .
+            </>
+          )}{" "}
+          It depends on <strong>{downstream.size}</strong>.
+        </p>
+      )}
+
       <div className="flow__scroll">
         <svg
           className="flow__svg"
@@ -178,7 +374,10 @@ export function DependencyFlow({
           width={l.width}
           height={l.height}
           role="img"
-          aria-label={`Service dependency flow: ${visible.length} calls between ${nodeCount} services. The table below carries the same data as text.`}
+          aria-label={
+            `Service dependency flow: ${visible.length} observed calls between ${nodeCount} services, ` +
+            `drawn left to right in call direction. The table below carries the same data as text.`
+          }
         >
           <defs>
             <marker id="flow-arrow" viewBox="0 0 8 8" refX="7" refY="4"
@@ -196,54 +395,90 @@ export function DependencyFlow({
             const a = l.nodes.get(e.from_service);
             const b = l.nodes.get(e.to_service);
             if (!a || !b) return null;
+            // Emphasise the edges that actually touch the focused service; the
+            // rest are the paths carrying impact onward and stay recessive.
             const on = !focus || e.from_service === focus || e.to_service === focus;
-            const d = edgePath(a, b);
+            const bd = band(e.evidence_count);
+            const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? []);
             return (
               <g key={e.id} className={`flow__edge${on ? " flow__edge--on" : ""}`}>
-                <title>{`${e.from_service} → ${e.to_service} · ${e.evidence_count} observations · last seen ${new Date(e.last_seen).toLocaleString()}`}</title>
-                <path
-                  d={d}
-                  className="flow__line"
-                  strokeWidth={strokeFor(e.evidence_count)}
-                  markerEnd={`url(#${on ? "flow-arrow-on" : "flow-arrow"})`}
-                />
-                {/* The number is printed, not implied by thickness alone. */}
-                <text className="flow__count" dy="-4">
-                  <textPath href={`#${e.id}`} startOffset="50%" textAnchor="middle">
-                    {e.evidence_count}
-                  </textPath>
+                <title>
+                  {`${e.from_service} → ${e.to_service}\n` +
+                   `${e.evidence_count} scan cycles observed this call (${bd.label}).\n` +
+                   `This counts sightings in logs, not requests — it is confidence, not volume.\n` +
+                   `Last seen ${new Date(e.last_seen).toLocaleString()}`}
+                </title>
+                <path d={d} className="flow__line" strokeWidth={bd.width}
+                      markerEnd={`url(#${on ? "flow-arrow-on" : "flow-arrow"})`} />
+                {/* Printed, never implied by thickness alone — and set
+                    horizontally rather than on a textPath, which rotated the
+                    digits along the curve and made them unreadable. */}
+                <text x={mid.x} y={mid.y - 6} textAnchor="middle" className="flow__count">
+                  {e.evidence_count}
                 </text>
-                <path id={e.id} d={d} className="flow__hidden-path" />
               </g>
             );
           })}
 
           {[...l.nodes.values()].map(n => {
-            const on = !focus || n.id === focus;
+            const hop = hopOf(n.id);
+            const cls = [
+              "flow__node",
+              n.id === focus ? "flow__node--focus" : "",
+              // Direct neighbours of the focus read stronger than distant ones,
+              // so hop distance is visible without a second colour channel.
+              focus && hop !== null && hop > 1 ? "flow__node--distant" : "",
+              focus && hop === null ? "flow__node--off" : "",
+            ].filter(Boolean).join(" ");
             return (
-              <g
-                key={n.id}
-                className={`flow__node${n.id === focus ? " flow__node--focus" : ""}${on ? "" : " flow__node--off"}`}
-                onClick={() => onFocus(n.id === focus ? null : n.id)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={ev => { if (ev.key === "Enter" || ev.key === " ") onFocus(n.id === focus ? null : n.id); }}
-              >
-                <title>{`${n.id} — click to ${n.id === focus ? "clear focus" : "show only its callers and callees"}`}</title>
-                <rect x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx="7" className="flow__box" />
-                <text x={n.x + NODE_W / 2} y={n.y + NODE_H / 2 + 4} textAnchor="middle" className="flow__label">
-                  {n.id.length > 20 ? `${n.id.slice(0, 19)}…` : n.id}
+              <g key={n.id} className={cls}
+                 onClick={() => onFocus(n.id === focus ? null : n.id)}
+                 role="button" tabIndex={0}
+                 onKeyDown={ev => {
+                   if (ev.key === "Enter" || ev.key === " ") {
+                     ev.preventDefault();
+                     onFocus(n.id === focus ? null : n.id);
+                   }
+                 }}>
+                <title>
+                  {`${n.id} — ${roleText(n)}` +
+                   (focus && hop !== null && hop > 0
+                     ? `\n${hop === 1 ? "Directly" : `${hop} hops`} ${upstream.has(n.id) ? "upstream of" : "downstream of"} ${focus}`
+                     : "") +
+                   `\nClick to ${n.id === focus ? "clear focus" : "trace what it reaches"}`}
+                </title>
+                <rect x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx="8" className="flow__box" />
+                <text x={n.x + NODE_W / 2} y={n.y + 19} textAnchor="middle" className="flow__label">
+                  {n.id.length > 21 ? `${n.id.slice(0, 20)}…` : n.id}
+                </text>
+                <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__sub">
+                  {roleText(n)}
                 </text>
               </g>
             );
           })}
         </svg>
       </div>
-      <p className="flow__legend adm-muted">
-        Left to right = call direction. Line weight and the number on each arrow are
-        observation counts. Click a service to see only its immediate callers and callees.
-        {focus && <> · <button type="button" className="topo-link" onClick={() => onFocus(null)}>show everything</button></>}
-      </p>
+
+      <div className="flow__legend adm-muted">
+        <span><span className="flow__key flow__key--dir" aria-hidden="true" /> left to right = call direction</span>
+        <span className="flow__legend-group" aria-hidden="true">
+          {BANDS.slice().reverse().map(b => (
+            <span key={b.min} className="flow__key-band">
+              <svg width="26" height="8" aria-hidden="true">
+                <line x1="0" y1="4" x2="26" y2="4" className="flow__line" strokeWidth={b.width} />
+              </svg>
+              {b.min === 0 ? "1–2" : b.min === 3 ? "3–19" : "20+"}
+            </span>
+          ))}
+        </span>
+        <span>
+          the number on each arrow is how many scan cycles saw the call —{" "}
+          <strong>confidence, not traffic volume</strong>. Click a service to trace what it
+          reaches and what breaks with it.
+          {focus && <> · <button type="button" className="topo-link" onClick={() => onFocus(null)}>show everything</button></>}
+        </span>
+      </div>
     </div>
   );
 }

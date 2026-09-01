@@ -62,6 +62,8 @@ type Graph = {
   callers: Map<string, ServiceDependency[]>; // to   → edges in
   maxEvidence: number;
   staleCount: number;
+  entries: string[];    // nothing observed calling them — where work enters
+  terminals: string[];  // observed calling nothing — dependencies of last resort
 };
 
 function buildGraph(edges: ServiceDependency[]): Graph {
@@ -80,13 +82,16 @@ function buildGraph(edges: ServiceDependency[]): Graph {
     maxEvidence = Math.max(maxEvidence, e.evidence_count);
     if (now - new Date(e.last_seen).getTime() > STALE_AFTER_MS) staleCount += 1;
   }
+  const all = [...services].sort();
   return {
     edges,
-    services: [...services].sort(),
+    services: all,
     callees,
     callers,
     maxEvidence,
     staleCount,
+    entries: all.filter(s => !callers.has(s)),
+    terminals: all.filter(s => !callees.has(s)),
   };
 }
 
@@ -122,12 +127,14 @@ function Freshness({ lastSeen }: { lastSeen: string }) {
   );
 }
 
-// One hue, more-is-wider. The number is always printed — the bar is a scan aid,
-// not the value.
+// One hue, more-is-wider — but note what the quantity IS: the number of scan
+// cycles that observed this call, which tracks the caller's log verbosity and
+// the edge's age, not its traffic. Read it as confidence. The bar is only an
+// in-table scan aid; the number is always printed, and the header names it.
 function EvidenceBar({ count, max }: { count: number; max: number }) {
   const pct = max > 0 ? Math.max(4, Math.round((count / max) * 100)) : 0;
   return (
-    <span className="topo-evidence" title={`${count} log observations`}>
+    <span className="topo-evidence" title={`Seen in ${count} scan cycles — confidence that the call is real, not how much traffic it carries`}>
       <span className="topo-evidence__track">
         <span className="topo-evidence__fill" style={{ width: `${pct}%` }} />
       </span>
@@ -204,8 +211,9 @@ export function TopologyPanel() {
           <h2>Service Dependencies</h2>
           <p className="adm-panel__desc">
             Mined from pod logs, not observed on the network — an edge exists only where a
-            caller logged the callee's DNS name. A missing edge means <em>no evidence</em>,
-            not <em>no dependency</em>.
+            caller logged the callee's hostname. A missing edge means <em>no evidence</em>,
+            not <em>no dependency</em>. Counts are how many scan cycles saw the call, so they
+            measure <em>confidence, not traffic volume</em>.
           </p>
         </div>
         <div className="adm-filters">
@@ -272,9 +280,14 @@ export function TopologyPanel() {
             <StatCard label="Services" value={String(graph.services.length)} />
             <StatCard label="Edges" value={String(graph.edges.length)} />
             <StatCard
-              label="Observations"
-              value={graph.edges.reduce((n, e) => n + e.evidence_count, 0).toLocaleString()}
-              sub="log mentions counted"
+              label="Entry points"
+              value={String(graph.entries.length)}
+              sub={graph.entries.length ? graph.entries.join(", ") : "none — every service has a caller"}
+            />
+            <StatCard
+              label="Terminal"
+              value={String(graph.terminals.length)}
+              sub={graph.terminals.length ? graph.terminals.join(", ") : "none observed"}
             />
             <StatCard
               label="Stale edges"
@@ -283,12 +296,7 @@ export function TopologyPanel() {
             />
           </div>
 
-          <DependencyFlow
-            edges={graph.edges}
-            focus={selected}
-            onFocus={setFocus}
-            maxEvidence={graph.maxEvidence}
-          />
+          <DependencyFlow edges={graph.edges} focus={selected} onFocus={setFocus} />
 
           <div className="topo-focus">
             <div className="topo-focus__services">
@@ -329,7 +337,7 @@ export function TopologyPanel() {
             <table className="adm-table">
               <thead>
                 <tr>
-                  <th>From</th><th></th><th>To</th><th>Evidence</th><th>Last seen</th><th>First seen</th>
+                  <th>From</th><th></th><th>To</th><th>Cycles seen</th><th>Last seen</th><th>First seen</th>
                 </tr>
               </thead>
               <tbody>
