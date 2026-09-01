@@ -150,6 +150,63 @@ service_dependencies` (already used by every Pattern-A skill's prefetch)
 transparently see richer data once this miner starts pushing, with zero
 changes to those call sites.
 
+## Amendment (2026-09-01) — the frontend, and the matching rule
+
+Two statements above were true when written and are no longer.
+
+### "No frontend changes" is no longer true
+
+That claim held only because nothing consumed the edges directly. A review
+surface now exists: a **Dependencies** tab (`TopologyPanel.tsx`) reading the
+already-shipped `GET /api/service-dependencies`, with a left-to-right layered
+flow diagram (`DependencyFlow.tsx`), per-service focus lists, a table, and a
+Mermaid export. No backend, storage or miner change was needed — which is the
+evidence that this ADR's read path was in fact adequately factored.
+
+Worth recording because the first version of that panel was a **table with no
+diagram**, on the argument that a node-link view degenerates into a hairball.
+Reviewed against real data the argument was wrong: at five edges the table was
+unreadable, because "what calls what" is a shape. The scale concern was
+genuine, so it is handled by *degrading* — one hop when a service is focused,
+and a refusal to draw past 24 nodes / 60 edges — rather than by declining to
+draw. Documented in [docs/SERVICE_DEPENDENCIES.md](../../docs/SERVICE_DEPENDENCIES.md).
+
+### The matching rule now accepts bare service names
+
+Phase 4 describes `extract_service_mentions` as "reused verbatim, zero
+changes." It has since changed, in a way that applies to all three miners at
+once (the Glue miner imports it rather than reimplementing it — the reuse this
+ADR chose is what made a one-place fix possible).
+
+The function matched only `<service>.<namespace>[.svc.cluster.local]`. Almost
+nothing in a cluster logs that: Kubernetes resolves a short name through the
+pod's search domain, so real callers write `http://agentify-backend:8080`.
+
+**The failure this hid is the point.** `payments` reported five edges and
+looked like a working subsystem — but those existed *only* because its test
+workloads were written to log FQDNs deliberately. The miner was being
+validated against a fixture built to satisfy it. `agentify` and `vault`, which
+call each other constantly, reported zero. Same shape as this project's
+tracing and embedding bugs: a component reporting success while observing
+nothing, found by running it against reality rather than by reading it.
+
+A bare name now counts, but **only in a hostname context** — immediately after
+`//`, or immediately before `:<port>`. Without that restriction a Service
+named `payment` would match the word "payment" in log prose. Validation
+against the live Service list remains the second guard, and a bare name is
+checked against the *scanned namespace's own* list, which is precisely what
+the search domain does. The boundary is pinned by a test that must keep
+failing for the loose version.
+
+Redaction was verified to run before extraction without destroying the
+signal: URL userinfo is rewritten (`//user:pass@host` → `//user:***@host`) but
+host and port survive, so the edge is still found.
+
+**Cost accepted:** `name:port` is a slightly weaker signal than an FQDN — a
+log line like `payment:8080` in prose would match if `payment` is a real
+Service. Judged acceptable against the alternative, which was a graph blind to
+the form nearly every real caller uses.
+
 ## Consequences
 
 - **Positive:** service-dependency edges are no longer limited to what a

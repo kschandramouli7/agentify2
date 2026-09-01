@@ -121,6 +121,11 @@ See [ADR 0004](context-mesh/decisions/0004-tech-stack-polyglot-go-python-typescr
 - **Semantic memory:** `docs/SEMANTIC_MEMORY.md` — how diagnose conclusions are
   embedded (Voyage), stored (`incident_embeddings` + pgvector) and retrieved, why
   every failure mode is silent, and how to verify it is actually working.
+- **Service dependencies:** `docs/SERVICE_DEPENDENCIES.md` — the Dependencies
+  dashboard, the three miners behind it, the hostname-matching rule, and the
+  eight reasons a namespace legitimately shows nothing. Every edge is evidence
+  a caller *logged* a hostname, never an observed network flow — read this
+  before drawing any conclusion from the graph.
 - **Prompts:** `docs/PROMPT_LIFECYCLE.md` — prompts are data served from Langfuse,
   not code in the container. Editing `src/agent/k8fy/prompts.py` changes only the
   fallback; shipping a prompt change means publishing a candidate, gating it, and

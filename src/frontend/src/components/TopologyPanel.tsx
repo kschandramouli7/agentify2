@@ -27,7 +27,8 @@ import { DependencyFlow } from "./DependencyFlow";
 // always with a word, never colour alone. Both reuse the existing token system
 // rather than importing a second palette.
 
-const STALE_AFTER_MS = 15 * 60 * 1000; // ~30 scan cycles at the 30s burst interval
+const STALE_AFTER_MS = 15 * 60 * 1000; // ~15 cycles at the miner's 60s SCAN_INTERVAL_SECONDS,
+                                       // so a single missed cycle never reads as stale
 
 // /admin/tracked returns "namespace/service" pairs — the same source the
 // observability search box uses. Namespaces are its distinct prefixes.
@@ -256,9 +257,11 @@ export function TopologyPanel() {
         <div className="adm-empty">
           <p>No dependency evidence for <strong>{applied}</strong>.</p>
           <p className="adm-muted">
-            Expected when nothing in the namespace logs a callee's DNS name. The miner needs
+            Expected when nothing in the namespace logs a callee's hostname. The miner needs
             the caller to have a Service (to attribute <code>from_service</code>) and to print
-            the target hostname — see <code>docs/…</code> P18 use case #2.
+            the target host — either <code>svc.ns</code> or a bare <code>//svc</code> /
+            <code>svc:port</code>. <code>docs/SERVICE_DEPENDENCIES.md</code> §4 lists the eight
+            reasons a namespace comes back empty, in order of likelihood.
           </p>
         </div>
       )}
