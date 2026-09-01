@@ -7,8 +7,9 @@ import { MetricsPanel } from "./components/MetricsPanel";
 import { PricingPanel } from "./components/PricingPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { RemediationPanel } from "./components/RemediationPanel";
+import { TopologyPanel } from "./components/TopologyPanel";
 
-type Page = "observability" | "registry" | "traces" | "sync" | "metrics" | "pricing" | "chat" | "remediation";
+type Page = "observability" | "registry" | "traces" | "sync" | "metrics" | "pricing" | "chat" | "remediation" | "topology";
 
 interface NavItem {
   id: Page;
@@ -35,6 +36,7 @@ const MAIN_NAV: NavItem[] = [
 const ADMIN_NAV: NavItem[] = [
   { id: "registry",     label: "Pod Registry",    icon: "⬡", description: "Browse live pods"            },
   { id: "traces",       label: "Query History",   icon: "≡", description: "Past queries & traces"       },
+  { id: "topology",     label: "Dependencies",    icon: "⇄", description: "Mined service-to-service call graph (P18 #2)" },
   { id: "sync",         label: "Namespace Sync",  icon: "⟳", description: "Sync cluster namespaces"    },
   { id: "metrics",      label: "Metrics",         icon: "◈", description: "Token usage & cost"          },
   { id: "pricing",      label: "Model Pricing",   icon: "⊙", description: "$/MTok rates for all models" },
@@ -133,6 +135,7 @@ export function App() {
           {page === "pricing"  && <PricingPanel />}
           {page === "chat"     && <ChatPanel />}
           {page === "remediation" && <RemediationPanel />}
+          {page === "topology"    && <TopologyPanel />}
         </main>
       </div>
     </div>

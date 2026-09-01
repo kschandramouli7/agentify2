@@ -2753,3 +2753,109 @@ code {
 .pods th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
 
 .adm-btn--ghost { background: transparent; }
+
+/* ── Service dependencies (TopologyPanel) ─────────────────────────────────── */
+/* Reuses the existing token system: one hue for magnitude, reserved status
+   tokens for freshness. No categorical hues — this data has no series. */
+
+.topo-empty { margin: 4px 0 0; font-size: 12.5px; }
+
+.topo-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text);
+  cursor: pointer;
+  border-bottom: 1px dotted var(--border-bright);
+}
+.topo-link:hover { color: var(--accent-light); }
+
+/* evidence_count: one hue, more-is-wider, number always printed beside it. */
+.topo-evidence { display: inline-flex; align-items: center; gap: 6px; }
+.topo-evidence__track {
+  display: inline-block;
+  width: 56px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.topo-evidence__fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+.topo-evidence__num {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-size: 12px;
+  min-width: 2ch;
+}
+
+.topo-focus { margin: 12px 0 16px; }
+.topo-focus__services {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.topo-focus__hint { font-size: 12.5px; margin-right: 2px; }
+
+.topo-chip {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.topo-chip:hover { border-color: var(--border-bright); }
+.topo-chip--active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent-light);
+}
+
+.topo-focus__detail {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 12px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+@media (max-width: 720px) {
+  .topo-focus__detail { grid-template-columns: 1fr; }
+}
+.topo-focus__col h4 {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.topo-edges { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.topo-edges__item { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.topo-edges__arrow { color: var(--dim); }
+
+.topo-export { margin-top: 16px; }
+.topo-export__hint { margin: 8px 0 6px; font-size: 12.5px; }
+.topo-export__code {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+  color: var(--text);
+}

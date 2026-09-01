@@ -369,6 +369,29 @@ export interface TraceRecord {
   estimated_cost_usd: number;
 }
 
+// ── Service dependencies (ROADMAP P18 use case #2, ADR 0029) ────────────────
+// Edges are MINED FROM LOG TEXT, not observed on the network: an edge exists
+// only where a caller logged the callee's DNS name. So absence means "no
+// evidence", never "no dependency" — the UI has to say so, or a reader will
+// treat a sparse graph as a complete one.
+export type ServiceDependency = {
+  id: string;
+  namespace: string;
+  from_service: string;
+  to_service: string;
+  evidence_count: number;
+  first_seen: string;
+  last_seen: string;
+  tenant_id: string;
+  cluster_id?: string;
+};
+
+export async function listServiceDependencies(namespace: string): Promise<ServiceDependency[]> {
+  const res = await fetch(`/api/service-dependencies?namespace=${encodeURIComponent(namespace)}`);
+  if (!res.ok) throw new Error(`Failed to load service dependencies (${res.status})`);
+  return res.json();
+}
+
 export async function listTraces(): Promise<TraceRecord[]> {
   const res = await fetch("/admin/traces");
   if (res.status === 404) return [];
