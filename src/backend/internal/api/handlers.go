@@ -773,7 +773,7 @@ var (
 // cover health, certs, metrics and change history, but not logs, remediation
 // verbs, or symptom words like "slow" / "timeout" / "error".
 //
-// Kept in sync with _DEPENDENCY_QUESTION_KEYWORDS / _NEEDS_SYNTHESIS_KEYWORDS in
+// Kept in sync with _DEPENDENCY_QUESTION_RE / _NEEDS_SYNTHESIS_RE in
 // src/agent/k8fy/agent.py — the chat path applies the same rule, and one
 // documented rule that behaves differently per entry point would be worse than
 // no rule at all.

@@ -421,6 +421,19 @@ _DEPENDENCY_QUESTION_RE = re.compile(
 # Diagnostic phrasing leads the list for the same reason Go's inferIntent()
 # checks it first: "why is payment-api slow, does it depend on vault?" is a
 # diagnosis, and the graph is context for it, not the answer.
+# Concerns that need synthesis. A question touching any of these goes to the
+# model even when it also mentions dependencies, because the deterministic
+# answer can ONLY talk about the call graph — it has no health, log, cert or
+# metric data, and answering "what are payment-api's dependencies and is it
+# healthy?" from a graph alone would silently drop half the question.
+#
+# Diagnostic phrasing leads the list for the same reason Go's inferIntent()
+# checks it first: "why is payment-api slow, does it depend on vault?" is a
+# diagnosis, and the graph is context for it, not the answer. (Go relies on
+# ordering for that half — its diagnose block returns before
+# isDependencyQuestion is reached — so its needsSynthesisRE omits the
+# diagnostic stems this one carries. Same routing outcome, asserted
+# question-for-question by tests on both sides.)
 _NEEDS_SYNTHESIS_RE = re.compile(
     r"\b(why|what's wrong|whats wrong|what is wrong|root cause|root-cause"
     r"|diagnos|investigate|going on|going wrong|broken"
@@ -466,27 +479,6 @@ def _focus_service(messages: List[Dict[str, Any]], context: Dict[str, Any], serv
             return name
     ctx_service = context.get("service")
     return ctx_service if isinstance(ctx_service, str) and ctx_service in services else None
-
-
-# Concerns that need synthesis. A question touching any of these goes to the
-# model even when it also mentions dependencies, because the deterministic
-# answer below can ONLY talk about the call graph — it has no health, log, cert
-# or metric data, and answering "what are payment-api's dependencies and is it
-# healthy?" with a graph alone would silently drop half the question.
-#
-# Diagnostic phrasing leads the list for the same reason Go's inferIntent()
-# checks it first: "why is payment-api slow, does it depend on vault?" is a
-# diagnosis, and the graph is context for it, not the answer.
-_NEEDS_SYNTHESIS_KEYWORDS = (
-    # diagnostic phrasing — mirrors inferIntent()'s own first block
-    "why", "what's wrong", "whats wrong", "what is wrong", "root cause",
-    "root-cause", "diagnos", "investigate", "going on", "going wrong", "broken",
-    # other data domains this deterministic path holds nothing about
-    "health", "healthy", "unhealthy", "degraded", "crash", "oom", "restart",
-    "log", "error", "cert", "expir", "vault", "pki",
-    "metric", "cpu", "memory", "latency", "slow", "timeout",
-    "deploy", "rollout", "changed", "scale", "rollback", "fix", "remediat",
-)
 
 
 def _chat_route(messages: List[Dict[str, Any]]) -> Optional[str]:
