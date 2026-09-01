@@ -43,7 +43,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P15** | Pull-based log-platform connector (Splunk first, Elasticsearch/OpenSearch second) — replaces direct-cluster log fetch with a query-time read against wherever logs already land | Test harness (Fargate+Firehose+S3/Athena) built 2026-07-21/22 — connector code itself not started | [spec 008](specs/008-on-demand-pod-logs.md), [ADR 0014](decisions/0014-on-demand-ephemeral-log-fetch.md) (extends, does not revisit), [ADR 0021](decisions/0021-log-platform-test-infra.md) |
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
-| **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029); use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
+| **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go` |
 | **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 
 ---
@@ -1665,6 +1665,49 @@ has never been decided, only inherited. Levers, cheapest first:
 **Do not tune this by moving thresholds.** Decide the target first, then measure
 against it — the eval suite scores latency per item and can answer the question
 directly.
+
+---
+
+### Use case #2 — verified live 2026-09-01
+
+Shipped 2026-08-03 and extended 2026-08-18, but **it had never produced a single
+row**, and nothing surfaced that: `service_dependencies` was empty because
+discovery mines **log text**, not network traffic, and no test workload ever
+called another service or logged its name. `payment-worker` looped on
+`echo "payment-worker running — certs from Vault PKI"`; `payment-api` and
+`payment` served nginx and called nobody. Two miners, an ingest API, tenant
+scoping and a consumer, all running against nothing.
+
+Fixed by giving it evidence (`e4aadf6`): `payment-worker` bursts calls to
+`payment-api` and `payment` every 30 s and echoes the FQDN, and a new
+`payment-batch` workload bursts to all three. Result:
+
+```
+ namespace |  from_service  |   to_service   | evidence_count
+-----------+----------------+----------------+----------------
+ payments  | payment-batch  | payment-worker |             15
+ payments  | payment-batch  | payment-api    |             15
+ payments  | payment-batch  | payment        |             15
+ payments  | payment-worker | payment        |              6
+ payments  | payment-worker | payment-api    |              6
+```
+
+`evidence_count` above 1 is the load-bearing part: it proves the
+`ON CONFLICT` upsert path, not just the insert.
+
+**Two non-obvious requirements this exposed**, both of which silently drop edges:
+
+1. **The caller needs a Service.** Both miners resolve `from_service` by matching
+   pod labels against Service selectors and `continue` when nothing matches — so
+   `payment-worker`, which had no Service, could never be the source of an edge
+   however faithfully it logged. It now has a headless one.
+2. **The caller must log the callee's DNS name.** Making the call is not enough;
+   there is no network observation anywhere in this design.
+
+**Not to be repeated:** a sidecar would have been the obvious way to add calls to
+the nginx-based services, and it would have broken log reading for those pods
+entirely — `get_pod_logs` sends no `container` parameter, so the K8s API 400s on
+multi-container pods and the function returns `""` (OPS-9).
 
 ---
 
