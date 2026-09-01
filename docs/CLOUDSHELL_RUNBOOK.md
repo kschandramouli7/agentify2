@@ -94,8 +94,16 @@ SELECT extname FROM pg_extension;
 
 ## 3. Hit the backend API
 
+`kubectl port-forward … &` returns immediately but the tunnel takes a second or
+two, so a curl on the next line fails with `Could not connect` while
+`Forwarding from 127.0.0.1:18080` prints afterwards. Wait for readiness:
+
 ```bash
-kubectl port-forward -n agentify svc/agentify-backend 18080:8080 &
+kubectl port-forward -n agentify svc/agentify-backend 18080:8080 >/dev/null 2>&1 &
+for i in $(seq 1 10); do
+  curl -sf localhost:18080/health >/dev/null 2>&1 && { echo "port-forward ready"; break; }
+  sleep 2
+done
 
 curl -sS localhost:18080/health
 

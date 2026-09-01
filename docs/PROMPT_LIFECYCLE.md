@@ -170,7 +170,8 @@ too).
 whole mechanism, and it needs no deploy:
 
 ```bash
-# wait ~60s for the SDK's stale-while-revalidate cache, then:
+# wait ~60s for the SDK's stale-while-revalidate cache, then (port-forward first —
+# it needs a moment to establish, see CLOUDSHELL_RUNBOOK.md):
 curl -sS -X POST localhost:18080/api/query -H 'Content-Type: application/json' \
   -d '{"question":"why is payment-worker crashing?","context":{"namespace":"payments","service":"payment-worker"}}'
 curl -sS localhost:18080/admin/traces | python3 -m json.tool | grep -m2 prompt_version
