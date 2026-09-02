@@ -46,8 +46,8 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; review dashboard (Dependencies tab), bare-hostname matching, and a deterministic `dependencies` intent answering in chat and on `/api/query` with no model call (tier1) added 2026-09-01 (ADR 0029 amendment, `docs/SERVICE_DEPENDENCIES.md`) — the FQDN-only rule had left `agentify`/`vault` at zero edges while `payments` passed only because its test workloads logged FQDNs deliberately; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go`, `src/frontend/src/components/TopologyPanel.tsx`, `docs/SERVICE_DEPENDENCIES.md` |
 | **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 | **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P22** | **Architecture Recovery** — point a collector at an unfamiliar cluster and get its architecture back: entry points, call graph, terminal dependencies, ingress exposure, risk notes | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P23** | **Determinism Miner** — mine trace history for model-answered questions a deterministic rule could have answered, and propose the rule | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, risk notes, each carrying its own evidence coverage | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) | this file — ADR at implementation |
 
 ---
 
@@ -1768,20 +1768,38 @@ is more honest and less popular.
 
 ---
 
-## P22 — Architecture Recovery: reconstruct a cluster's architecture from observation (proposed 2026-09-01, was "cluster archaeology")
+## P22 — Architecture Autodoc: a cluster's architecture, regenerated from observation (proposed 2026-09-01, was "cluster archaeology")
 
-**Name.** "Architecture recovery" is the established term for reconstructing a
-system's design from the system itself, so it is searchable and credible
-outside this repo. Considered and rejected: *Cluster Archaeology* (evocative,
-but implies digging through history when the agent describes the present) and
-*Cluster Cartographer* (memorable, kept as the informal name for the output —
-the map).
+**Name — and what it commits us to.** Chosen 2026-09-01 from a considered set:
+*Architecture Recovery* (the established academic term for reconstructing a
+design from the system itself — searchable and credible, but it names the
+method rather than the thing shipped), *Cluster Atlas* (best artefact name;
+an atlas is a bound set of maps, and it scales naturally to a fleet),
+*Site Survey* (frames a one-off assessment), *Handover Report* (the most
+compelling name and the most limiting — it frames a single event),
+*Cluster Archaeology* (implies digging through history when the agent
+describes the present) and *Topology Reconstruction* (sounds graph-only,
+drops ingress and risk notes).
 
-**The pitch:** connect a collector, get your architecture back. Entry points,
-the call graph, terminal dependencies, ingress exposure, version skew, and the
-risks worth knowing — as a written document plus the interactive map
-(`docs/architecture-map.html` is the hand-built proof that the artifact is
-useful; this generates it per cluster).
+"Autodoc" is the most demanding of these, and that is a deliberate choice, so
+it must be honoured rather than quietly softened: **it promises the document
+is always current.** A one-off report that goes stale would be a bait and
+switch under this name. Two consequences follow, and they change the design:
+
+1. **It regenerates on a schedule, not on request.** The collector already
+   pushes inventory, ingress and health every 60s and mines edges continuously;
+   the document is a rendering of that state, not a separate act of
+   investigation.
+2. **Every section must carry its own freshness and coverage**, because a
+   confidently-worded architecture document that is silently 20 minutes or 95%
+   of scans out of date is worse than no document — see P21, which this now
+   hard-depends on rather than merely prefers.
+
+**The pitch:** connect a collector, get your architecture back — and keep
+getting it. Entry points, the call graph, terminal dependencies, ingress
+exposure, version skew, and the risks worth knowing, as a written document plus
+the interactive map (`docs/architecture-map.html` is the hand-built proof that
+the artefact is useful; this generates it per cluster, continuously).
 
 ### Why this is the strongest wedge
 
@@ -1796,11 +1814,12 @@ platform team inherits a cluster and has no idea what it contains.*
 
 ### What it needs first
 
-- **P21.** A recovered architecture that silently omits 95% of an edge's
-  evidence is worse than no document — it will be trusted. The output must
+- **P21, as a hard dependency, not a preference.** A generated architecture
+  that silently omits 95% of an edge's evidence is worse than no document —
+  under a name promising it is current, it will be trusted. Every section must
   carry its own completeness, per service.
-- **OPS-9.** Unreadable multi-container logs cap recovery in exactly the
-  clusters worth selling to.
+- **OPS-9.** Unreadable multi-container logs cap what can be documented at all,
+  in exactly the clusters worth selling to.
 - A document generator. The map already exists; the prose does not.
 
 ### Deliberately out of scope
@@ -1811,14 +1830,27 @@ Git/IaC adapter in the codebase today — and it should not be smuggled in here.
 
 ---
 
-## P23 — Determinism Miner: find the model calls that never needed a model (proposed 2026-09-01, was "Tier-1 candidate miner")
+## P23 — Distillation: distil deterministic rules out of trace history (proposed 2026-09-01, was "Tier-1 candidate miner")
 
-**Name.** Deliberately not "Tier-1 candidate miner": "Tier-1" is internal
-vocabulary from [ADR 0006](decisions/0006-two-tier-query-path.md) and names the
-mechanism rather than the value. *Determinism Miner* names what it finds —
-determinism latent in answers already given. Considered: *Model-Call Auditor*
-(better if the framing is cost governance rather than capability) and *Path
-Demotion Agent* (accurate, unappealing).
+**Name.** Chosen 2026-09-01. Deliberately not "Tier-1 candidate miner":
+"Tier-1" is internal vocabulary from
+[ADR 0006](decisions/0006-two-tier-query-path.md) and names the mechanism
+rather than the value. Also considered: *Determinism Miner* (says what it
+finds, neutral on what happens next), *Rule Distiller* (the same concept as
+the chosen name, with the role suffix this repo's other skills use),
+*Inference Auditor* (governance framing — would have narrowed the item to
+reporting, and naming it that would have got it built that way),
+*Rule Promotion Agent* and *Call Elimination Agent* (the latter implies it
+acts, which it must not).
+
+**"Distillation" here means rules, not models.** In an LLM codebase the word
+usually means training a smaller model to imitate a larger one; this item
+never trains anything and produces no model. It borrows the concept
+deliberately, because the shape is identical and so is the failure mode: you
+reproduce the common case cheaply and **lose the long tail**. That is exactly
+why the eval-set caveat below is a prerequisite rather than a nicety. Any ADR
+or prompt named for this item should say `rule distillation` in full to keep
+the two apart.
 
 **The idea:** every trace already records `intent`, `tier`, `prompt_version`,
 `input_tokens`, `output_tokens` and `estimated_cost_usd`. Mine that history for
