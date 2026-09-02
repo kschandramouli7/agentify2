@@ -45,6 +45,9 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; review dashboard (Dependencies tab), bare-hostname matching, and a deterministic `dependencies` intent answering in chat and on `/api/query` with no model call (tier1) added 2026-09-01 (ADR 0029 amendment, `docs/SERVICE_DEPENDENCIES.md`) — the FQDN-only rule had left `agentify`/`vault` at zero edges while `payments` passed only because its test workloads logged FQDNs deliberately; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go`, `src/frontend/src/components/TopologyPanel.tsx`, `docs/SERVICE_DEPENDENCIES.md` |
 | **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
+| **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P22** | **Architecture Recovery** — point a collector at an unfamiliar cluster and get its architecture back: entry points, call graph, terminal dependencies, ingress exposure, risk notes | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P23** | **Determinism Miner** — mine trace history for model-answered questions a deterministic rule could have answered, and propose the rule | Proposed (2026-09-01) | this file — ADR at implementation |
 
 ---
 
@@ -1708,6 +1711,152 @@ Fixed by giving it evidence (`e4aadf6`): `payment-worker` bursts calls to
 the nginx-based services, and it would have broken log reading for those pods
 entirely — `get_pod_logs` sends no `container` parameter, so the K8s API 400s on
 multi-container pods and the function returns `""` (OPS-9).
+
+---
+
+## P21 — Self-Observability Agent: report where the platform is blind (proposed 2026-09-01)
+
+**Hard truth:** every feature built on the dependency graph inherits the
+graph's completeness, and nothing today measures it. On 2026-09-01 the
+`payments` namespace showed five edges and "Stale edges: 0 · all fresh" while
+`payment-worker`'s two edges were being caught in **5% of scans** (17 sightings
+across ~350 scans). The panel read as healthy. If the miner catches a call it
+already knows about one time in twenty, it is almost certainly missing calls it
+never catches at all — and a capacity or drift feature built on that data would
+produce confident nonsense.
+
+This inverts the product: instead of diagnosing the cluster, diagnose
+agentify's **ability to see** the cluster.
+
+### What it reports
+
+- **Services that never log a hostname.** They can call anything and stay
+  invisible to mining. Structured loggers that record `host` as a field the
+  miner never reads are the common case.
+- **Pods whose logs are unreadable.** `get_pod_logs` sends no `container`
+  parameter, so the K8s API 400s on every multi-container pod (OPS-9). In a
+  mesh cluster that is every pod, and the failure is silent.
+- **Namespaces with many pods and zero edges** — ranked against the eight
+  documented causes in `docs/SERVICE_DEPENDENCIES.md` §4 rather than reported
+  as a flat "no data".
+- **Callers with no Service**, whose mentions are dropped because
+  `from_service` cannot be attributed.
+- **Sampling headroom**: how much of each namespace the 5-pod /
+  200-line window actually covers.
+
+### Why it is agentic rather than a dashboard
+
+The signals are deterministic and cheap; the useful part is the **recommendation
+per finding**, which is a judgement call about someone else's code — "log the
+target host in this client", "your log config needs a container name", "this
+Deployment has no Service so its calls are unattributable". That is worth one
+model call per namespace, not per finding.
+
+### What it needs first
+
+Nothing new. Coverage is already computable from `evidence_count`,
+`first_seen`, `last_seen` and the scan interval — the Dependencies panel
+computes it today. This is the cheapest item on the ladder and the only one
+that tells you whether P22 and the unbuilt spec-011 use cases are standing on
+solid ground.
+
+### Open question
+
+Whether low coverage should **block** downstream features (refuse to forecast
+capacity on a namespace under 25% coverage) or merely annotate them. Blocking
+is more honest and less popular.
+
+---
+
+## P22 — Architecture Recovery: reconstruct a cluster's architecture from observation (proposed 2026-09-01, was "cluster archaeology")
+
+**Name.** "Architecture recovery" is the established term for reconstructing a
+system's design from the system itself, so it is searchable and credible
+outside this repo. Considered and rejected: *Cluster Archaeology* (evocative,
+but implies digging through history when the agent describes the present) and
+*Cluster Cartographer* (memorable, kept as the informal name for the output —
+the map).
+
+**The pitch:** connect a collector, get your architecture back. Entry points,
+the call graph, terminal dependencies, ingress exposure, version skew, and the
+risks worth knowing — as a written document plus the interactive map
+(`docs/architecture-map.html` is the hand-built proof that the artifact is
+useful; this generates it per cluster).
+
+### Why this is the strongest wedge
+
+It exploits the two assets that are genuinely hard to copy: the **outbound-only
+collector** (no inbound access, no cross-account credentials, no VPN — so it
+works in a customer's cluster on day one) and **topology mined from log text**
+(no mesh, no eBPF, no sidecar to install). Every competitor that needs a mesh
+or an agent-per-pod cannot do "10 minutes to first value".
+
+It is also the natural answer to a question nobody else answers well: *a
+platform team inherits a cluster and has no idea what it contains.*
+
+### What it needs first
+
+- **P21.** A recovered architecture that silently omits 95% of an edge's
+  evidence is worse than no document — it will be trusted. The output must
+  carry its own completeness, per service.
+- **OPS-9.** Unreadable multi-container logs cap recovery in exactly the
+  clusters worth selling to.
+- A document generator. The map already exists; the prose does not.
+
+### Deliberately out of scope
+
+Anything requiring declared intent (Git manifests, Helm, Terraform). Comparing
+observed against declared is a different and larger item — there is no
+Git/IaC adapter in the codebase today — and it should not be smuggled in here.
+
+---
+
+## P23 — Determinism Miner: find the model calls that never needed a model (proposed 2026-09-01, was "Tier-1 candidate miner")
+
+**Name.** Deliberately not "Tier-1 candidate miner": "Tier-1" is internal
+vocabulary from [ADR 0006](decisions/0006-two-tier-query-path.md) and names the
+mechanism rather than the value. *Determinism Miner* names what it finds —
+determinism latent in answers already given. Considered: *Model-Call Auditor*
+(better if the framing is cost governance rather than capability) and *Path
+Demotion Agent* (accurate, unappealing).
+
+**The idea:** every trace already records `intent`, `tier`, `prompt_version`,
+`input_tokens`, `output_tokens` and `estimated_cost_usd`. Mine that history for
+questions answered at Tier-2 whose answers a deterministic rule could have
+produced, cluster them, and propose the rule.
+
+Each accepted proposal removes a model call permanently — not a cheaper call, a
+**zero** call. That closes the loop [ADR 0006](decisions/0006-two-tier-query-path.md)
+opened: the two-tier split was designed once by hand and has been extended by
+hand ever since, most recently by the `dependencies` intent on 2026-09-01.
+
+### Why it is different from P19
+
+P19 makes prompts **better**. P23 makes prompts **unnecessary** for a slice of
+traffic. They point in opposite directions and both are worth having; P23 is
+the cheaper of the two and has no prompt-promotion risk, because its output is
+a code proposal reviewed like any other.
+
+### Method sketch
+
+1. Group Tier-2 traces by `intent` and by structural similarity of the answer
+   (the incident embeddings already in `incident_embeddings` are one route).
+2. Flag clusters where the answers are near-identical across differing inputs —
+   the signature of a rule, not of reasoning.
+3. For each cluster, propose the predicate and the response shape, with the
+   historical traces as evidence and the measured spend as the payoff.
+4. A human reviews it as a PR. Nothing self-modifies.
+
+### Honest caveats
+
+- **A 10-item eval set cannot validate a new deterministic path.** Promoting a
+  Tier-2 answer to a rule risks regressing the long tail the model was handling
+  correctly, and today nothing would catch it. Expanding the eval set is a
+  prerequisite, not a nicety.
+- The trace corpus is small. This item gets more valuable with volume and is
+  close to worthless before it.
+- Cost savings are real but currently modest in absolute terms; the stronger
+  argument is **latency** (see P20) and determinism, not spend.
 
 ---
 
