@@ -46,7 +46,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; review dashboard (Dependencies tab), bare-hostname matching, and a deterministic `dependencies` intent answering in chat and on `/api/query` with no model call (tier1) added 2026-09-01 (ADR 0029 amendment, `docs/SERVICE_DEPENDENCIES.md`) — the FQDN-only rule had left `agentify`/`vault` at zero edges while `payments` passed only because its test workloads logged FQDNs deliberately; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go`, `src/frontend/src/components/TopologyPanel.tsx`, `docs/SERVICE_DEPENDENCIES.md` |
 | **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 | **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, risk notes, each carrying its own evidence coverage | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, per-service health, each carrying its own evidence coverage. Data audit done 2026-09-03; blocked on pod→service attribution + P21 | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
@@ -1822,9 +1822,11 @@ switch under this name. Two consequences follow, and they change the design:
 
 **The pitch:** connect a collector, get your architecture back — and keep
 getting it. Entry points, the call graph, terminal dependencies, ingress
-exposure, version skew, and the risks worth knowing, as a written document plus
-the interactive map (`docs/architecture-map.html` is the hand-built proof that
-the artefact is useful; this generates it per cluster, continuously).
+exposure, per-service health, and the risks worth knowing, as a written
+document plus the interactive map (`docs/architecture-map.html` is the
+hand-built proof that the artefact is useful; this generates it per cluster,
+continuously). Version skew was in the original pitch and has moved to v2 —
+see the data audit below for why.
 
 ### Why this is the strongest wedge
 
@@ -1837,15 +1839,73 @@ or an agent-per-pod cannot do "10 minutes to first value".
 It is also the natural answer to a question nobody else answers well: *a
 platform team inherits a cluster and has no idea what it contains.*
 
+### Data audit — done 2026-09-03, before starting
+
+Each section this item promises, checked against the schema rather than
+assumed. Recording it so nobody repeats the audit.
+
+| Section | Source | State |
+|---|---|---|
+| Call graph, entry points, terminal services | `service_dependencies` | **Available.** The Dependencies panel already derives entry/terminal and transitive reach. |
+| Ingress exposure | `cluster_ingress_endpoints` (kind, name, host, backend_service) | **Available.** |
+| Service inventory + selectors | `cluster_services` + `selector JSONB` | **Available.** |
+| K8s version, cluster-wide pod counts | `cluster_health_snapshots` | **Available, but cluster-wide only** — one row per cluster, overwrite-in-place, so no history. |
+| Per-service replicas / ready / restarts | pod events → `current_state` (`phase`, `ready`, `restarts`) | **Data present, not joinable** — see the blocker below. |
+| Version skew per service | deploy events → `current_state` (`images`, `replicas_desired`, `entity_key` = deployment name) | **Data present, not joinable**, and no history to skew against. |
+| Completeness per section | — | **Absent.** P27 phase 1 / P21. |
+
 ### What it needs first
+
+- **Pod → service attribution, Hub-side. Newly found, and a hard blocker for
+  two sections.** `normalize_pod_event`'s payload is `pod_id`, `namespace`,
+  `phase`, `ready`, `restarts` — **no labels**. So although
+  `cluster_services.selector` is right there, the Hub cannot join a pod to its
+  Service, and the same gap applies to deployment → service. The consequence is
+  concrete: this item cannot write *"payment-api has 2 pods, 0 ready"* — the
+  exact risk note it promises — even though both halves of the data are
+  already stored.
+
+  The selector match only ever happens **in the collector**
+  (`_service_for_pod`) and **in the Glue miner** (`_service_for_labels`).
+  Cheapest fix is therefore to have the collector resolve `service` at push
+  time, since it already computes it; adding `labels` to the payload would also
+  work but ships data nothing else needs.
 
 - **P21, as a hard dependency, not a preference.** A generated architecture
   that silently omits 95% of an edge's evidence is worse than no document —
   under a name promising it is current, it will be trusted. Every section must
-  carry its own completeness, per service.
-- **OPS-9.** Unreadable multi-container logs cap what can be documented at all,
-  in exactly the clusters worth selling to.
-- A document generator. The map already exists; the prose does not.
+  carry its own completeness, per service. In turn P21 wants **P27 phase 1**,
+  so the completeness is measured rather than inferred.
+
+- **OPS-9 — blocks *shipping*, not *building*.** Every current workload is
+  single-container, so development against this cluster works today. In any
+  service-mesh cluster the mined half goes dark, which is exactly the kind of
+  cluster worth selling to. Not a reason to wait; a reason not to demo.
+
+- **A document generator.** The map exists but is hand-authored with hardcoded
+  node coordinates; generating it per cluster means parameterising it from the
+  read APIs (`/api/service-dependencies`, `/api/cluster-ingress`,
+  `/api/cluster-health`, `/api/cluster-service-selectors`, `/admin/tracked` —
+  all already present). The prose generator does not exist at all.
+
+### Not a blocker, though it looks like one
+
+**OPS-5** (`payment-worker` flapping since 2026-09-01) is arguably a **test
+case** rather than an obstacle: an honest autodoc should say "this service is
+flapping and its dependencies are only observed in 2% of scans". It does make
+validation harder — ground truth is unstable while you are checking whether the
+generator is right — so fixing it first is convenient, not required.
+
+### Scope split, so v1 does not ship with empty sections
+
+**v1 — sourceable today (after the two hard blockers above):**
+call graph, entry points and terminal services, ingress exposure, per-service
+health, and per-section coverage.
+
+**v2 — needs new capture:**
+version skew over time (`cluster_health_snapshots` is overwrite-in-place by
+design, so there is no history; and P27 phase 5 covers image-at-observation),
+and anything derived from utilisation rather than restart counts.
 
 ### Deliberately out of scope
 
