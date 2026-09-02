@@ -1907,6 +1907,15 @@ version skew over time (`cluster_health_snapshots` is overwrite-in-place by
 design, so there is no history; and P27 phase 5 covers image-at-observation),
 and anything derived from utilisation rather than restart counts.
 
+**One constraint found while wiring the attribution (2026-09-03):** the ADR
+0007 egress allowlist permits `service` on a payload, so per-service health
+reaches the agent — but **`images`, `replicas_desired`, `deployment`,
+`revision` and `change` are all dropped**. So a v2 version-skew section cannot
+be written by an agent skill reading through `/api/query`; it must either be a
+Hub-side generator reading Postgres directly (redaction does not apply there,
+by design — it is an *egress* control), or the allowlist must be extended,
+which revises ADR 0007 and is a decision rather than a patch.
+
 ### Deliberately out of scope
 
 Anything requiring declared intent (Git manifests, Helm, Terraform). Comparing

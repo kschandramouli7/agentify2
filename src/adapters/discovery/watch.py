@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict
 
 from . import k8s_client, normalize
+from .service_index import INDEX
 from .config import Config
 
 logger = logging.getLogger("agentify.discovery.watch")
@@ -62,10 +63,18 @@ async def _watch_loop(name: str, path: str, cfg: Config, shutdown: asyncio.Event
 
 
 async def _handle_pod_event(event_type: str, pod: Dict[str, Any], cfg: Config) -> None:
-    await normalize.push_event(normalize.normalize_pod_event(pod, event_type), cfg.backend_url, cfg.collector_token)
+    metadata = pod.get("metadata", {})
+    service = INDEX.resolve(metadata.get("namespace", ""), metadata.get("labels") or {})
+    await normalize.push_event(
+        normalize.normalize_pod_event(pod, event_type, service), cfg.backend_url, cfg.collector_token
+    )
 
 
 async def _handle_service_event(event_type: str, svc: Dict[str, Any], cfg: Config) -> None:
+    # Index BEFORE pushing: a Service's own ADDED event is the earliest moment
+    # its selector is known, and pods in that namespace may already be queued
+    # behind it on the other stream.
+    INDEX.apply_service_event(event_type, svc)
     await normalize.push_event(normalize.normalize_service_event(svc, event_type), cfg.backend_url, cfg.collector_token)
 
 
@@ -87,7 +96,15 @@ def _make_deployment_handler():
         if not revision or deploy_revisions.get(key) == revision:
             return
         deploy_revisions[key] = revision
-        await normalize.push_event(normalize.normalize_deploy_event(dep, revision), cfg.backend_url, cfg.collector_token)
+        # The pod TEMPLATE labels are what a Service selects on; a Deployment's
+        # own metadata labels frequently differ.
+        template_labels = (
+            ((dep.get("spec", {}) or {}).get("template", {}) or {}).get("metadata", {}) or {}
+        ).get("labels") or {}
+        service = INDEX.resolve(metadata.get("namespace", ""), template_labels)
+        await normalize.push_event(
+            normalize.normalize_deploy_event(dep, revision, service), cfg.backend_url, cfg.collector_token
+        )
 
     return handle
 

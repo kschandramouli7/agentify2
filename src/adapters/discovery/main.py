@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from . import k8s_client, live_relay, normalize, watch
 from .config import Config, load_from_env
+from .service_index import INDEX, service_for_labels
 from .health import serve_health
 from .health_snapshot import push_health
 from .ingress import build_ingress_entries, build_route_entries, correlate_gateway_routes, push_ingress
@@ -45,19 +46,21 @@ def _configure_logging() -> None:
 
 
 def _service_for_pod(pod_labels: Dict[str, str], services: List[Dict[str, Any]]) -> Optional[str]:
-    """Which Service (by name) a pod belongs to, via the same label-selector
-    matching K8s itself uses to build Service endpoints — not a pod-name
-    heuristic. A Service with an empty selector (e.g. manually-managed
-    Endpoints) never matches."""
-    for svc in services:
-        selector = svc["selector"]
-        if selector and all(pod_labels.get(k) == v for k, v in selector.items()):
-            return svc["name"]
-    return None
+    """Which Service (by name) a pod belongs to.
+
+    Thin wrapper kept for this module's callers and tests; the implementation
+    moved to service_index so watch.py can share it (main imports watch, so the
+    reverse import would be circular).
+    """
+    return service_for_labels(pod_labels, services)
 
 
 async def _scan_namespace(ns: str, cfg: Config) -> None:
     services = await k8s_client.list_services(ns)
+    # Seed the shared index from the list this scan already fetched. Free, and
+    # it closes the startup window in which the pods watch can deliver events
+    # before the services watch has been heard from.
+    INDEX.seed(ns, services)
     known = {s["name"] for s in services}
     if not known:
         return
@@ -226,7 +229,17 @@ async def _run(cfg: Config, shutdown: asyncio.Event) -> None:
     while not shutdown.is_set():
         logger.info("scan cycle starting")
         await _scan_once(cfg, caps)
-        logger.info("scan cycle complete")
+        # Attribution coverage, every cycle. A `service` field that is silently
+        # absent on most pod events would be believed by everything downstream;
+        # this is the counter that makes that visible instead (ROADMAP P27).
+        cov = INDEX.coverage()
+        logger.info(
+            "scan cycle complete (pod->service attribution: %s of %s resolved%s, %s namespaces indexed, "
+            "%s attempts against an unindexed namespace)",
+            cov["resolved"], cov["attempts"],
+            "" if cov["rate"] is None else f" = {cov['rate'] * 100:.0f}%",
+            cov["namespaces_indexed"], cov["unindexed_namespace"],
+        )
         try:
             await asyncio.wait_for(shutdown.wait(), timeout=cfg.scan_interval_seconds)
         except asyncio.TimeoutError:

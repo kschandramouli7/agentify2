@@ -104,8 +104,21 @@ def _is_pod_ready(pod: Dict[str, Any]) -> bool:
     return False
 
 
-def normalize_pod_event(pod: Dict[str, Any], event_type: str) -> Dict[str, Any]:
-    """Convert a watch event for a pod into a canonical event."""
+def normalize_pod_event(
+    pod: Dict[str, Any], event_type: str, service: Optional[str] = None
+) -> Dict[str, Any]:
+    """Convert a watch event for a pod into a canonical event.
+
+    `service` is the Service this pod belongs to, resolved by the caller via
+    service_index. It is attributed HERE, at push time, rather than by shipping
+    pod labels for the Hub to match: the collector already does this matching
+    for dependency mining, and the Hub has no matcher at all. Without it,
+    nothing downstream can aggregate pod health per service (ROADMAP P22).
+
+    Omitted from the payload when unresolved rather than sent as null, so a
+    consumer cannot mistake "no Service selects this pod" for "attributed to
+    nothing".
+    """
     metadata = pod.get("metadata", {})
     status = pod.get("status", {})
     payload = {
@@ -115,6 +128,8 @@ def normalize_pod_event(pod: Dict[str, Any], event_type: str) -> Dict[str, Any]:
         "ready": _is_pod_ready(pod),
         "restarts": _total_restarts(pod),
     }
+    if service:
+        payload["service"] = service
     return _canonical_event(
         event_namespace="k8fy.live-state",
         event_type=f"pod_{event_type.lower()}",
@@ -159,7 +174,9 @@ def normalize_metric_event(pod_name: str, namespace: str, container: str, restar
     )
 
 
-def normalize_deploy_event(deployment: Dict[str, Any], revision: str) -> Dict[str, Any]:
+def normalize_deploy_event(
+    deployment: Dict[str, Any], revision: str, service: Optional[str] = None
+) -> Dict[str, Any]:
     """Convert a Deployment rollout (revision change) into an append-only
     event. Emitted to k8fy.events so diagnosis can align a rollout time with
     a symptom onset (spec 007) — a change record, not current state; every
@@ -175,6 +192,12 @@ def normalize_deploy_event(deployment: Dict[str, Any], revision: str) -> Dict[st
         "replicas_desired": spec.get("replicas"),
         "change": "rollout",
     }
+    # Resolved from the Deployment's POD TEMPLATE labels, not its own metadata
+    # labels — a Service selects the pods, and the two label sets are commonly
+    # different. Lets a consumer answer "what image is payment-api running"
+    # without a second join.
+    if service:
+        payload["service"] = service
     return _canonical_event(
         event_namespace="k8fy.events",
         event_type="deploy",
