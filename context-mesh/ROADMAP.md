@@ -48,6 +48,18 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, risk notes, each carrying its own evidence coverage | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
+
+**How P21–P26 relate.** agentify is, structurally, an **evidence engine**: the
+collector turns an opaque cluster into evidence that is otherwise expensive to
+obtain (no mesh, no eBPF, no inbound access). Each item above is one
+transformation of that evidence — **→ policy** (P24), **→ causality** (P25,
+P26), **→ risk** (P22), **→ action** (the existing remediation path) — and
+**P21 is the quality gate on the evidence itself**, which is why every one of
+the others depends on it. An item that does not consume or improve the evidence
+is probably somebody else's product.
 
 ---
 
@@ -1889,6 +1901,156 @@ a code proposal reviewed like any other.
   close to worthless before it.
 - Cost savings are real but currently modest in absolute terms; the stronger
   argument is **latency** (see P20) and determinism, not spend.
+
+---
+
+## P24 — Policy Synthesis: turn the observed call graph into enforceable config (proposed 2026-09-01)
+
+**Name.** *Policy Synthesis*, chosen over *Least-Privilege Synthesis* — which
+is accurate for the first deliverable and too narrow for the item, since
+PodDisruptionBudgets and resource requests are not least-privilege concerns.
+"Synthesis" is doing real work in the name: this **writes** config, where
+P18 use case #8 only **assesses** whether policies exist.
+
+**Hard truth, before the pitch:** this is the first proposed feature where
+being wrong **breaks production** rather than merely misinforms. Every other
+item degrades into a bad answer; this one degrades into a dropped packet. The
+dependency graph is a lower bound *by construction* — an edge exists only where
+a caller logged the callee's hostname — so a generated default-deny policy is
+wrong by default, in the dangerous direction.
+
+That is not an argument against building it. It is the argument for the
+constraints below being non-negotiable.
+
+### Why it is worth the risk
+
+Almost nobody writes NetworkPolicies, because almost nobody knows their own
+call graph. **We mine the call graph.** That is the single most valuable thing
+the mining asset unlocks, and it converts a security/compliance obligation that
+teams defer indefinitely into a reviewable diff.
+
+### Non-negotiable constraints
+
+1. **Audit mode only. It generates; it never applies.** No auto-apply, no
+   "enforce after N days". The output is a manifest for review.
+2. **A coverage floor per namespace.** Refuse to emit for any namespace whose
+   evidence coverage is below a threshold (P21). Refusing is the feature.
+3. **A backtest with every emission:** "this policy would have blocked N calls
+   we observed in the last 7 days" — computed from the edge history, not
+   asserted. A non-zero N is a hard stop, not a footnote.
+4. **Name the known blind spots explicitly in the output.** DNS, egress to
+   external APIs, init containers, sidecars, and anything on a multi-container
+   pod (OPS-9) are places we are structurally likely to have seen nothing.
+
+### Why it is agentic rather than a template
+
+Emitting the YAML is deterministic. The judgement is in **what is absent**:
+"there is no observed DNS egress from this namespace, which means either
+nothing resolves names — implausible — or we cannot see it." Reasoning about
+the shape of a gap is not a template, and it is the part that stops the feature
+being dangerous. One model call per namespace, not per rule.
+
+### Phasing
+
+- **Phase 1 — NetworkPolicy.** Highest value, highest risk, all inputs exist.
+- **Phase 2 — PodDisruptionBudgets**, weighted by *transitive dependents*
+  (`reach()` already computes this), so criticality is derived rather than
+  guessed.
+- **Phase 3 — resource requests.** Blocked: restart counts are not utilisation,
+  and nothing collects per-container CPU/memory at the granularity this needs.
+
+---
+
+## P25 — Change Correlation: rank which recent change could explain a symptom (proposed 2026-09-01)
+
+**Name — and the claim it deliberately does not make.** Proposed as "change →
+incident causality" and renamed: **the system cannot establish causation.** It
+can rank candidate changes by temporal proximity and graph reachability, which
+is correlation plus a topology prior. Naming it *Causality* would overclaim in
+exactly the way this repo has repeatedly had to correct — `evidence_count` is
+confidence, not traffic volume; an edge is logged evidence, not an observed
+flow. *Change Correlation* keeps the honesty in the name. *Blame Engine* was
+considered and rejected for the obvious reason.
+
+**Hard truth:** MTTR in a real organisation is dominated by one question —
+*"which of the 47 changes in the last six hours did this?"* — and answering it
+badly is worse than not answering, because a confident wrong suspect sends a
+team down a dead end while the outage continues.
+
+### Why we can attempt it at all
+
+Four inputs already exist, and the third is the one competitors lack:
+
+1. **Change history** (`ChangeHistorySkill`, spec 007) — what changed and when.
+2. **Temporal proximity** — traces and events give the symptom a timestamp.
+3. **Graph reachability** — only a change *upstream* of the symptom is even a
+   candidate. This is the filter that turns 47 changes into 3, and it is only
+   possible because the call graph is mined.
+4. **Semantic memory** (`incident_embeddings`) — "this is the third time", with
+   what resolved it before.
+
+Ranking is then temporal proximity × graph distance × prior incidence.
+
+### The failure mode to design against
+
+**Confidently blaming the nearest deploy.** The output must be able to say
+*"none of the changes I can see explains this"*, and must always show the
+unexplained residue rather than forcing a top suspect. Changes we structurally
+cannot see include: values in Secrets, feature flags, upstream provider
+incidents, and anything applied outside the clusters we collect from. Those
+must be listed as blind spots on every answer, not discovered by the operator
+after an hour.
+
+### What it needs first
+
+- **P21**, because a graph missing edges silently removes real suspects — the
+  worst possible failure for this feature.
+- Change events captured reliably across every collected cluster; today's
+  coverage is per-cluster and unverified at fleet scale.
+
+---
+
+## P26 — Incident Narrative: reconstruct what happened, as the input to a human review (proposed 2026-09-01)
+
+**Name.** *Incident Narrative*, not *Postmortem Generator*. The distinction is
+substantive rather than cosmetic: a post-incident review is a **human ritual**
+with the purpose of organisational learning, and this item produces an *input*
+to it — the assembled timeline and evidence — not a replacement for it.
+Claiming to generate the postmortem would invite teams to skip the part that
+has the value.
+
+**Hard truth:** a fluent narrative is persuasive whether or not it is correct,
+which makes this the most dangerous **output shape** in the product. Prose
+smooths over gaps that a table would expose. So every claim in the narrative
+must cite the evidence it rests on, and every gap must be stated in the
+narrative itself rather than omitted for readability.
+
+### What it assembles
+
+- The timeline, from traces, K8s events, and change history.
+- What the symptom was, and which services were affected — with blast radius
+  from the graph, so "affected" is derived rather than asserted.
+- Whether this has happened before, via `incident_embeddings`, and what
+  resolved it then.
+- What the platform could not see, per section.
+
+### Why it is worth building
+
+Every organisation does this manually and does it badly, because reconstruction
+is tedious and happens when everyone is tired. It is also the item with the
+clearest artefact: a document someone would otherwise have spent two hours
+assembling.
+
+Distinct from **spec 011 use case #4 (SRE Knowledge Builder)**, which builds a
+durable knowledge base. This produces a single document about a single
+incident; UC4 would consume its output.
+
+### What it needs first
+
+**P25.** Without it, the "what changed" section is a list rather than a ranked
+set of suspects — a timeline with no explanation, which is the tedious half of
+the work but not the valuable half. Building P26 before P25 produces something
+that looks finished and is not.
 
 ---
 
