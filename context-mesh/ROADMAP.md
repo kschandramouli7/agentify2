@@ -51,15 +51,19 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | Proposed (2026-09-03) | this file — ADR at implementation |
 
-**How P21–P26 relate.** agentify is, structurally, an **evidence engine**: the
+**How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
-obtain (no mesh, no eBPF, no inbound access). Each item above is one
+obtain (no mesh, no eBPF, no inbound access). Most items above are one
 transformation of that evidence — **→ policy** (P24), **→ causality** (P25,
-P26), **→ risk** (P22), **→ action** (the existing remediation path) — and
-**P21 is the quality gate on the evidence itself**, which is why every one of
-the others depends on it. An item that does not consume or improve the evidence
-is probably somebody else's product.
+P26), **→ risk** (P22), **→ action** (the existing remediation path).
+
+Two items act on the evidence itself rather than transforming it, and every
+other item depends on them: **P21** is its quality gate (how much of the truth
+do we actually see) and **P27** its depth (how much of what we see do we
+bother to keep). An item that neither consumes nor improves the evidence is
+probably somebody else's product.
 
 ---
 
@@ -1772,6 +1776,15 @@ computes it today. This is the cheapest item on the ladder and the only one
 that tells you whether P22 and the unbuilt spec-011 use cases are standing on
 solid ground.
 
+**Relationship to P27, so the two do not read as rivals.** A v1 can ship on
+today's *inferred* coverage, which is why this item claims to need nothing.
+But inferred coverage cannot distinguish "called less often" from "logs became
+unreadable" from "pod not among the five sampled" — the exact ambiguity that
+made `payment-worker`'s decline uninterpretable on 2026-09-03. **P27 phase 1
+replaces the inference with a measured denominator**, and this item's findings
+get sharply better the moment it lands. Ship v1 on inference; do not design as
+if inference were the end state.
+
 ### Open question
 
 Whether low coverage should **block** downstream features (refuse to forecast
@@ -1952,7 +1965,11 @@ being dangerous. One model call per namespace, not per rule.
 
 ### Phasing
 
-- **Phase 1 — NetworkPolicy.** Highest value, highest risk, all inputs exist.
+- **Phase 1 — NetworkPolicy.** Highest value, highest risk. **Blocked on P27
+  phase 2**: the graph stores no port, so a generated policy could only say
+  "allow all ports" — which is not least privilege, and would make the feature
+  a compliance checkbox rather than a control. "All inputs exist" was written
+  here on 2026-09-01 and was wrong.
 - **Phase 2 — PodDisruptionBudgets**, weighted by *transitive dependents*
   (`reach()` already computes this), so criticality is derived rather than
   guessed.
@@ -2051,6 +2068,117 @@ incident; UC4 would consume its output.
 set of suspects — a timeline with no explanation, which is the tedious half of
 the work but not the valuable half. Building P26 before P25 produces something
 that looks finished and is not.
+
+---
+
+## P27 — Edge Enrichment: capture what the log line already contains (proposed 2026-09-03)
+
+**Hard truth:** a dependency edge is four facts — `from_service`,
+`to_service`, `evidence_count`, `first_seen`/`last_seen` — and everything else
+in the line is thrown away. The consequence is not subtle: **a healthy call and
+a failed one produce identical rows.**
+
+```
+payment-batch: called https://payment-api…/charge ok            → ['payment-api']
+payment-batch: called https://payment…/ unreachable             → ['payment']
+upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3) → ['payment-api']
+GET http://vault.vault.svc…:8200/v1/pki/issue -> 200            → dropped entirely
+```
+
+Discarded across those lines: port, scheme, path, outcome, latency, retry
+state, and every cross-namespace edge.
+
+**The observation that prompted this.** On 2026-09-03 `payment-worker`'s two
+edges read 51 sightings over ~38h — 2.2% of scans — and were stale at 15
+minutes. Compared against 2026-09-01 (17 sightings over ~5.8h, 4.9%), the
+34 sightings gained in between fell over ~1932 scans: **1.8%**. The rate is
+*declining*, and the schema cannot distinguish the three candidate causes:
+the service is calling less often, its logs became unreadable, or its pod
+stopped being among the five sampled. Three different problems, one
+indistinguishable symptom.
+
+### Phase 1 — the denominator (this is also P21's measurement half)
+
+Record, per `(namespace, service, scan cycle)`: was the pod sampled? were its
+logs readable? how many lines came back? That turns coverage from a ratio
+*inferred* from `evidence_count` into a measured fraction with a known
+denominator, and it answers the `payment-worker` question above directly.
+
+**Ownership, so this is not built twice:** P27 phase 1 produces the
+measurement substrate; **P21 consumes and reports on it.** P21 is the agent
+and the recommendations; this is the data it needs to exist.
+
+### Phase 2 — outcome and port (pure parsing wins, biggest payoff)
+
+- **Outcome counters** — success / failure / timeout, and retry state where
+  present. This is the single largest information loss today: it converts a
+  topology graph into a **health** graph, and "is this dependency working"
+  is a more useful question than "does it exist".
+- **Port and scheme** — **P24 is not buildable without this.** A NetworkPolicy
+  with no port can only say `allow all ports`.
+
+*Caveat:* outcome vocabulary is per-logger (`ok`, `unreachable`, `200`, `503`,
+`timeout`), so this needs a normaliser and will be partial. Partial is fine;
+*silently* partial is not — see the warning below.
+
+### Phase 3 — reach past the namespace boundary
+
+Cross-namespace edges (`vault.vault`) and external egress
+(`api.anthropic.com`) are dropped **by design** today, because the miner
+validates candidates against one namespace's Service list. Capturing them:
+
+- gives an **egress inventory** nobody currently has, which is valuable on its
+  own for security review;
+- is required for NetworkPolicy **egress** rules, so P24 is incomplete without
+  it.
+
+*Caveat:* an external host cannot be validated against a Service list, so these
+must be stored in a separate, lower trust tier and never mixed with in-cluster
+edges in a policy without review.
+
+### Phase 4 — provenance and shape
+
+- **Provenance** — which miner found the edge (live, Glue, agent skill; three
+  producers write to one table and are currently indistinguishable) and
+  whether it matched a qualified FQDN or a bare name. Bare matches are weaker
+  evidence and should be weightable as such.
+- **Caller cardinality** — how many distinct pods made the call. "1 of 5
+  replicas" versus "all 5" is a large semantic difference (leader-only,
+  sharded, mid-canary) that is currently aggregated away.
+- **Bucketed evidence** instead of a running total — a single counter cannot
+  separate steady traffic from a 02:00 daily burst, and it would have made the
+  decline above visible directly rather than by arithmetic.
+- **Path / operation class** — `/health` versus `/charge`. A probe-only edge is
+  a far weaker dependency, and both P24 and any SPOF analysis will over-weight
+  probes without this.
+
+### Phase 5 — deferred
+
+- **Latency where logged** → feeds P25 ("this dependency got slower").
+- **Image/version at time of observation** → also P25 ("this edge appeared at
+  `payment-worker` v1.2, disappeared at v1.3").
+
+### The one schema decision
+
+Split rows on port: `(tenant_id, cluster_id, namespace, from_service,
+to_service, port)`, with outcomes as counters on that row. Aggregating ports
+into a single edge loses exactly the field P24 needs. Cost accepted: row count
+grows with the number of distinct ports per pair, which in practice is small.
+
+### The warning that matters more than any of the fields
+
+**Every field added is another thing that can be silently empty and then
+trusted.** This repository's recent history is a run of subsystems reporting
+success while observing nothing: tracing that swallowed a real 401, an
+embedding FK that never inserted, an FQDN-only matcher that left two
+namespaces at zero edges while a third passed only because its test workloads
+were written to satisfy it, and `evidence_count` read as traffic volume when
+it measures neither traffic nor, on its own, confidence.
+
+So every field here ships with **its own capture-rate counter, surfaced in the
+UI** — "port known for 62% of edges" — or it will be believed when it is
+empty. That is not gold-plating; it is the only thing that has reliably caught
+this class of bug in this codebase.
 
 ---
 
