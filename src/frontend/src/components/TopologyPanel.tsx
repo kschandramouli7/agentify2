@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { listServiceDependencies, type ServiceDependency } from "../api";
-import { DependencyFlow, confidence, rarelyObserved } from "./DependencyFlow";
+import {
+  listServiceDependencies, listClusterIngress, listScanCoverage,
+  type ServiceDependency,
+} from "../api";
+import { DependencyFlow, confidence, rarelyObserved, type FlowEdge, type NodeMeta } from "./DependencyFlow";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
 //
@@ -230,7 +233,85 @@ export function TopologyPanel() {
     enabled: applied.length > 0,
   });
 
+  // The three sources that turn a call graph into an architecture view. All
+  // best-effort: each degrades to empty rather than blanking the panel, because
+  // the mined graph on its own is still worth showing.
+  const { data: ingress = [] } = useQuery({
+    queryKey: ["cluster-ingress", applied],
+    queryFn: () => listClusterIngress(applied),
+    enabled: applied.length > 0,
+  });
+  const { data: coverage = [] } = useQuery({
+    queryKey: ["scan-coverage", applied],
+    queryFn: () => listScanCoverage(applied),
+    enabled: applied.length > 0,
+  });
+  // Full service inventory for this namespace, from the same /admin/tracked
+  // the namespace picker already reads. This is what makes services with no
+  // observed edges appear at all.
+  const { data: inventory = [] } = useQuery({
+    queryKey: ["tracked-services", applied],
+    queryFn: async () => {
+      const res = await fetch("/admin/tracked");
+      if (!res.ok) return [] as string[];
+      const pairs = (await res.json()) as string[] | null;
+      return (pairs ?? [])
+        .filter(p => p.startsWith(`${applied}/`))
+        .map(p => p.slice(applied.length + 1))
+        .filter(Boolean);
+    },
+    enabled: applied.length > 0,
+  });
+
   const graph = useMemo(() => buildGraph(data ?? []), [data]);
+
+  // Declared entry points become synthetic nodes and edges. Their ids are
+  // prefixed so they can never collide with a real service name.
+  const arch = useMemo(() => {
+    const edges: FlowEdge[] = [...(data ?? [])];
+    const meta = new Map<string, NodeMeta>();
+    const now = new Date().toISOString();
+
+    for (const svc of inventory) meta.set(svc, { kind: "service" });
+
+    for (const e of ingress) {
+      if (!e.backend_service) continue;                 // nothing to point at
+      // Prefixed so an entry point can never collide with a service name;
+      // `label` is what actually gets drawn.
+      const shown = e.host || e.name;
+      const id = `ingress:${shown}`;
+      meta.set(id, { kind: "ingress", host: shown, label: shown });
+      edges.push({
+        id: `ingress:${e.kind}:${e.name}:${e.host}:${e.backend_service}`,
+        namespace: applied,
+        from_service: id,
+        to_service: e.backend_service,
+        evidence_count: 0,
+        // A declared route has no observation window; these satisfy the type
+        // and are never read, because `kind: "declared"` short-circuits every
+        // confidence and freshness path.
+        first_seen: now,
+        last_seen: now,
+        tenant_id: "",
+        kind: "declared",
+      });
+    }
+
+    for (const c of coverage) {
+      const prev = meta.get(c.service) ?? { kind: "service" as const };
+      meta.set(c.service, {
+        ...prev,
+        coverage: c.pods_seen > 0 ? c.pods_sampled / c.pods_seen : null,
+        podsSeen: c.pods_seen,
+        podsSampled: c.pods_sampled,
+      });
+    }
+
+    // Services in the inventory that no edge (observed or declared) mentions.
+    const referenced = new Set(edges.flatMap(e => [e.from_service, e.to_service]));
+    const standalone = inventory.filter(s => !referenced.has(s));
+    return { edges, meta, standalone };
+  }, [data, ingress, coverage, inventory, applied]);
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
   const rare = useMemo(() => rarelyObserved(graph.edges), [graph.edges]);
@@ -242,10 +323,14 @@ export function TopologyPanel() {
         <div>
           <h2>Service Dependencies</h2>
           <p className="adm-panel__desc">
-            Mined from pod logs, not observed on the network — an edge exists only where a
-            caller logged the callee's hostname. A missing edge means <em>no evidence</em>,
-            not <em>no dependency</em>. Counts are how many scan cycles saw the call, so they
-            measure <em>confidence, not traffic volume</em>.
+            Every service in the namespace, its declared entry points, and the calls actually
+            observed between them. <strong>Solid arrows are mined from pod logs</strong> — an
+            edge exists only where a caller logged the callee's hostname, so a missing one
+            means <em>no evidence</em>, not <em>no dependency</em>, and the counts are scan
+            cycles, measuring <em>confidence, not traffic</em>. <strong>Dashed purple arrows
+            are declared routes</strong> read from Kubernetes Ingress objects — facts, with no
+            count. A dashed box is a service the inventory knows about that no observed call
+            mentions.
           </p>
         </div>
         <div className="adm-filters">
@@ -293,9 +378,12 @@ export function TopologyPanel() {
         <p className="adm-error">{error instanceof Error ? error.message : "Failed to load dependencies."}</p>
       )}
 
-      {!isLoading && !isError && graph.edges.length === 0 && (
+      {!isLoading && !isError && graph.edges.length === 0 && arch.standalone.length === 0 && (
         <div className="adm-empty">
-          <p>No dependency evidence for <strong>{applied}</strong>.</p>
+          <p>
+            No dependency evidence for <strong>{applied}</strong>
+            {inventory.length > 0 && <> — and no services in the inventory either</>}.
+          </p>
           <p className="adm-muted">
             Expected when nothing in the namespace logs a callee's hostname. The miner needs
             the caller to have a Service (to attribute <code>from_service</code>) and to print
@@ -306,11 +394,23 @@ export function TopologyPanel() {
         </div>
       )}
 
-      {graph.edges.length > 0 && (
+      {(graph.edges.length > 0 || arch.standalone.length > 0) && (
         <>
           <div className="adm-stats-row">
-            <StatCard label="Services" value={String(graph.services.length)} />
-            <StatCard label="Edges" value={String(graph.edges.length)} />
+            <StatCard
+              label="Services"
+              value={String(Math.max(inventory.length, graph.services.length))}
+              sub={
+                arch.standalone.length > 0
+                  ? `${arch.standalone.length} with no observed calls`
+                  : "all appear in the graph"
+              }
+            />
+            <StatCard
+              label="Observed calls"
+              value={String(graph.edges.length)}
+              sub={ingress.length > 0 ? `+ ${ingress.length} declared route${ingress.length === 1 ? "" : "s"}` : undefined}
+            />
             <StatCard
               label="Entry points"
               value={String(graph.entries.length)}
@@ -339,7 +439,13 @@ export function TopologyPanel() {
             </p>
           )}
 
-          <DependencyFlow edges={graph.edges} focus={selected} onFocus={setFocus} />
+          <DependencyFlow
+            edges={arch.edges}
+            standalone={arch.standalone}
+            meta={arch.meta}
+            focus={selected}
+            onFocus={setFocus}
+          />
 
           <div className="topo-focus">
             <div className="topo-focus__services">

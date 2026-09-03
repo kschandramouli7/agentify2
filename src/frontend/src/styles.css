@@ -2979,6 +2979,21 @@ code {
    rather than a colour — colour is spoken for by focus, and status hues are
    reserved. */
 .flow__line--stale { stroke-dasharray: 5 4; }
+/* A DECLARED route (from a Kubernetes Ingress object) is a fact; an observed
+   edge is evidence. Drawing them identically would conflate two different
+   claims — the same class of mistake as rendering a sighting count as traffic.
+   Long dashes plus a distinct hue, and the legend names both. */
+.flow__line--declared { stroke: var(--ai, #8b7fd4); stroke-dasharray: 10 5; }
+.flow__edge--on .flow__line--declared { stroke: var(--ai, #8b7fd4); }
+.flow__inline-declared { color: var(--ai, #8b7fd4); font-weight: 600; }
+
+/* An entry point from outside the cluster. */
+.flow__node--ingress .flow__box { stroke: var(--ai, #8b7fd4); stroke-dasharray: none; }
+
+/* Present in the cluster, absent from the evidence. Dashed outline rather than
+   dimmed: dimming reads as "less important", where the truth is "not seen". */
+.flow__node--unobserved .flow__box { stroke-dasharray: 4 3; }
+.flow__node--unobserved .flow__sub { font-style: italic; }
 .flow__edge--on .flow__line { stroke: var(--accent); }
 .flow__arrowhead { fill: var(--dim); }
 .flow__arrowhead--on { fill: var(--accent); }

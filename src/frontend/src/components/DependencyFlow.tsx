@@ -1,6 +1,46 @@
 import { useMemo } from "react";
 import { type ServiceDependency } from "../api";
 
+/**
+ * An edge on the diagram. `kind` separates two categorically different claims
+ * that must never be conflated:
+ *
+ *   observed — mined from a log line. Evidence, therefore a LOWER BOUND, with
+ *              a confidence band and a sighting count.
+ *   declared — read from a Kubernetes object (an Ingress / HTTPRoute / Route).
+ *              A fact. No confidence, no count, and its absence means the
+ *              object does not exist rather than "we saw nothing".
+ *
+ * Drawing them identically would repeat the mistake this panel already made
+ * once, when a sighting count was rendered as though it were traffic volume.
+ */
+export type FlowEdge = ServiceDependency & { kind?: "observed" | "declared" };
+
+/** Extra facts about a node, from inventory rather than from the edges. */
+export type NodeMeta = {
+  /** "service" (a real Kubernetes Service) or "ingress" (an entry point). */
+  kind?: "service" | "ingress";
+  /** Fraction of scans in which this service's pods were readable, if known. */
+  coverage?: number | null;
+  /** Pods attributed to it / pods actually sampled, if known. */
+  podsSeen?: number;
+  podsSampled?: number;
+  /** True when inventory lists it but no edge references it. */
+  unobserved?: boolean;
+  /** For an ingress node: the host it serves. */
+  host?: string;
+  /** What to draw in the box. The id must stay unique and collision-proof
+   *  (an ingress id is prefixed), which makes it the wrong thing to display. */
+  label?: string;
+};
+
+/** Fit a string to the node box. Hostnames are the reason this exists —
+ *  "agentify-dev.elb.amazonaws.com" is twice the width of the box and spilled
+ *  outside it. */
+function fit(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
 // Left-to-right dataflow diagram of the mined service graph.
 //
 // HISTORY, BECAUSE IT EXPLAINS THE SHAPE
@@ -84,7 +124,7 @@ export type Confidence = {
   coverage: number | null;
 };
 
-export function confidence(e: ServiceDependency): Confidence {
+export function confidence(e: FlowEdge): Confidence {
   const first = new Date(e.first_seen).getTime();
   const last = new Date(e.last_seen).getTime();
   const spanScans = Number.isFinite(first) && Number.isFinite(last) && last > first
@@ -107,8 +147,9 @@ export function confidence(e: ServiceDependency): Confidence {
 /** Edges the miner catches in under a quarter of scans. Their existence means
  *  the graph is probably missing OTHER edges entirely, which is the actionable
  *  reading — so callers surface this rather than only styling the line. */
-export function rarelyObserved(edges: ServiceDependency[]): ServiceDependency[] {
-  return edges.filter(e => confidence(e).key === "rare");
+export function rarelyObserved(edges: FlowEdge[]): FlowEdge[] {
+  // Declared edges have no evidence to be thin — they are facts, not sightings.
+  return edges.filter(e => e.kind !== "declared" && confidence(e).key === "rare");
 }
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // matches TopologyPanel's threshold
@@ -146,7 +187,7 @@ const slotKey = (s: Slot) => (s.kind === "node" ? `n:${s.id}` : `b:${s.edgeId}`)
 const slotHeight = (s: Slot) => (s.kind === "node" ? NODE_H : BEND_H);
 
 /** In/out degree per service, over whatever edge list is given. */
-export function degrees(edges: ServiceDependency[]): Map<string, { in: number; out: number }> {
+export function degrees(edges: FlowEdge[]): Map<string, { in: number; out: number }> {
   const d = new Map<string, { in: number; out: number }>();
   const at = (id: string) => d.get(id) ?? d.set(id, { in: 0, out: 0 }).get(id)!;
   for (const e of edges) {
@@ -178,7 +219,11 @@ export function degrees(edges: ServiceDependency[]): Map<string, { in: number; o
  * "entry · calls 2" while focused and "entry · calls 3" unfocused. Degree is a
  * property of the service, so it must not depend on what is currently drawn.
  */
-export function layout(edges: ServiceDependency[], deg: Map<string, { in: number; out: number }>): Layout {
+export function layout(
+  edges: FlowEdge[],
+  deg: Map<string, { in: number; out: number }>,
+  standalone: string[] = [],
+): Layout {
   const parents = new Map<string, string[]>();
   const ids = new Set<string>();
   for (const e of edges) {
@@ -186,6 +231,11 @@ export function layout(edges: ServiceDependency[], deg: Map<string, { in: number
     ids.add(e.to_service);
     (parents.get(e.to_service) ?? parents.set(e.to_service, []).get(e.to_service)!).push(e.from_service);
   }
+  // Services the inventory knows about but no edge references. Drawing them is
+  // the single biggest legibility win: the agentify namespace runs four
+  // services and the mined graph referenced two, so half the architecture was
+  // simply absent from the picture with nothing to indicate it.
+  for (const id of standalone) ids.add(id);
 
   const depth = new Map<string, number>();
   const resolve = (id: string, seen: Set<string>): number => {
@@ -312,7 +362,7 @@ const BACK_EDGE_ROOM = 46; // room below the boxes for a back edge's return trac
  * the fan from crossing itself on the way out.
  */
 export function assignPorts(
-  edges: ServiceDependency[], nodes: Map<string, Node>,
+  edges: FlowEdge[], nodes: Map<string, Node>,
 ): Map<string, { from: Pt; to: Pt; track: number }> {
   const out = new Map<string, ServiceDependency[]>();
   const inn = new Map<string, ServiceDependency[]>();
@@ -475,7 +525,7 @@ export function edgePath(
  * distance — the honest reading of "how close is this failure".
  */
 export function reach(
-  edges: ServiceDependency[], start: string, dir: "up" | "down",
+  edges: FlowEdge[], start: string, dir: "up" | "down",
 ): Map<string, number> {
   const next = new Map<string, string[]>();
   for (const e of edges) {
@@ -499,18 +549,30 @@ export function reach(
   return dist;
 }
 
-function roleText(n: Node): string {
+function roleText(n: Node, m?: NodeMeta): string {
+  // Just "entry point": the host is already the box label, and repeating it
+  // here both duplicated it and overflowed the box on a real ALB hostname.
+  if (m?.kind === "ingress") return "entry point";
+  // in=0 AND out=0 is NOT an entry point — it is a service we have no evidence
+  // about in either direction. Calling it "entry · calls 0" implied a finding
+  // where there is only an absence.
+  if (n.inDeg === 0 && n.outDeg === 0) return "no observed calls";
   if (n.inDeg === 0) return `entry · calls ${n.outDeg}`;
-  if (n.outDeg === 0) return `terminal · ${n.inDeg} caller${n.inDeg === 1 ? "" : "s"}`;
+  if (n.outDeg === 0) return fit(`terminal · ${n.inDeg} caller${n.inDeg === 1 ? "" : "s"}`, 30);
   return `${n.inDeg} in · ${n.outDeg} out`;
 }
 
 export function DependencyFlow({
-  edges, focus, onFocus,
+  edges, focus, onFocus, standalone = [], meta,
 }: {
-  edges: ServiceDependency[];
+  edges: FlowEdge[];
   focus: string | null;
   onFocus: (s: string | null) => void;
+  /** Inventory services with no edge — drawn so the picture is the whole
+   *  namespace rather than only its observed half. */
+  standalone?: string[];
+  /** Per-node facts from inventory: node kind, coverage, ingress host. */
+  meta?: Map<string, NodeMeta>;
 }) {
   // Focus shows the TRANSITIVE neighbourhood, not one hop. One hop answers
   // "who calls this"; the operator's actual question during an incident is
@@ -529,16 +591,23 @@ export function DependencyFlow({
     };
   }, [edges, focus]);
 
+  // Standalone nodes are dropped while a service is focused: focus answers
+  // "what does this reach", and a node with no edges reaches nothing.
+  const visibleStandalone = focus ? [] : standalone;
+
   const nodeCount = useMemo(
-    () => new Set(visible.flatMap(e => [e.from_service, e.to_service])).size,
-    [visible],
+    () => new Set([...visible.flatMap(e => [e.from_service, e.to_service]), ...visibleStandalone]).size,
+    [visible, visibleStandalone],
   );
 
   // From the full edge list on purpose — see layout()'s note on `deg`.
   const deg = useMemo(() => degrees(edges), [edges]);
 
   const tooBig = nodeCount > MAX_NODES || visible.length > MAX_EDGES;
-  const l = useMemo(() => layout(tooBig ? [] : visible, deg), [visible, tooBig, deg]);
+  const l = useMemo(
+    () => layout(tooBig ? [] : visible, deg, tooBig ? [] : visibleStandalone),
+    [visible, tooBig, deg, visibleStandalone],
+  );
   // Attachment points, computed once per layout: orthogonal lines that share a
   // port read as a single thick line rather than as several edges.
   const ports = useMemo(() => assignPorts(tooBig ? [] : visible, l.nodes), [visible, tooBig, l]);
@@ -555,7 +624,7 @@ export function DependencyFlow({
     );
   }
 
-  if (visible.length === 0) return null;
+  if (visible.length === 0 && visibleStandalone.length === 0) return null;
 
   const hopOf = (id: string): number | null =>
     id === focus ? 0 : upstream.get(id) ?? downstream.get(id) ?? null;
@@ -613,39 +682,57 @@ export function DependencyFlow({
             // Emphasise the edges that actually touch the focused service; the
             // rest are the paths carrying impact onward and stay recessive.
             const on = !focus || e.from_service === focus || e.to_service === focus;
+            const declared = e.kind === "declared";
             const c = confidence(e);
-            const stale = isStale(e);
+            const stale = !declared && isStale(e);
             const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? [], ports.get(e.id));
             return (
               <g key={e.id} className={`flow__edge${on ? " flow__edge--on" : ""}`}>
                 <title>
-                  {`${e.from_service} → ${e.to_service}\n` +
-                   (c.scans === null
-                     ? `Seen ${e.evidence_count}x; too new to judge how consistently.\n`
-                     : `Seen in ${e.evidence_count} of ~${c.scans} scans since it was first ` +
-                       `observed (${Math.round((c.coverage ?? 0) * 100)}%) — ${c.label}.\n`) +
-                   `This counts sightings in logs, not requests: confidence, not traffic volume.\n` +
-                   (stale ? "STALE: no new evidence in over 15 minutes.\n" : "") +
-                   `Last seen ${new Date(e.last_seen).toLocaleString()}`}
+                  {declared
+                    ? `${e.from_service} → ${e.to_service}\n` +
+                      "DECLARED route, read from the Kubernetes object — a fact, not evidence. " +
+                      "No sighting count applies."
+                    : `${e.from_service} → ${e.to_service}\n` +
+                      (c.scans === null
+                        ? `Seen ${e.evidence_count}x; too new to judge how consistently.\n`
+                        : `Seen in ${e.evidence_count} of ~${c.scans} scans since it was first ` +
+                          `observed (${Math.round((c.coverage ?? 0) * 100)}%) — ${c.label}.\n`) +
+                      `This counts sightings in logs, not requests: confidence, not traffic volume.\n` +
+                      (stale ? "STALE: no new evidence in over 15 minutes.\n" : "") +
+                      `Last seen ${new Date(e.last_seen).toLocaleString()}`}
                 </title>
                 <path d={d}
-                      className={`flow__line${stale ? " flow__line--stale" : ""}`}
-                      strokeWidth={c.width}
+                      className={
+                        "flow__line" +
+                        (declared ? " flow__line--declared" : "") +
+                        (stale ? " flow__line--stale" : "")
+                      }
+                      strokeWidth={declared ? 2 : c.width}
                       markerEnd={`url(#${on ? "flow-arrow-on" : "flow-arrow"})`} />
                 {/* Printed, never implied by thickness alone — and set
                     horizontally rather than on a textPath, which rotated the
                     digits along the curve and made them unreadable. */}
-                <text x={mid.x} y={mid.y - 6} textAnchor="middle" className="flow__count">
-                  {e.evidence_count}
-                </text>
+                {!declared && (
+                  <text x={mid.x} y={mid.y - 6} textAnchor="middle" className="flow__count">
+                    {e.evidence_count}
+                  </text>
+                )}
               </g>
             );
           })}
 
           {[...l.nodes.values()].map(n => {
             const hop = hopOf(n.id);
+            const m = meta?.get(n.id);
+            const unobserved = n.inDeg === 0 && n.outDeg === 0 && m?.kind !== "ingress";
             const cls = [
               "flow__node",
+              m?.kind === "ingress" ? "flow__node--ingress" : "",
+              // Dashed outline, not dimmed: an unobserved service is present in
+              // the cluster and absent from the evidence. Dimming would read as
+              // "less important" rather than "not seen".
+              unobserved ? "flow__node--unobserved" : "",
               n.id === focus ? "flow__node--focus" : "",
               // Direct neighbours of the focus read stronger than distant ones,
               // so hop distance is visible without a second colour channel.
@@ -663,7 +750,15 @@ export function DependencyFlow({
                    }
                  }}>
                 <title>
-                  {`${n.id} — ${roleText(n)}` +
+                  {`${n.id} — ${roleText(n, m)}` +
+                   (m?.coverage != null
+                     ? `\nObserved in ${Math.round(m.coverage * 100)}% of scans` +
+                       (m.podsSeen != null ? ` (${m.podsSampled ?? 0} of ${m.podsSeen} pods sampled)` : "")
+                     : "") +
+                   (unobserved
+                     ? "\nIn the inventory but referenced by no observed call — either it makes " +
+                       "and receives none, or nothing it does is visible to the miner."
+                     : "") +
                    (focus && hop !== null && hop > 0
                      ? `\n${hop === 1 ? "Directly" : `${hop} hops`} ${upstream.has(n.id) ? "upstream of" : "downstream of"} ${focus}`
                      : "") +
@@ -671,10 +766,10 @@ export function DependencyFlow({
                 </title>
                 <rect x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx="8" className="flow__box" />
                 <text x={n.x + NODE_W / 2} y={n.y + 19} textAnchor="middle" className="flow__label">
-                  {n.id.length > 21 ? `${n.id.slice(0, 20)}…` : n.id}
+                  {fit(m?.label ?? n.id, 21)}
                 </text>
                 <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__sub">
-                  {roleText(n)}
+                  {roleText(n, m)}
                 </text>
               </g>
             );
@@ -703,11 +798,20 @@ export function DependencyFlow({
             </svg>
             going stale
           </span>
+          <span className="flow__key-band">
+            <svg width="26" height="8" aria-hidden="true">
+              <line x1="0" y1="4" x2="26" y2="4" className="flow__line flow__line--declared" strokeWidth={2} />
+            </svg>
+            declared route
+          </span>
         </span>
         <span>
-          Line weight is how <strong>consistently</strong> the call is observed across the
-          edge's own lifetime — not how much traffic it carries. The number is the raw
-          sighting count. Click a service to trace what it reaches and what breaks with it.
+          <strong>Two different claims are drawn here.</strong> A solid arrow is{" "}
+          <em>observed</em> — mined from a log line, so its weight is how consistently it was
+          seen and the number is a sighting count, never traffic. A{" "}
+          <span className="flow__inline-declared">declared route</span> comes from a
+          Kubernetes Ingress object: a fact, with no count to give. A box with a dashed
+          outline is in the inventory but referenced by no observed call.
           {focus && <> · <button type="button" className="topo-link" onClick={() => onFocus(null)}>show everything</button></>}
         </span>
       </div>

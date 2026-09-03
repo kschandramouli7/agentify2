@@ -408,6 +408,48 @@ export type ServiceDependency = {
   cluster_id?: string;
 };
 
+/** One entry point into the cluster from outside — an Ingress, Gateway
+ *  HTTPRoute, or OpenShift Route (ROADMAP P18 use case #3).
+ *
+ *  Unlike a mined dependency edge, this is a DECLARED fact read from the
+ *  Kubernetes object, not evidence inferred from a log line. The distinction
+ *  has to survive into the UI: an ingress edge is certain, a mined edge is a
+ *  lower bound. */
+export type IngressEndpoint = {
+  namespace: string;
+  kind: string;            // "ingress" | "httproute" | "route"
+  name: string;
+  host: string;
+  backend_service: string;
+};
+
+export async function listClusterIngress(namespace: string): Promise<IngressEndpoint[]> {
+  const res = await fetch(`/api/cluster-ingress?namespace=${encodeURIComponent(namespace)}`);
+  if (!res.ok) return [];   // best-effort: a missing entry-point map must not blank the panel
+  const body = (await res.json()) as { entries?: IngressEndpoint[] } | null;
+  return body?.entries ?? [];
+}
+
+/** Per-service scan accounting — the denominator for evidence_count
+ *  (ROADMAP P27 phase 1). Lets a node say how well observed it is, rather
+ *  than leaving "no edges" ambiguous between "calls nothing" and "we never
+ *  looked at it". */
+export type ScanCoverage = {
+  namespace: string;
+  service: string;
+  scan_cycles: number;
+  pods_seen: number;
+  pods_sampled: number;
+  logs_readable: number;
+  log_lines: number;
+};
+
+export async function listScanCoverage(namespace: string): Promise<ScanCoverage[]> {
+  const res = await fetch(`/api/scan-coverage?namespace=${encodeURIComponent(namespace)}`);
+  if (!res.ok) return [];
+  return (await res.json()) as ScanCoverage[];
+}
+
 export async function listServiceDependencies(namespace: string): Promise<ServiceDependency[]> {
   const res = await fetch(`/api/service-dependencies?namespace=${encodeURIComponent(namespace)}`);
   if (!res.ok) throw new Error(`Failed to load service dependencies (${res.status})`);
