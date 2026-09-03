@@ -2227,6 +2227,48 @@ edges in a policy without review.
 - **Image/version at time of observation** → also P25 ("this edge appeared at
   `payment-worker` v1.2, disappeared at v1.3").
 
+### What each phase unlocks in the UI
+
+Asked 2026-09-03: what diagrams would enrich the Dependencies panel? The honest
+answer is that most of them are **blocked on the phases above** rather than
+being work someone could pick up today — an edge is currently `from`, `to`,
+`count`, `first/last seen`, and no diagram can show a dimension that is not
+captured. Recording them here, against the phase that unlocks each, so the
+value of a phase is legible before it is built.
+
+| Diagram | Question it answers | Unlocked by |
+|---|---|---|
+| **Adjacency matrix** — callers as rows, callees as columns, cell = confidence | "show me the whole namespace" when the node-link view has given up | **nothing — buildable today** |
+| **Health-weighted graph** — same layout, edges annotated by failure rate | "which of these dependencies is actually *working*" | Phase 2 (outcome) |
+| **Policy preview** — edges grouped by port, rendered as the NetworkPolicy that would be generated, with the backtest count beside it | "what would enforcing least privilege actually block" | Phase 2 (port) — this is P24's UI |
+| **API surface** — expand a node into the endpoints observed on it | "what does this service actually expose, as observed rather than as documented" | Phase 4 (path) |
+| **Probe filter** — hide health-check-only edges | "which of these are real dependencies" — a `/health`-only edge barely is one | Phase 4 (path) |
+| **Observation timeline** — a strip per edge over time | "is this edge steady, bursty, or decaying" | Phase 4 (bucketed evidence) |
+| **Latency-annotated graph** | "which dependency got slower" | Phase 5 (latency) |
+
+**The adjacency matrix is the one to build first, and it needs no new data.**
+It is also the real answer to `DependencyFlow`'s `MAX_NODES`/`MAX_EDGES`
+refusal: a matrix stays readable at two hundred services where a node-link
+diagram cannot, so the panel would degrade into a different *view* rather than
+into a message explaining why it will not draw. Today that refusal is a dead
+end.
+
+**Health-weighted is the one that changes what the panel is FOR.** Everything
+today answers "what calls what"; outcome makes it answer "and is it working",
+which is the question an operator actually arrives with.
+
+### Not a phase of this item — a new capture mode
+
+A **mined sequence diagram** (reconstructing probable request flows, `batch →
+worker → api`) is the most valuable diagram on the list and is deliberately
+absent from the table. It needs **per-call timestamps**, and the collector
+captures per-scan aggregates — it never sees an individual call, only that a
+hostname appeared in a log tail. That is a different capture mode, not a
+column, and it would need its own item and its own cost argument (log volume,
+ordering across pods, clock skew between them).
+
+Worth stating plainly so nobody promises it on the strength of this item.
+
 ### The one schema decision
 
 Split rows on port: `(tenant_id, cluster_id, namespace, from_service,
