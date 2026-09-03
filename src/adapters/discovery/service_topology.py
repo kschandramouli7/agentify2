@@ -16,7 +16,7 @@ already-built ingest path.
 
 import logging
 import re
-from typing import Set
+from typing import Dict, List, Set
 
 import httpx
 
@@ -85,6 +85,44 @@ def extract_service_mentions(log_text: str, namespace: str, known_services: Set[
             found.add(name)
 
     return found
+
+
+async def push_scan_coverage(
+    namespace: str,
+    stats: Dict[str, Dict[str, int]],
+    backend_url: str,
+    collector_token: str,
+) -> None:
+    """Report one scan cycle's accounting for a namespace (ROADMAP P27 phase 1).
+
+    This is the DENOMINATOR for the edges push_dependency records.
+    `evidence_count` alone cannot distinguish a service that is called rarely
+    from one whose logs are unreadable from one whose pods are never among the
+    MAX_PODS_PER_NAMESPACE sampled — the ambiguity that made payment-worker's
+    decline uninterpretable on 2026-09-03.
+
+    One request per namespace, not per service: a scan produces a single report
+    covering everything it looked at, and the Hub reads them together.
+
+    Best-effort, like every other push here — a dropped report costs one cycle
+    of denominator, never a scan.
+    """
+    if not stats:
+        return
+    # Omit the header entirely when unset — same reason as push_dependency.
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
+    payload = {
+        "namespace": namespace,
+        "services": [{"service": name, **counts} for name, counts in sorted(stats.items())],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{backend_url.rstrip('/')}/api/scan-coverage", json=payload, headers=headers,
+            )
+            resp.raise_for_status()
+    except httpx.HTTPError as e:
+        logger.warning("push_scan_coverage failed for namespace=%s: %s", namespace, e)
 
 
 async def push_dependency(

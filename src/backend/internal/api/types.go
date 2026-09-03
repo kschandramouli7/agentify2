@@ -123,6 +123,13 @@ type PricingStore interface {
 type ServiceDependencyStore interface {
 	UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService string) error
 	ListServiceDependencies(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceDependency, error)
+
+	// Scan coverage lives on this interface rather than its own because it is
+	// the DENOMINATOR for the edges above — evidence_count is uninterpretable
+	// without it (ROADMAP P27 phase 1). Splitting them would mean a 17th
+	// parameter on NewHandler and two nil checks that are always equal.
+	UpsertScanCoverage(ctx context.Context, tenantID, clusterID, namespace, service string, cycles, podsSeen, podsSampled, logsReadable int, logLines int64) error
+	ListScanCoverage(ctx context.Context, tenantID, namespace string) ([]pgstore.ScanCoverage, error)
 }
 
 // ClusterServiceStore is the service->cluster registry interface (ROADMAP

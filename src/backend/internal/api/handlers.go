@@ -1930,6 +1930,122 @@ type serviceDependencyUpsertRequest struct {
 // per-cluster credential to authenticate as. A real Discovery collector's own
 // CollectorToken-derived clusterID always wins over anything in the body, so
 // a stray cluster_id field in a genuine collector's push is never honored.
+// scanCoverageUpsertRequest is one scan cycle's accounting for one service.
+// cluster_id is honored only as a fallback, exactly as
+// serviceDependencyUpsertRequest's is — a real collector's CollectorToken
+// always wins (ADR 0029 Phase 3).
+type scanCoverageUpsertRequest struct {
+	Namespace string                    `json:"namespace"`
+	ClusterID string                    `json:"cluster_id,omitempty"`
+	Services  []scanCoverageServiceStat `json:"services"`
+}
+
+type scanCoverageServiceStat struct {
+	Service      string `json:"service"`
+	ScanCycles   int    `json:"scan_cycles"`
+	PodsSeen     int    `json:"pods_seen"`
+	PodsSampled  int    `json:"pods_sampled"`
+	LogsReadable int    `json:"logs_readable"`
+	LogLines     int64  `json:"log_lines"`
+}
+
+// HandleScanCoverageUpsert records one scan cycle's accounting for a namespace
+// (ROADMAP P27 phase 1).
+//
+// Batched per namespace rather than per service, unlike the dependency upsert:
+// a scan produces one report covering every service it looked at, and sending
+// them individually would multiply requests by the service count for data that
+// is only ever read together.
+func (h *Handler) HandleScanCoverageUpsert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.serviceDepsStore == nil {
+		http.Error(w, "service dependency store not available", http.StatusServiceUnavailable)
+		return
+	}
+	tenantID, clusterID, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	var req scanCoverageUpsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if clusterID == "" && req.ClusterID != "" {
+		clusterID = req.ClusterID
+	}
+
+	// One failing service must not discard the rest of the report: coverage is
+	// best-effort accounting, and a partial denominator beats none. Same
+	// log-and-continue discipline as the collector's own push_* functions.
+	written, failed := 0, 0
+	for _, st := range req.Services {
+		if st.Service == "" {
+			continue
+		}
+		if err := h.serviceDepsStore.UpsertScanCoverage(r.Context(), tenantID, clusterID,
+			req.Namespace, st.Service, st.ScanCycles, st.PodsSeen, st.PodsSampled, st.LogsReadable, st.LogLines); err != nil {
+			h.logger.Warn("failed to upsert scan coverage",
+				"namespace", req.Namespace, "service", st.Service, "error", err)
+			failed++
+			continue
+		}
+		written++
+	}
+	if failed > 0 && written == 0 {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"written": written, "failed": failed})
+}
+
+// HandleScanCoverageList returns scan accounting for one namespace, so a caller
+// can turn evidence_count into a coverage fraction.
+func (h *Handler) HandleScanCoverageList(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if h.serviceDepsStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.ScanCoverage{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	cov, err := h.serviceDepsStore.ListScanCoverage(r.Context(), tenantID, namespace)
+	if err != nil {
+		h.logger.Warn("failed to list scan coverage", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.ScanCoverage{})
+		return
+	}
+	if cov == nil {
+		cov = []pgstore.ScanCoverage{}
+	}
+	writeJSON(w, http.StatusOK, cov)
+}
+
 func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

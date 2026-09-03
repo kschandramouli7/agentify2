@@ -30,7 +30,7 @@ from .health_snapshot import push_health
 from .ingress import build_ingress_entries, build_route_entries, correlate_gateway_routes, push_ingress
 from .inventory import push_inventory
 from .log_redaction import redact_log_text
-from .service_topology import extract_service_mentions, push_dependency
+from .service_topology import extract_service_mentions, push_dependency, push_scan_coverage
 
 logger = logging.getLogger("agentify.discovery")
 
@@ -65,21 +65,48 @@ async def _scan_namespace(ns: str, cfg: Config) -> None:
     if not known:
         return
 
-    pods = (await k8s_client.list_pods(ns))[: cfg.max_pods_per_namespace]
-    for pod in pods:
-        from_service = _service_for_pod(pod["labels"], services)
+    # Every known Service gets its scan_cycles advanced, including ones with no
+    # pods at all and ones whose pods never make the sample. That is the whole
+    # point of a denominator: "scanned 2880 times, sampled twice" is a different
+    # problem from "called rarely", and evidence_count cannot tell them apart
+    # (ROADMAP P27 phase 1).
+    coverage: Dict[str, Dict[str, int]] = {
+        name: {"scan_cycles": 1, "pods_seen": 0, "pods_sampled": 0, "logs_readable": 0, "log_lines": 0}
+        for name in known
+    }
+
+    # Attribute the FULL pod list before truncating: pods_seen counts what
+    # exists, pods_sampled counts what we looked at. Using the truncated list
+    # for both would report full coverage of a 5-pod sample and hide the
+    # sampling entirely — the exact self-flattery this item exists to prevent.
+    all_pods = await k8s_client.list_pods(ns)
+    attributed = [(pod, _service_for_pod(pod["labels"], services)) for pod in all_pods]
+    for _pod, from_service in attributed:
+        if from_service in coverage:
+            coverage[from_service]["pods_seen"] += 1
+
+    for pod, from_service in attributed[: cfg.max_pods_per_namespace]:
         if not from_service:
             continue  # can't attribute this pod's mentions to an edge without a from_service
+        coverage[from_service]["pods_sampled"] += 1
 
         raw_logs = await k8s_client.get_pod_logs(ns, pod["name"], tail_lines=cfg.log_tail_lines)
         if not raw_logs:
+            # Counted as sampled-but-unreadable, deliberately distinct from
+            # "read it and found no mentions": an unreadable log is a platform
+            # problem (OPS-9 returns "" for every multi-container pod), while an
+            # empty extraction is a real observation.
             continue
+        coverage[from_service]["logs_readable"] += 1
+        coverage[from_service]["log_lines"] += raw_logs.count("\n") + 1
         logs = redact_log_text(raw_logs)
 
         for to_service in extract_service_mentions(logs, ns, known):
             if to_service == from_service:
                 continue  # self-mention, not a dependency
             await push_dependency(ns, from_service, to_service, cfg.backend_url, cfg.collector_token)
+
+    await push_scan_coverage(ns, coverage, cfg.backend_url, cfg.collector_token)
 
 
 async def _namespace_services(ns: str) -> Optional[List[Dict[str, Any]]]:

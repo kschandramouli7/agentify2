@@ -19,6 +19,34 @@ type fakeServiceDependencyStore struct {
 	lastFrom      string
 	lastTo        string
 	upsertCalled  bool
+
+	// Scan-coverage calls, recorded so the coverage tests can assert on them
+	// (ROADMAP P27 phase 1).
+	coverageCalls []coverageCall
+	coverageErr   error
+	coverageRows  []pgstore.ScanCoverage
+}
+
+type coverageCall struct {
+	tenantID, clusterID, namespace, service     string
+	cycles, podsSeen, podsSampled, logsReadable int
+	logLines                                    int64
+}
+
+func (f *fakeServiceDependencyStore) UpsertScanCoverage(ctx context.Context, tenantID, clusterID, namespace, service string, cycles, podsSeen, podsSampled, logsReadable int, logLines int64) error {
+	f.coverageCalls = append(f.coverageCalls, coverageCall{
+		tenantID: tenantID, clusterID: clusterID, namespace: namespace, service: service,
+		cycles: cycles, podsSeen: podsSeen, podsSampled: podsSampled,
+		logsReadable: logsReadable, logLines: logLines,
+	})
+	return f.coverageErr
+}
+
+func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenantID, namespace string) ([]pgstore.ScanCoverage, error) {
+	if f.coverageErr != nil {
+		return nil, f.coverageErr
+	}
+	return f.coverageRows, nil
 }
 
 func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService string) error {

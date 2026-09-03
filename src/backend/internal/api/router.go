@@ -72,6 +72,12 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/service-dependencies", h.HandleServiceDependencyUpsert)
 	mux.HandleFunc("GET /api/service-dependencies", h.HandleServiceDependencyList)
 
+	// Scan-coverage accounting — the denominator for evidence_count
+	// (ROADMAP P27 phase 1). Same credential shape as the dependency upsert:
+	// a collector's CollectorToken derives (tenant, cluster).
+	mux.HandleFunc("POST /api/scan-coverage", h.HandleScanCoverageUpsert)
+	mux.HandleFunc("GET /api/scan-coverage", h.HandleScanCoverageList)
+
 	// Fleet collector's namespace/service/deployment inventory push (ADR 0022 /
 	// ROADMAP P18 use case #1) — auto-populates Integration.Namespaces.
 	mux.HandleFunc("POST /api/cluster-inventory", h.HandleClusterInventoryUpsert)

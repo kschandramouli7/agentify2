@@ -456,6 +456,46 @@ func (c *Client) initSchema(ctx context.Context) error {
 	-- the primary key). Capacity (node count/allocatable CPU-mem) is
 	-- deliberately not part of this snapshot yet — needs a new nodes RBAC
 	-- grant, flagged as a follow-up, not built here.
+	-- ROADMAP P27 phase 1: the DENOMINATOR for dependency-graph coverage.
+	--
+	-- service_dependencies.evidence_count is a numerator with no denominator:
+	-- "seen 51 times" cannot distinguish a service that is called rarely from
+	-- one whose logs are unreadable from one whose pods are never among the
+	-- MAX_PODS_PER_NAMESPACE sampled. That ambiguity made payment-worker's
+	-- decline uninterpretable on 2026-09-03 (5% -> 1.8% of scans).
+	--
+	-- One row per (tenant, cluster, namespace, service), counters incremented
+	-- per scan cycle, mirroring service_dependencies' upsert semantics. Coverage
+	-- is then evidence_count / pods_sampled for that from_service.
+	CREATE TABLE IF NOT EXISTS scan_coverage (
+		tenant_id      TEXT NOT NULL,
+		cluster_id     TEXT NOT NULL DEFAULT '',
+		namespace      TEXT NOT NULL,
+		service        TEXT NOT NULL,
+		scan_cycles    INT NOT NULL DEFAULT 0,  -- cycles in which this namespace was scanned
+		pods_seen      INT NOT NULL DEFAULT 0,  -- pods attributed to this service across cycles
+		pods_sampled   INT NOT NULL DEFAULT 0,  -- of those, how many we actually read logs for
+		logs_readable  INT NOT NULL DEFAULT 0,  -- of those, how many returned any log text
+		log_lines      BIGINT NOT NULL DEFAULT 0,
+		first_scan     TIMESTAMP DEFAULT NOW(),
+		last_scan      TIMESTAMP DEFAULT NOW(),
+		PRIMARY KEY (tenant_id, cluster_id, namespace, service)
+	);
+	CREATE INDEX IF NOT EXISTS idx_scan_coverage_lookup ON scan_coverage(tenant_id, namespace);
+
+	ALTER TABLE IF EXISTS scan_coverage ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS scan_coverage FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'scan_coverage' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON scan_coverage
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
 	CREATE TABLE IF NOT EXISTS cluster_health_snapshots (
 		cluster_id  TEXT PRIMARY KEY,
 		tenant_id   TEXT NOT NULL,
@@ -1781,6 +1821,97 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 		return err
 	}
 	return tx.Commit()
+}
+
+// ScanCoverage is one service's scan accounting — the denominator for
+// interpreting service_dependencies.evidence_count (ROADMAP P27 phase 1).
+type ScanCoverage struct {
+	Namespace    string    `json:"namespace"`
+	Service      string    `json:"service"`
+	ScanCycles   int       `json:"scan_cycles"`
+	PodsSeen     int       `json:"pods_seen"`
+	PodsSampled  int       `json:"pods_sampled"`
+	LogsReadable int       `json:"logs_readable"`
+	LogLines     int64     `json:"log_lines"`
+	FirstScan    time.Time `json:"first_scan"`
+	LastScan     time.Time `json:"last_scan"`
+	TenantID     string    `json:"tenant_id"`
+	ClusterID    string    `json:"cluster_id,omitempty"`
+}
+
+// UpsertScanCoverage adds one scan cycle's counts for one service.
+//
+// Counters are INCREMENTED rather than replaced, for the same reason
+// UpsertServiceDependency increments evidence_count: the collector reports what
+// it did this cycle and has no durable memory across restarts, so the Hub is
+// the only place a cumulative total can live. scan_cycles is incremented by the
+// caller passing 1, not derived, so a namespace scanned but yielding no pods
+// still advances the denominator — which is exactly the case that reveals a
+// service whose pods are never sampled.
+func (c *Client) UpsertScanCoverage(ctx context.Context, tenantID, clusterID, namespace, service string, cycles, podsSeen, podsSampled, logsReadable int, logLines int64) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO scan_coverage (tenant_id, cluster_id, namespace, service,
+		                           scan_cycles, pods_seen, pods_sampled, logs_readable, log_lines,
+		                           first_scan, last_scan)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+		ON CONFLICT (tenant_id, cluster_id, namespace, service) DO UPDATE SET
+		  scan_cycles   = scan_coverage.scan_cycles   + EXCLUDED.scan_cycles,
+		  pods_seen     = scan_coverage.pods_seen     + EXCLUDED.pods_seen,
+		  pods_sampled  = scan_coverage.pods_sampled  + EXCLUDED.pods_sampled,
+		  logs_readable = scan_coverage.logs_readable + EXCLUDED.logs_readable,
+		  log_lines     = scan_coverage.log_lines     + EXCLUDED.log_lines,
+		  last_scan     = NOW()`,
+		tenantID, clusterID, namespace, service, cycles, podsSeen, podsSampled, logsReadable, logLines)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListScanCoverage returns scan accounting for one namespace across every
+// cluster belonging to tenantID, same scoping rationale as
+// ListServiceDependencies. RLS enforces the tenant boundary.
+func (c *Client) ListScanCoverage(ctx context.Context, tenantID, namespace string) ([]ScanCoverage, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT namespace, service, scan_cycles, pods_seen, pods_sampled, logs_readable, log_lines,
+		       first_scan, last_scan, tenant_id, COALESCE(cluster_id, '')
+		FROM scan_coverage WHERE namespace = $1 ORDER BY service`, namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []ScanCoverage
+	for rows.Next() {
+		var c ScanCoverage
+		if err := rows.Scan(&c.Namespace, &c.Service, &c.ScanCycles, &c.PodsSeen, &c.PodsSampled,
+			&c.LogsReadable, &c.LogLines, &c.FirstScan, &c.LastScan, &c.TenantID, &c.ClusterID); err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // ListServiceDependencies returns every mined edge for one namespace, across

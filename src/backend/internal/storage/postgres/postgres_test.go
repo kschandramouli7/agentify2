@@ -468,6 +468,61 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P27 phase 1: scan_coverage ACCUMULATES across cycles, so a denominator survives collector restarts", func(t *testing.T) {
+		// The core of the feature is the ON CONFLICT arithmetic. The collector
+		// reports only what it did this cycle and has no durable memory across
+		// restarts, so if these counters replaced instead of accumulating, the
+		// denominator would reset to one cycle every rollout and coverage would
+		// read ~100% forever — the exact self-flattery this item exists to stop.
+		tenantID := uuid.New().String()
+
+		// Two cycles for the same service: 4 pods exist, 2 sampled, both readable.
+		for i := 0; i < 2; i++ {
+			if err := client.UpsertScanCoverage(ctx, tenantID, "cluster-a", "payments", "api", 1, 4, 2, 2, 400); err != nil {
+				t.Fatalf("upsert cycle %d: %v", i, err)
+			}
+		}
+		// A service whose pod exists but is never sampled — the payment-worker
+		// case. Its scan_cycles must still advance, or its coverage would look
+		// like 0/0 (unknown) rather than 0/2 (invisible).
+		if err := client.UpsertScanCoverage(ctx, tenantID, "cluster-a", "payments", "worker", 1, 1, 0, 0, 0); err != nil {
+			t.Fatalf("upsert worker: %v", err)
+		}
+		if err := client.UpsertScanCoverage(ctx, tenantID, "cluster-a", "payments", "worker", 1, 1, 0, 0, 0); err != nil {
+			t.Fatalf("upsert worker again: %v", err)
+		}
+
+		rows, err := client.ListScanCoverage(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list scan coverage: %v", err)
+		}
+		byService := map[string]ScanCoverage{}
+		for _, r := range rows {
+			byService[r.Service] = r
+		}
+		api, ok := byService["api"]
+		if !ok {
+			t.Fatalf("no coverage row for api; got %v", rows)
+		}
+		if api.ScanCycles != 2 || api.PodsSeen != 8 || api.PodsSampled != 4 || api.LogsReadable != 4 || api.LogLines != 800 {
+			t.Errorf("api counters did not accumulate: %+v", api)
+		}
+		worker, ok := byService["worker"]
+		if !ok {
+			t.Fatalf("no coverage row for worker; got %v", rows)
+		}
+		if worker.ScanCycles != 2 {
+			t.Errorf("worker scan_cycles = %d, want 2 — a scanned-but-unsampled service must still advance its denominator", worker.ScanCycles)
+		}
+		if worker.PodsSampled != 0 {
+			t.Errorf("worker pods_sampled = %d, want 0", worker.PodsSampled)
+		}
+		// The interpretation the denominator makes possible.
+		if worker.PodsSeen == 0 {
+			t.Error("worker pods_seen = 0; the pod exists and must be counted")
+		}
+	})
+
 	t.Run("ROADMAP P18 use case #4: two of one tenant's clusters' service_dependencies edges surface together, each tagged with its own cluster_id", func(t *testing.T) {
 		// Verifies the ROADMAP's "no code change needed" claim for cross-
 		// cluster dependency edges: ListServiceDependencies is scoped by
@@ -575,7 +630,10 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("create restricted test role: %v", err)
 	}
-	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON service_dependencies TO rls_test_app`); err != nil {
+	// Grants are explicit per table, so a new RLS-enabled table needs one here
+	// AND in whatever provisions the production role — an omitted grant fails
+	// closed (permission denied) rather than open, which is the right way round.
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON service_dependencies, scan_coverage TO rls_test_app`); err != nil {
 		t.Fatalf("grant restricted test role: %v", err)
 	}
 	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
@@ -623,6 +681,28 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	// tenant (increments A's row), not global (which would also bump B's).
 	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend"); err != nil {
 		t.Fatalf("re-upsert tenant A dependency: %v", err)
+	}
+
+	// ROADMAP P27 phase 1: scan_coverage carries the same RLS guarantee. It
+	// names every service in a namespace, so a leak here leaks an inventory,
+	// not just one edge.
+	if err := appClient.UpsertScanCoverage(ctx, tenantA, clusterA.ID, "payments", "a-only-service", 1, 1, 1, 1, 10); err != nil {
+		t.Fatalf("upsert coverage for tenant A: %v", err)
+	}
+	if err := appClient.UpsertScanCoverage(ctx, tenantB, clusterB.ID, "payments", "b-only-service", 1, 1, 1, 1, 10); err != nil {
+		t.Fatalf("upsert coverage for tenant B: %v", err)
+	}
+	covA, err := appClient.ListScanCoverage(ctx, tenantA, "payments")
+	if err != nil {
+		t.Fatalf("list coverage for tenant A: %v", err)
+	}
+	for _, r := range covA {
+		if r.Service == "b-only-service" {
+			t.Fatalf("tenant A read tenant B's scan_coverage row: %+v", r)
+		}
+	}
+	if len(covA) != 1 || covA[0].Service != "a-only-service" {
+		t.Errorf("tenant A coverage = %+v, want only its own row", covA)
 	}
 
 	depsA, err := appClient.ListServiceDependencies(ctx, tenantA, "payments")
