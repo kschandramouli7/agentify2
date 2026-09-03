@@ -252,6 +252,14 @@ export function layout(edges: ServiceDependency[], deg: Map<string, { in: number
 
   const colHeight = (slots: Slot[]) =>
     slots.reduce((h, s) => h + slotHeight(s), 0) + Math.max(0, slots.length - 1) * ROW_GAP;
+  // A back edge (a cycle, or a same-column pair) routes below every box on a
+  // return track. Without reserving room the path is drawn outside the viewBox
+  // and silently clipped — which looked like a missing edge, the worst possible
+  // failure for a diagram whose claim is that these are observed facts.
+  const hasBackEdge = edges.some(
+    e => (depth.get(e.to_service) ?? 0) <= (depth.get(e.from_service) ?? 0),
+  );
+
   const fullHeight = Math.max(NODE_H, ...layers.map(colHeight));
 
   const nodes = new Map<string, Node>();
@@ -281,43 +289,179 @@ export function layout(edges: ServiceDependency[], deg: Map<string, { in: number
     nodes,
     bends,
     width: PAD * 2 + layers.length * NODE_W + Math.max(0, layers.length - 1) * COL_GAP,
-    height: PAD * 2 + fullHeight,
+    height: PAD * 2 + fullHeight + (hasBackEdge ? BACK_EDGE_ROOM : 0),
   };
 }
 
+const CORNER = 5;    // corner rounding; small enough to still read as square
+const PORT_GAP = 9;  // vertical spacing between an edge's attachment points
+const TRACK_GAP = 14; // horizontal spacing between edges' vertical runs
+const BACK_EDGE_ROOM = 46; // room below the boxes for a back edge's return track
+
 /**
- * Smooth path through the endpoints and any waypoints, with horizontal tangents
- * at every joint so the segments meet without a visible kink.
+ * Where each edge attaches to its endpoints ("ports").
+ *
+ * With curved edges, several lines leaving one node could share a single
+ * attachment point and still be told apart, because they diverged immediately.
+ * Orthogonal lines do not diverge — they run along the same horizontal for a
+ * stretch and read as one thick line. So exits are spread down the source's
+ * right edge and entries up the target's left edge.
+ *
+ * Ordering matters as much as spacing: exits are sorted by where their target
+ * sits vertically, and entries by where their source sits, which is what stops
+ * the fan from crossing itself on the way out.
  */
-export function edgePath(from: Node, to: Node, via: Pt[]): { d: string; mid: Pt } {
-  const start: Pt = { x: from.x + NODE_W, y: from.y + NODE_H / 2 };
-  const end: Pt = { x: to.x, y: to.y + NODE_H / 2 };
+export function assignPorts(
+  edges: ServiceDependency[], nodes: Map<string, Node>,
+): Map<string, { from: Pt; to: Pt; track: number }> {
+  const out = new Map<string, ServiceDependency[]>();
+  const inn = new Map<string, ServiceDependency[]>();
+  for (const e of edges) {
+    if (!nodes.has(e.from_service) || !nodes.has(e.to_service)) continue;
+    (out.get(e.from_service) ?? out.set(e.from_service, []).get(e.from_service)!).push(e);
+    (inn.get(e.to_service) ?? inn.set(e.to_service, []).get(e.to_service)!).push(e);
+  }
+
+  const centreY = (id: string) => {
+    const n = nodes.get(id)!;
+    return n.y + NODE_H / 2;
+  };
+  // Spread n ports around the centre of a node side, clamped inside the box so
+  // a high-degree node never sprouts lines from outside its own outline.
+  const spread = (n: Node, count: number, i: number) => {
+    const usable = NODE_H - 12;
+    const step = Math.min(PORT_GAP, count > 1 ? usable / (count - 1) : 0);
+    return n.y + NODE_H / 2 + (i - (count - 1) / 2) * step;
+  };
+
+  const ports = new Map<string, { from: Pt; to: Pt; track: number }>();
+  for (const [id, list] of out) {
+    const n = nodes.get(id)!;
+    list.sort((a, b) => centreY(a.to_service) - centreY(b.to_service) || a.id.localeCompare(b.id));
+    list.forEach((e, i) => {
+      const prev = ports.get(e.id);
+      ports.set(e.id, {
+        from: { x: n.x + NODE_W, y: spread(n, list.length, i) },
+        to: prev?.to ?? { x: 0, y: 0 },
+        // Each edge out of a node gets its OWN vertical track. Without this,
+        // two edges whose elbows land on the same x share that segment and the
+        // pair renders as a closed rectangle — one shape, not two edges.
+        track: (i - (list.length - 1) / 2) * TRACK_GAP,
+      });
+    });
+  }
+  for (const [id, list] of inn) {
+    const n = nodes.get(id)!;
+    list.sort((a, b) => centreY(a.from_service) - centreY(b.from_service) || a.id.localeCompare(b.id));
+    list.forEach((e, i) => {
+      const prev = ports.get(e.id);
+      ports.set(e.id, {
+        from: prev?.from ?? { x: 0, y: 0 },
+        to: { x: n.x, y: spread(n, list.length, i) },
+        track: prev?.track ?? 0,
+      });
+    });
+  }
+  return ports;
+}
+
+/** One rounded right-angle turn at `corner`, arriving from `prev` and leaving
+ *  toward `next`. Returns the SVG segment; the arc is skipped when a leg is too
+ *  short for it, which would otherwise overshoot and kink. */
+function turn(prev: Pt, corner: Pt, next: Pt): string {
+  const inLen = Math.hypot(corner.x - prev.x, corner.y - prev.y);
+  const outLen = Math.hypot(next.x - corner.x, next.y - corner.y);
+  const r = Math.min(CORNER, inLen / 2, outLen / 2);
+  if (r < 1) return ` L ${corner.x} ${corner.y}`;
+  const ux = Math.sign(corner.x - prev.x), uy = Math.sign(corner.y - prev.y);
+  const vx = Math.sign(next.x - corner.x), vy = Math.sign(next.y - corner.y);
+  return (
+    ` L ${corner.x - ux * r} ${corner.y - uy * r}` +
+    ` Q ${corner.x} ${corner.y} ${corner.x + vx * r} ${corner.y + vy * r}`
+  );
+}
+
+/** Orthogonal path through a list of points, rounding each corner. */
+function orthPath(pts: Pt[]): string {
+  let d = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) d += turn(pts[i - 1], pts[i], pts[i + 1]);
+  const last = pts[pts.length - 1];
+  return d + ` L ${last.x} ${last.y}`;
+}
+
+/**
+ * Orthogonal ("squared") route from one node to another.
+ *
+ * Replaces a bezier. The curves read as organic and made every edge look
+ * approximate, which is the wrong impression for a diagram whose whole claim is
+ * that these are observed facts. Right angles also make it obvious when two
+ * edges share a track, where a curve just looked like a slightly different
+ * curve.
+ *
+ * Shape: a horizontal stub out of the source, one vertical run at the midpoint
+ * of the gap, then a horizontal stub into the target — the classic Z route,
+ * degenerating to a straight line when both ports share a y.
+ */
+export function edgePath(
+  from: Node, to: Node, via: Pt[], port?: { from: Pt; to: Pt; track?: number },
+): { d: string; mid: Pt } {
+  const start: Pt = port?.from ?? { x: from.x + NODE_W, y: from.y + NODE_H / 2 };
+  const end: Pt = port?.to ?? { x: to.x, y: to.y + NODE_H / 2 };
 
   if (via.length === 0 && end.x <= start.x) {
-    // Back edge (a cycle, or same column): bow underneath so it stays readable
-    // instead of hiding behind the nodes.
-    const dip = Math.max(Math.abs(end.y - start.y), NODE_H) + 26;
+    // Back edge (a cycle, or same column): drop below both boxes and run back
+    // along a horizontal track, rather than hiding behind the nodes. The dip
+    // lands inside the BACK_EDGE_ROOM layout() reserves for exactly this.
+    const dip = Math.max(from.y + NODE_H, to.y + NODE_H) + BACK_EDGE_ROOM / 2;
+    const pts = [start, { x: start.x + 18, y: start.y }, { x: start.x + 18, y: dip },
+                 { x: end.x - 18, y: dip }, { x: end.x - 18, y: end.y }, end];
+    return { d: orthPath(pts), mid: { x: (start.x + end.x) / 2, y: dip } };
+  }
+
+  // Straight through when the ports line up — no elbow to draw.
+  if (via.length === 0 && Math.abs(start.y - end.y) < 0.5) {
     return {
-      d: `M ${start.x} ${start.y} C ${start.x + 40} ${start.y + dip}, ${end.x - 40} ${end.y + dip}, ${end.x} ${end.y}`,
-      mid: { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 + dip * 0.75 },
+      d: `M ${start.x} ${start.y} L ${end.x} ${end.y}`,
+      mid: { x: (start.x + end.x) / 2, y: start.y },
     };
   }
 
-  const pts = [start, ...via, end];
-  let d = `M ${start.x} ${start.y}`;
-  for (let i = 1; i < pts.length; i++) {
-    const p = pts[i - 1];
-    const q = pts[i];
-    const c = (q.x - p.x) * 0.5;
-    d += ` C ${p.x + c} ${p.y}, ${q.x - c} ${q.y}, ${q.x} ${q.y}`;
+  const track = port?.track ?? 0;
+
+  if (via.length > 0) {
+    // A column-skipping edge takes ONE bypass channel rather than an elbow per
+    // leg. The waypoint already reserves a row between the boxes it passes, so
+    // running the whole horizontal at that row is both correct and legible:
+    // the edge visibly goes around the intervening node.
+    //
+    // Elbowing per leg instead produced a staircase whose segments closed into
+    // a rectangle, which read as a container rather than as two edges.
+    const channelY = via[0].y;
+    const sx = start.x + 18 + track;
+    const ex = end.x - 18 - track;
+    const pts: Pt[] = [start];
+    if (Math.abs(start.y - channelY) >= 0.5) pts.push({ x: sx, y: start.y }, { x: sx, y: channelY });
+    if (Math.abs(end.y - channelY) >= 0.5) pts.push({ x: ex, y: channelY }, { x: ex, y: end.y });
+    pts.push(end);
+    return { d: orthPath(pts), mid: { x: (sx + ex) / 2, y: channelY } };
   }
 
-  // Label anchor: a waypoint when there is one (it is on the drawn curve by
-  // construction), else the midpoint of the single segment.
-  const mid = via.length
-    ? via[(via.length - 1) >> 1]
+  // Adjacent columns: the classic Z, with the vertical run on this edge's own
+  // track and clamped inside the gap so it never doubles back.
+  const lo = Math.min(start.x, end.x) + 12;
+  const hi = Math.max(start.x, end.x) - 12;
+  const xm = Math.max(lo, Math.min(hi, (start.x + end.x) / 2 + track));
+  const pts: Pt[] = [start, { x: xm, y: start.y }, { x: xm, y: end.y }, end];
+
+  // Label on the first vertical run when there is one — a vertical segment has
+  // clear space either side of it, where a horizontal run is where the lines
+  // bunch together.
+  const vertical = pts.find((q, i) => i > 0 && Math.abs(q.x - pts[i - 1].x) < 0.5 && Math.abs(q.y - pts[i - 1].y) > 8);
+  const vi = vertical ? pts.indexOf(vertical) : -1;
+  const mid = vi > 0
+    ? { x: pts[vi].x, y: (pts[vi].y + pts[vi - 1].y) / 2 }
     : { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
-  return { d, mid };
+  return { d: orthPath(pts), mid };
 }
 
 /**
@@ -395,6 +539,9 @@ export function DependencyFlow({
 
   const tooBig = nodeCount > MAX_NODES || visible.length > MAX_EDGES;
   const l = useMemo(() => layout(tooBig ? [] : visible, deg), [visible, tooBig, deg]);
+  // Attachment points, computed once per layout: orthogonal lines that share a
+  // port read as a single thick line rather than as several edges.
+  const ports = useMemo(() => assignPorts(tooBig ? [] : visible, l.nodes), [visible, tooBig, l]);
 
   if (tooBig) {
     return (
@@ -468,7 +615,7 @@ export function DependencyFlow({
             const on = !focus || e.from_service === focus || e.to_service === focus;
             const c = confidence(e);
             const stale = isStale(e);
-            const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? []);
+            const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? [], ports.get(e.id));
             return (
               <g key={e.id} className={`flow__edge${on ? " flow__edge--on" : ""}`}>
                 <title>
