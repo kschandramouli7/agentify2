@@ -391,6 +391,23 @@ func (c *Client) initSchema(ctx context.Context) error {
 		PRIMARY KEY (tenant_id, cluster_id, namespace, service)
 	);
 	CREATE INDEX IF NOT EXISTS idx_cluster_services_lookup ON cluster_services(tenant_id, namespace, service);
+
+	-- Service profile (ROADMAP P22): what each service IS, alongside the
+	-- selector that says which pods it fronts. Every column is populated from
+	-- data the collector already fetched and discarded — list_services returned
+	-- spec.type and spec.ports and kept only the selector, and the workload list
+	-- was reduced to a boolean. No new K8s call, no new RBAC.
+	--
+	-- Replica counts are nullable on purpose: a CronJob has none, and "0
+	-- replicas" (scaled to zero, a real finding) must not be stored the same as
+	-- "we do not know".
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS service_type     TEXT NOT NULL DEFAULT '';
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS ports            JSONB NOT NULL DEFAULT '[]'::jsonb;
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS workload_kind    TEXT NOT NULL DEFAULT '';
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS replicas_desired INT;
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS replicas_ready   INT;
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS image            TEXT NOT NULL DEFAULT '';
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS schedule         TEXT NOT NULL DEFAULT '';
 	-- ADR 0029 (P18 use case #2's Glue extension): each Service's K8s
 	-- selector, alongside its name. Discovery already fetches this on every
 	-- scan (main.py's list_services, used for its own live from_service
@@ -1961,6 +1978,37 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 type ServiceEntry struct {
 	Name     string
 	Selector map[string]string
+
+	// Service profile (ROADMAP P22). Zero values mean "the collector did not
+	// report it" — an older build, or a Service with no matching workload,
+	// which is itself worth surfacing.
+	ServiceType     string
+	Ports           []ServicePort
+	WorkloadKind    string
+	ReplicasDesired *int
+	ReplicasReady   *int
+	Image           string
+	Schedule        string
+}
+
+type ServicePort struct {
+	Name     string `json:"name,omitempty"`
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// ServiceProfile is one service as the architecture view reads it back.
+type ServiceProfile struct {
+	Namespace       string        `json:"namespace"`
+	Service         string        `json:"service"`
+	ServiceType     string        `json:"service_type"`
+	Ports           []ServicePort `json:"ports"`
+	WorkloadKind    string        `json:"workload_kind"`
+	ReplicasDesired *int          `json:"replicas_desired"`
+	ReplicasReady   *int          `json:"replicas_ready"`
+	Image           string        `json:"image"`
+	Schedule        string        `json:"schedule"`
+	ClusterID       string        `json:"cluster_id,omitempty"`
 }
 
 // UpsertClusterServices replaces the full known-service set for one
@@ -1986,14 +2034,28 @@ func (c *Client) UpsertClusterServices(ctx context.Context, tenantID, clusterID 
 	}
 	for namespace, services := range byNamespace {
 		for _, service := range services {
+			// Ports are stored as JSONB rather than a child table: they are only
+			// ever read back with their service, and a Service has a handful.
+			ports := service.Ports
+			if ports == nil {
+				ports = []ServicePort{}
+			}
+			portsJSON, err := json.Marshal(ports)
+			if err != nil {
+				return fmt.Errorf("marshal ports for %s/%s: %w", namespace, service.Name, err)
+			}
 			selectorJSON, err := json.Marshal(service.Selector)
 			if err != nil {
 				return fmt.Errorf("marshal selector for %s/%s: %w", namespace, service.Name, err)
 			}
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO cluster_services (tenant_id, cluster_id, namespace, service, selector, updated_at)
-				 VALUES ($1, $2, $3, $4, $5, NOW())`,
-				tenantID, clusterID, namespace, service.Name, selectorJSON); err != nil {
+				`INSERT INTO cluster_services (tenant_id, cluster_id, namespace, service, selector,
+				                               service_type, ports, workload_kind,
+				                               replicas_desired, replicas_ready, image, schedule, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
+				tenantID, clusterID, namespace, service.Name, selectorJSON,
+				service.ServiceType, portsJSON, service.WorkloadKind,
+				service.ReplicasDesired, service.ReplicasReady, service.Image, service.Schedule); err != nil {
 				return fmt.Errorf("insert cluster service %s/%s: %w", namespace, service.Name, err)
 			}
 		}
@@ -2070,6 +2132,59 @@ func (c *Client) ListClusterServices(ctx context.Context, tenantID string) (map[
 		result[namespace] = append(result[namespace], service)
 	}
 	return result, rows.Err()
+}
+
+// ListServiceProfiles returns what every service in one namespace IS —
+// workload kind, service type, ports, replicas, image — across every cluster
+// belonging to tenantID (same scoping rationale as ListServiceDependencies).
+//
+// This is the read that turns anonymous boxes on the dependency diagram into
+// an architecture view; RLS enforces the tenant boundary.
+func (c *Client) ListServiceProfiles(ctx context.Context, tenantID, namespace string) ([]ServiceProfile, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT namespace, service, service_type, ports, workload_kind,
+		       replicas_desired, replicas_ready, image, schedule, COALESCE(cluster_id, '')
+		FROM cluster_services WHERE namespace = $1 ORDER BY service`, namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ServiceProfile
+	for rows.Next() {
+		var p ServiceProfile
+		var portsJSON []byte
+		if err := rows.Scan(&p.Namespace, &p.Service, &p.ServiceType, &portsJSON, &p.WorkloadKind,
+			&p.ReplicasDesired, &p.ReplicasReady, &p.Image, &p.Schedule, &p.ClusterID); err != nil {
+			return nil, err
+		}
+		// A malformed ports blob must not fail the whole namespace — the rest
+		// of the profile is still useful.
+		if len(portsJSON) > 0 {
+			if err := json.Unmarshal(portsJSON, &p.Ports); err != nil {
+				c.logger.Warn("bad ports JSON on cluster_services row",
+					"namespace", p.Namespace, "service", p.Service, "error", err)
+				p.Ports = nil
+			}
+		}
+		if p.Ports == nil {
+			p.Ports = []ServicePort{}
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ListClusterServiceSelectors returns one specific cluster's known services

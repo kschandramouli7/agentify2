@@ -109,6 +109,47 @@ async def _scan_namespace(ns: str, cfg: Config) -> None:
     await push_scan_coverage(ns, coverage, cfg.backend_url, cfg.collector_token)
 
 
+async def _service_profiles(ns: str, services: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach each Service's workload facts to it — the "service profile".
+
+    Every field here comes from requests the collector already made and then
+    discarded: list_services returned spec.type/ports and kept only the
+    selector; the workload list was reduced to a boolean ("does this namespace
+    have workloads"). Nothing new is fetched and no new RBAC is needed.
+
+    Workloads are matched to Services by the SAME selector-to-pod-label rule
+    used everywhere else (service_index), applied to the workload's pod
+    TEMPLATE labels — a Service selects the pods, and a workload's own metadata
+    labels commonly differ from its template's.
+
+    A Service with no matching workload keeps a profile with no kind, which is
+    itself informative: something is fronting pods nothing in this namespace
+    declares.
+    """
+    workloads = await k8s_client.list_workloads(ns)
+    profiles = []
+    for svc in services:
+        selector = svc.get("selector") or {}
+        match = None
+        if selector:
+            for w in workloads:
+                labels = w.get("template_labels") or {}
+                if all(labels.get(k) == v for k, v in selector.items()):
+                    match = w
+                    break
+        profiles.append({
+            "service": svc["name"],
+            "service_type": ("Headless" if svc.get("headless") else svc.get("type") or "ClusterIP"),
+            "ports": svc.get("ports") or [],
+            "workload_kind": (match or {}).get("kind") or "",
+            "replicas_desired": (match or {}).get("replicas_desired"),
+            "replicas_ready": (match or {}).get("replicas_ready"),
+            "image": ((match or {}).get("images") or [None])[0],
+            "schedule": (match or {}).get("schedule") or "",
+        })
+    return profiles
+
+
 async def _namespace_services(ns: str) -> Optional[List[Dict[str, Any]]]:
     """This namespace's services (name + selector) if it's "active" — has at
     least one Service, Deployment, StatefulSet, or DaemonSet — else None
@@ -133,8 +174,22 @@ async def _scan_inventory(namespaces: List[str], cfg: Config) -> None:
     namespace_services: Dict[str, List[Dict[str, Any]]] = {}
     for ns in namespaces:
         services = await _namespace_services(ns)
-        if services is not None:
-            namespace_services[ns] = services
+        if services is None:
+            continue
+        # Enrich each Service entry with its workload profile before pushing.
+        # The profile rides the EXISTING inventory push rather than a second
+        # request: cluster_services already is the registry of "what services
+        # exist", so "what they are" belongs on the same row. A separate table
+        # could disagree with this one.
+        try:
+            profiles = {p["service"]: p for p in await _service_profiles(ns, services)}
+        except Exception:  # noqa: BLE001
+            logger.exception("service profile build failed for namespace=%s", ns)
+            profiles = {}
+        namespace_services[ns] = [
+            {**svc, **{k: v for k, v in profiles.get(svc["name"], {}).items() if k != "service"}}
+            for svc in services
+        ]
     if namespace_services:
         await push_inventory(namespace_services, cfg.backend_url, cfg.collector_token)
 

@@ -122,7 +122,27 @@ async def list_services(namespace: str) -> List[Dict[str, Any]]:
         name = item.get("metadata", {}).get("name", "")
         if not name:
             continue
-        services.append({"name": name, "selector": item.get("spec", {}).get("selector") or {}})
+        spec = item.get("spec", {}) or {}
+        # Everything below arrives in the SAME response we already make; it was
+        # being discarded. spec.type/ports/clusterIP are what turn an anonymous
+        # box on the dependency diagram into "an internally-exposed HTTPS
+        # service on 8443" (ROADMAP P22 service profile).
+        services.append({
+            "name": name,
+            "selector": spec.get("selector") or {},
+            "type": spec.get("type") or "ClusterIP",
+            # clusterIP "None" means headless — no VIP, used for peer discovery
+            # by StatefulSets. Worth distinguishing from a normal ClusterIP.
+            "headless": (spec.get("clusterIP") == "None"),
+            "ports": [
+                {
+                    "name": pt.get("name") or "",
+                    "port": pt.get("port"),
+                    "protocol": pt.get("protocol") or "TCP",
+                }
+                for pt in (spec.get("ports") or [])
+            ],
+        })
     return services
 
 
@@ -195,6 +215,38 @@ async def list_tls_secrets(namespace: str) -> List[Dict[str, str]]:
     return secrets
 
 
+async def _list_apps_v1_objects(namespace: str, resource: str) -> List[Dict[str, Any]]:
+    """Workloads in `namespace` with the fields a service profile needs.
+
+    Same request `_list_apps_v1_names` already makes — it extracted names and
+    dropped the rest. Replica counts and the container image are the difference
+    between "payment-api" and "payment-api · Deployment · 3/3 · nginx:1.25".
+    """
+    resp = await _k8s_get(f"/apis/apps/v1/namespaces/{quote(namespace)}/{resource}")
+    if resp is None or resp.status_code != 200:
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in resp.json().get("items", []):
+        meta = item.get("metadata", {}) or {}
+        spec = item.get("spec", {}) or {}
+        status = item.get("status", {}) or {}
+        name = meta.get("name", "")
+        if not name:
+            continue
+        containers = ((spec.get("template", {}) or {}).get("spec", {}) or {}).get("containers", []) or []
+        out.append({
+            "name": name,
+            # The pod TEMPLATE labels are what a Service selects on — the same
+            # distinction service_index documents for attribution.
+            "template_labels": (((spec.get("template", {}) or {}).get("metadata", {}) or {}).get("labels") or {}),
+            "replicas_desired": spec.get("replicas"),
+            # DaemonSets have no spec.replicas; their status carries the counts.
+            "replicas_ready": status.get("readyReplicas", status.get("numberReady")),
+            "images": [c["image"] for c in containers if c.get("image")],
+        })
+    return out
+
+
 async def _list_apps_v1_names(namespace: str, resource: str) -> List[str]:
     """Shared list-and-extract-names helper for the apps/v1 workload kinds
     below — identical shape to list_services/list_pods, just against a
@@ -205,6 +257,53 @@ async def _list_apps_v1_names(namespace: str, resource: str) -> List[str]:
         return []
     items = resp.json().get("items", [])
     return [name for item in items if (name := item.get("metadata", {}).get("name", ""))]
+
+
+async def list_workloads(namespace: str) -> List[Dict[str, Any]]:
+    """Every apps/v1 workload in `namespace`, tagged with its kind.
+
+    Kind is the most classifying single fact about a service: a Deployment
+    serves, a StatefulSet holds state, a DaemonSet runs per node. CronJobs live
+    under batch/v1 and are fetched separately below.
+    """
+    out: List[Dict[str, Any]] = []
+    for resource, kind in (
+        ("deployments", "Deployment"),
+        ("statefulsets", "StatefulSet"),
+        ("daemonsets", "DaemonSet"),
+    ):
+        for w in await _list_apps_v1_objects(namespace, resource):
+            out.append({**w, "kind": kind})
+    for w in await _list_cronjobs(namespace):
+        out.append(w)
+    return out
+
+
+async def _list_cronjobs(namespace: str) -> List[Dict[str, Any]]:
+    """CronJobs (batch/v1) — the one workload kind that says "batch, on a
+    schedule" rather than "serving", and the schedule itself is worth showing."""
+    resp = await _k8s_get(f"/apis/batch/v1/namespaces/{quote(namespace)}/cronjobs")
+    if resp is None or resp.status_code != 200:
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in resp.json().get("items", []):
+        meta = item.get("metadata", {}) or {}
+        spec = item.get("spec", {}) or {}
+        name = meta.get("name", "")
+        if not name:
+            continue
+        job = ((spec.get("jobTemplate", {}) or {}).get("spec", {}) or {}).get("template", {}) or {}
+        containers = ((job.get("spec", {}) or {}).get("containers", []) or [])
+        out.append({
+            "kind": "CronJob",
+            "name": name,
+            "template_labels": ((job.get("metadata", {}) or {}).get("labels") or {}),
+            "replicas_desired": None,
+            "replicas_ready": None,
+            "images": [c["image"] for c in containers if c.get("image")],
+            "schedule": spec.get("schedule") or "",
+        })
+    return out
 
 
 async def list_deployments(namespace: str) -> List[str]:

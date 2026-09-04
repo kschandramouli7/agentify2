@@ -3027,6 +3027,15 @@ code {
 .flow__node--distant { opacity: 0.72; }
 .flow__node--off { opacity: 0.32; }
 .flow__label { fill: var(--text); font-size: 12px; pointer-events: none; }
+/* The middle line: WHAT the service is (kind, scale, exposure). Reads above
+   the role line because it is a declarative fact, where the role is derived
+   from observed edges. */
+.flow__what {
+  fill: var(--text);
+  font-size: 10px;
+  opacity: 0.82;
+  pointer-events: none;
+}
 .flow__sub {
   fill: var(--muted);
   font-size: 9.5px;

@@ -32,7 +32,44 @@ export type NodeMeta = {
   /** What to draw in the box. The id must stay unique and collision-proof
    *  (an ingress id is prefixed), which makes it the wrong thing to display. */
   label?: string;
+  /** Declarative facts from the Kubernetes objects — workload kind, scale,
+   *  exposure. Distinct in kind from everything else here: a profile is a
+   *  FACT, where coverage and edges are evidence. */
+  workloadKind?: string;
+  replicasReady?: number | null;
+  replicasDesired?: number | null;
+  serviceType?: string;
+  ports?: { name?: string; port: number; protocol?: string }[];
+  image?: string;
+  schedule?: string;
 };
+
+/** The middle line of a node: what this service IS.
+ *
+ *  Ordered by how much it classifies the box — kind first (a CronJob is a
+ *  categorically different thing from a Deployment), then scale, then how it
+ *  is exposed. Omitted entirely when the collector reported no profile, rather
+ *  than padded with "unknown": an empty line reads as "not collected", a line
+ *  of unknowns reads as a finding. */
+function profileText(m?: NodeMeta): string | null {
+  if (!m) return null;
+  const bits: string[] = [];
+  // Kind only — a raw cron expression ("*/30 * * * *") is 12 characters of
+  // noise that pushed the port off the line. "CronJob" already says "batch";
+  // the schedule itself lives in the tooltip.
+  if (m.workloadKind) bits.push(m.workloadKind);
+  // 0/2 is a real and urgent finding, so a zero must print. Only null is unknown.
+  if (m.replicasReady != null && m.replicasDesired != null) {
+    bits.push(`${m.replicasReady}/${m.replicasDesired}`);
+  }
+  if (m.ports?.length) {
+    const p = m.ports[0];
+    bits.push(m.ports.length > 1 ? `${p.port} +${m.ports.length - 1}` : String(p.port));
+  } else if (m.serviceType === "Headless") {
+    bits.push("headless");
+  }
+  return bits.length ? bits.join(" · ") : null;
+}
 
 /** Fit a string to the node box. Hostnames are the reason this exists —
  *  "agentify-dev.elb.amazonaws.com" is twice the width of the box and spilled
@@ -83,7 +120,7 @@ function fit(text: string, max: number): string {
 // means the same thing whether or not some other edge was seen 4000 times.
 
 const NODE_W = 158;
-const NODE_H = 46;   // two lines: name + degree/role subtitle
+const NODE_H = 60;   // three lines: name, what it is, and its role in the graph
 const BEND_H = 20;   // a routing waypoint reserves less room than a real node
 const COL_GAP = 84;
 const ROW_GAP = 26;
@@ -725,6 +762,7 @@ export function DependencyFlow({
           {[...l.nodes.values()].map(n => {
             const hop = hopOf(n.id);
             const m = meta?.get(n.id);
+            const profile = profileText(m);
             const unobserved = n.inDeg === 0 && n.outDeg === 0 && m?.kind !== "ingress";
             const cls = [
               "flow__node",
@@ -751,6 +789,13 @@ export function DependencyFlow({
                  }}>
                 <title>
                   {`${n.id} — ${roleText(n, m)}` +
+                   (profile ? `\n${profile}` : "") +
+                   (m?.schedule ? `\nschedule: ${m.schedule}` : "") +
+                   (m?.image ? `\nimage: ${m.image}` : "") +
+                   (m?.ports?.length
+                     ? `\nports: ${m.ports.map(p => `${p.name ? p.name + " " : ""}${p.port}/${p.protocol ?? "TCP"}`).join(", ")}`
+                     : "") +
+                   (m?.serviceType ? `\nexposure: ${m.serviceType}` : "") +
                    (m?.coverage != null
                      ? `\nObserved in ${Math.round(m.coverage * 100)}% of scans` +
                        (m.podsSeen != null ? ` (${m.podsSampled ?? 0} of ${m.podsSeen} pods sampled)` : "")
@@ -768,7 +813,17 @@ export function DependencyFlow({
                 <text x={n.x + NODE_W / 2} y={n.y + 19} textAnchor="middle" className="flow__label">
                   {fit(m?.label ?? n.id, 21)}
                 </text>
-                <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__sub">
+                {profile && (
+                  <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__what">
+                    {fit(profile, 26)}
+                  </text>
+                )}
+                <text
+                  x={n.x + NODE_W / 2}
+                  y={profile ? n.y + 49 : n.y + 38}
+                  textAnchor="middle"
+                  className="flow__sub"
+                >
                   {roleText(n, m)}
                 </text>
               </g>

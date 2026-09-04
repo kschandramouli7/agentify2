@@ -19,6 +19,15 @@ type fakeClusterServiceStore struct {
 	lastUpsert    map[string][]pgstore.ServiceEntry
 	resolved      map[string][]string                     // "namespace/service" -> cluster ids
 	selectors     map[string]map[string]map[string]string // "cluster_id/namespace" -> service -> selector
+	profiles      map[string][]pgstore.ServiceProfile     // namespace -> profiles (ROADMAP P22)
+	profileErr    error
+}
+
+func (f *fakeClusterServiceStore) ListServiceProfiles(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceProfile, error) {
+	if f.profileErr != nil {
+		return nil, f.profileErr
+	}
+	return f.profiles[namespace], nil
 }
 
 func (f *fakeClusterServiceStore) UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]pgstore.ServiceEntry) error {

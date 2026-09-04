@@ -423,6 +423,30 @@ export type IngressEndpoint = {
   backend_service: string;
 };
 
+/** What a service IS, not just that it exists (ROADMAP P22).
+ *
+ *  Every field is read from Kubernetes objects the collector already fetched
+ *  and previously discarded, so this is declarative fact — no inference and
+ *  no evidence caveat, unlike a mined dependency edge. */
+export type ServiceProfile = {
+  namespace: string;
+  service: string;
+  service_type: string;                 // ClusterIP | Headless | LoadBalancer | NodePort
+  ports: { name?: string; port: number; protocol?: string }[];
+  workload_kind: string;                // Deployment | StatefulSet | DaemonSet | CronJob
+  replicas_desired: number | null;      // null = unknown; 0 = scaled to zero, a real finding
+  replicas_ready: number | null;
+  image: string;
+  schedule: string;                     // CronJob only
+  cluster_id?: string;
+};
+
+export async function listServiceProfiles(namespace: string): Promise<ServiceProfile[]> {
+  const res = await fetch(`/api/service-profiles?namespace=${encodeURIComponent(namespace)}`);
+  if (!res.ok) return [];   // best-effort: the graph is still worth drawing without profiles
+  return (await res.json()) as ServiceProfile[];
+}
+
 export async function listClusterIngress(namespace: string): Promise<IngressEndpoint[]> {
   const res = await fetch(`/api/cluster-ingress?namespace=${encodeURIComponent(namespace)}`);
   if (!res.ok) return [];   // best-effort: a missing entry-point map must not blank the panel

@@ -2105,6 +2105,24 @@ type namespaceInventory struct {
 type serviceInventoryEntry struct {
 	Name     string            `json:"name"`
 	Selector map[string]string `json:"selector,omitempty"`
+
+	// Service profile (ROADMAP P22) — what this service IS, not just that it
+	// exists. Every field comes from requests the collector already made and
+	// discarded, so this costs no extra K8s call. All optional: an older
+	// collector omits them and the row keeps whatever it had.
+	ServiceType     string             `json:"service_type,omitempty"`     // ClusterIP | Headless | LoadBalancer | NodePort
+	Ports           []servicePortEntry `json:"ports,omitempty"`
+	WorkloadKind    string             `json:"workload_kind,omitempty"`    // Deployment | StatefulSet | DaemonSet | CronJob
+	ReplicasDesired *int               `json:"replicas_desired,omitempty"` // pointer: 0 replicas and "unknown" are different
+	ReplicasReady   *int               `json:"replicas_ready,omitempty"`
+	Image           string             `json:"image,omitempty"`
+	Schedule        string             `json:"schedule,omitempty"` // CronJob only
+}
+
+type servicePortEntry struct {
+	Name     string `json:"name,omitempty"`
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 func (s *serviceInventoryEntry) UnmarshalJSON(data []byte) error {
@@ -2176,7 +2194,16 @@ func (h *Handler) HandleClusterInventoryUpsert(w http.ResponseWriter, r *http.Re
 		namespaces = append(namespaces, ns.Name)
 		entries := make([]pgstore.ServiceEntry, 0, len(ns.Services))
 		for _, svc := range ns.Services {
-			entries = append(entries, pgstore.ServiceEntry{Name: svc.Name, Selector: svc.Selector})
+			ports := make([]pgstore.ServicePort, 0, len(svc.Ports))
+			for _, pt := range svc.Ports {
+				ports = append(ports, pgstore.ServicePort{Name: pt.Name, Port: pt.Port, Protocol: pt.Protocol})
+			}
+			entries = append(entries, pgstore.ServiceEntry{
+				Name: svc.Name, Selector: svc.Selector,
+				ServiceType: svc.ServiceType, Ports: ports, WorkloadKind: svc.WorkloadKind,
+				ReplicasDesired: svc.ReplicasDesired, ReplicasReady: svc.ReplicasReady,
+				Image: svc.Image, Schedule: svc.Schedule,
+			})
 		}
 		byNamespace[ns.Name] = entries
 	}
@@ -2477,6 +2504,46 @@ type clusterServiceSelectorsResponse struct {
 // other Agent-to-Hub call (the Glue-based miner, this endpoint's only
 // caller, has no per-cluster credential of its own). Returns an empty map
 // (200), never an error, when nothing matches.
+// HandleServiceProfileList returns what every service in a namespace IS —
+// workload kind, service type, ports, replicas, image (ROADMAP P22).
+//
+// Namespace-scoped and cluster-agnostic, unlike
+// HandleClusterServiceSelectors: the architecture view is drawn per namespace
+// and does not know or care which cluster a service runs in.
+func (h *Handler) HandleServiceProfileList(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if h.clusterServiceStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.ServiceProfile{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	profiles, err := h.clusterServiceStore.ListServiceProfiles(r.Context(), tenantID, namespace)
+	if err != nil {
+		// Degrade to empty: the dependency graph is still worth drawing
+		// without the profile, same convention as every other read here.
+		h.logger.Warn("failed to list service profiles", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.ServiceProfile{})
+		return
+	}
+	if profiles == nil {
+		profiles = []pgstore.ServiceProfile{}
+	}
+	writeJSON(w, http.StatusOK, profiles)
+}
+
 func (h *Handler) HandleClusterServiceSelectors(w http.ResponseWriter, r *http.Request) {
 	clusterID := r.URL.Query().Get("cluster_id")
 	namespace := r.URL.Query().Get("namespace")

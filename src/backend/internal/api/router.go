@@ -109,6 +109,10 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	// which has no live cluster access of its own.
 	mux.HandleFunc("GET /api/cluster-service-selectors", h.HandleClusterServiceSelectors)
 
+	// What each service IS, for the architecture view (ROADMAP P22).
+	// Namespace-scoped and cluster-agnostic, unlike the selectors read above.
+	mux.HandleFunc("GET /api/service-profiles", h.HandleServiceProfileList)
+
 	// Admin: on-demand cert renewal — issues from Vault PKI + updates K8s Secret
 	mux.HandleFunc("POST /admin/certs/renew", h.HandleCertRenew)
 

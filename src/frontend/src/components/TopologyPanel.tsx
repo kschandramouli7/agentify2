@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  listServiceDependencies, listClusterIngress, listScanCoverage,
+  listServiceDependencies, listClusterIngress, listScanCoverage, listServiceProfiles,
   type ServiceDependency,
 } from "../api";
 import { DependencyFlow, confidence, rarelyObserved, type FlowEdge, type NodeMeta } from "./DependencyFlow";
@@ -246,6 +246,13 @@ export function TopologyPanel() {
     queryFn: () => listScanCoverage(applied),
     enabled: applied.length > 0,
   });
+  // What each service IS — workload kind, scale, exposure. Declarative facts
+  // read from the Kubernetes objects, so no evidence caveat applies to them.
+  const { data: profiles = [] } = useQuery({
+    queryKey: ["service-profiles", applied],
+    queryFn: () => listServiceProfiles(applied),
+    enabled: applied.length > 0,
+  });
   // Full service inventory for this namespace, from the same /admin/tracked
   // the namespace picker already reads. This is what makes services with no
   // observed edges appear at all.
@@ -273,6 +280,23 @@ export function TopologyPanel() {
     const now = new Date().toISOString();
 
     for (const svc of inventory) meta.set(svc, { kind: "service" });
+
+    // Profiles double as an inventory source: they come from cluster_services,
+    // which is the registry itself, so a service present there but missing
+    // from /admin/tracked still gets drawn.
+    for (const p of profiles) {
+      meta.set(p.service, {
+        ...(meta.get(p.service) ?? { kind: "service" as const }),
+        kind: "service",
+        workloadKind: p.workload_kind || undefined,
+        replicasReady: p.replicas_ready,
+        replicasDesired: p.replicas_desired,
+        serviceType: p.service_type || undefined,
+        ports: p.ports?.length ? p.ports : undefined,
+        image: p.image || undefined,
+        schedule: p.schedule || undefined,
+      });
+    }
 
     for (const e of ingress) {
       if (!e.backend_service) continue;                 // nothing to point at
@@ -309,9 +333,10 @@ export function TopologyPanel() {
 
     // Services in the inventory that no edge (observed or declared) mentions.
     const referenced = new Set(edges.flatMap(e => [e.from_service, e.to_service]));
-    const standalone = inventory.filter(s => !referenced.has(s));
-    return { edges, meta, standalone };
-  }, [data, ingress, coverage, inventory, applied]);
+    const known = new Set<string>([...inventory, ...profiles.map(p => p.service)]);
+    const standalone = [...known].filter(s => !referenced.has(s)).sort();
+    return { edges, meta, standalone, known };
+  }, [data, ingress, coverage, inventory, profiles, applied]);
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
   const rare = useMemo(() => rarelyObserved(graph.edges), [graph.edges]);
@@ -399,7 +424,7 @@ export function TopologyPanel() {
           <div className="adm-stats-row">
             <StatCard
               label="Services"
-              value={String(Math.max(inventory.length, graph.services.length))}
+              value={String(Math.max(arch.known.size, graph.services.length))}
               sub={
                 arch.standalone.length > 0
                   ? `${arch.standalone.length} with no observed calls`

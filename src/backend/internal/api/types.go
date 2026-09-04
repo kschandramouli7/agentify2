@@ -145,6 +145,9 @@ type ClusterServiceStore interface {
 	// 0029) — consulted by the Glue-based dependency miner, which has no
 	// live cluster access of its own.
 	ListClusterServiceSelectors(ctx context.Context, tenantID, clusterID, namespace string) (map[string]map[string]string, error)
+
+	// Service profile read for the architecture view (ROADMAP P22).
+	ListServiceProfiles(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceProfile, error)
 }
 
 // NamespaceEntry is one discovered namespace, returned by the namespace-sync
