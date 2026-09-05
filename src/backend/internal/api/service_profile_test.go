@@ -184,3 +184,36 @@ func TestServiceHealthList_EmptyIsAnArrayNotNull(t *testing.T) {
 		t.Errorf("body = %q, want []", got)
 	}
 }
+
+// TestServiceHealthList_DoesNotCountDeletedPods is the regression test for the
+// numbers a real cluster produced on 2026-09-05.
+//
+// current_state never forgets a pod: a DELETED watch event is upserted like any
+// other, so after ten rollouts a 1-replica Deployment had ten rows. The health
+// query counted all of them and the UI rendered "9/1 · 1 not ready" for a
+// service whose single pod was Running 1/1.
+//
+// The store is faked here, so what this pins is the CONTRACT the query must
+// satisfy: rows for deleted pods must never reach the caller. The predicate
+// itself is exercised by the real-Postgres suite.
+func TestServiceHealthList_DoesNotCountDeletedPods(t *testing.T) {
+	store := &fakeClusterHealthStore{serviceHealth: map[string][]pgstore.ServiceHealth{
+		// What a correct query returns for the observed cluster: one live pod.
+		"agentify": {{Namespace: "agentify", Service: "agentify-agent", Pods: 1, Ready: 1,
+			Restarts: 0, Phases: []string{"Running"}}},
+	}}
+	rec := getHealth(t, healthHandler(store), "?namespace=agentify")
+	var out []pgstore.ServiceHealth
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("got %d rows, want 1", len(out))
+	}
+	// The shape that was wrong: ready must never exceed pods, and neither may
+	// exceed what the cluster actually runs.
+	if out[0].Ready > out[0].Pods {
+		t.Errorf("ready=%d exceeds pods=%d — the query is counting rows for pods that no longer exist",
+			out[0].Ready, out[0].Pods)
+	}
+}

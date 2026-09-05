@@ -69,12 +69,21 @@ function profileText(m?: NodeMeta): string | null {
   // noise that pushed the port off the line. "CronJob" already says "batch";
   // the schedule itself lives in the tooltip.
   if (m.workloadKind) bits.push(m.workloadKind);
-  // Live readiness beats the declared spec when both exist: the spec says what
-  // was asked for, the watch says what is true. 0/2 is a real and urgent
-  // finding, so a zero must print — only null is unknown.
-  const ready = m.podsReadyNow ?? m.replicasReady;
-  const total = m.replicasDesired ?? m.podsRunning;
-  if (ready != null && total != null) bits.push(`${ready}/${total}`);
+  // The ratio comes from the DEPLOYMENT STATUS, not the pod watch, and the two
+  // are never mixed.
+  //
+  // The previous version showed `podsReadyNow ?? replicasReady` over
+  // `replicasDesired ?? podsRunning` — a live numerator over a declared
+  // denominator. That is incoherent even with clean data, and with the watch
+  // over-counting (it retained deleted pods) it rendered a 1-replica
+  // Deployment as "9/1". readyReplicas/replicas is authoritative, is what
+  // `kubectl get deploy` shows, and cannot accumulate.
+  //
+  // 0/2 is a real and urgent finding, so a zero must print — only null is
+  // unknown.
+  if (m.replicasReady != null && m.replicasDesired != null) {
+    bits.push(`${m.replicasReady}/${m.replicasDesired}`);
+  }
   if (m.ports?.length) {
     const p = m.ports[0];
     bits.push(m.ports.length > 1 ? `${p.port} +${m.ports.length - 1}` : String(p.port));
@@ -94,13 +103,21 @@ function troubleText(m?: NodeMeta): string | null {
   if (!m) return null;
   const bad = (m.phases ?? []).filter(p => p && p !== "Running" && p !== "Succeeded");
   if (bad.length) return fit(bad.join(", "), 24);
-  if (m.podsReadyNow != null && m.podsRunning != null && m.podsReadyNow < m.podsRunning) {
-    return `${m.podsRunning - m.podsReadyNow} not ready`;
+  // "Not ready" from the DEPLOYMENT's own numbers, for the same reason as the
+  // ratio above. Deriving it from watch counts produced "8 not ready" for a
+  // service whose single pod was Running 1/1, because the subtraction was over
+  // pods that no longer existed.
+  if (m.replicasReady != null && m.replicasDesired != null && m.replicasReady < m.replicasDesired) {
+    return `${m.replicasDesired - m.replicasReady} not ready`;
   }
   // PER POD, not total. A 3-pod StatefulSet with 6 lifetime restarts is two
   // each — normal churn. Flagging that in red is how a status colour gets
-  // trained out of a reader, so the threshold scales with the pod count.
-  const perPod = (m.restarts ?? 0) / Math.max(1, m.podsRunning ?? 1);
+  // trained out of a reader, so the threshold scales with the replica count.
+  //
+  // Divided by the DECLARED replica count, not the watched pod count: the
+  // latter includes pods that have been replaced, which would understate the
+  // per-pod rate and hide a genuine crash loop.
+  const perPod = (m.restarts ?? 0) / Math.max(1, m.replicasDesired ?? m.podsRunning ?? 1);
   if (perPod >= 5) return `${m.restarts} restarts`;
   return null;
 }

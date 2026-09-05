@@ -2392,6 +2392,22 @@ func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace stri
 		   AND event_namespace = 'k8fy.live-state'
 		   AND payload->>'namespace' = $2
 		   AND COALESCE(payload->>'service', '') <> ''
+		   -- Exclude pods the watch saw deleted.
+		   --
+		   -- current_state NEVER FORGETS A POD: a DELETED watch event is
+		   -- normalised to event_type 'pod_deleted' and UPSERTED like any
+		   -- other, so the row survives holding the dead pod's final state,
+		   -- and nothing in this codebase deletes from current_state. Without
+		   -- this predicate the counts below are "every pod that has ever
+		   -- existed", which after ten rollouts reported a 1-replica
+		   -- Deployment as 9 ready of 10 pods.
+		   --
+		   -- This is necessary but NOT sufficient: a pod that vanishes while
+		   -- the watch is reconnecting never produces a DELETED event and its
+		   -- row persists indefinitely. That is why the ready/desired RATIO
+		   -- shown in the UI comes from the Deployment status instead of from
+		   -- these counts — see OPS-12.
+		   AND COALESCE(event_type, '') <> 'pod_deleted'
 		 GROUP BY 1
 		 ORDER BY 1`, tenantID, namespace)
 	if err != nil {
