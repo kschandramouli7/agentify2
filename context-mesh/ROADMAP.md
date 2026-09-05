@@ -31,7 +31,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P4c** | Investigation-on-anomaly loop (human-in-loop, **no** auto-remediation) | **✅ v1 done (2026-06-06: opt-in periodic deterministic sweep → diagnose → Slack-compatible webhook; namespace incident dedup + cooldown + per-sweep cap; redacted egress; read-only)** | [spec 009](specs/009-investigation-on-anomaly.md), [ADR 0016](decisions/0016-proactive-investigation-loop.md); respects [ADR 0003](decisions/0003-read-only-to-actions-boundary.md) |
 | **P5** | Pattern A standardisation across all skill classes (deterministic pre-fetch + single Claude call per intent) | **✅ Done (2026-06-11: all 5 skills on Pattern A; DiagnoseSkill advisor/executor removed; [ADR 0026](decisions/0026-pattern-a-skills-standardisation.md))** | [spec 010](specs/010-skill-router.md), [ADR 0026](decisions/0026-pattern-a-skills-standardisation.md) |
 | **P5+** | Supporting tooling: AI gateway (semantic cache/budgets), eval harness + tool-call budgets, agent tracing | Later | ops/spec |
-| **P6** | HashiCorp Vault integration — cert management + autonomous rotation | **✅ Scaffold done (2026-06-17)** — open items: Vault HA, Terraform provider, dynamic secrets |
+| **P6** | HashiCorp Vault integration — cert management + autonomous rotation | **✅ Scaffold done (2026-06-17)** — open items: Vault HA, Terraform provider, dynamic secrets | — |
 | **P7** | **Eval harness as CI gate** — Langfuse dataset + CI eval step | **✅ Done (2026-06-25)** — `scripts/seed_eval_dataset.py` + `scripts/run_evals.py` + 02-deploy.yml gate; `intent`+`tier` added to QueryResponse | [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md) |
 | **P8** | RAG + pgvector + semantic memory (third memory layer) | After P7 | [ADR 0018](decisions/0018-three-layer-memory-architecture.md) |
 | **P9** | PR review agent — second domain use case proving two-tier generalises | **Not started. Architecture decision (2026-07-20): build as its own deployable agent, not a `SkillRouter` entry in `src/agent`** — see below | — |
@@ -45,13 +45,13 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; review dashboard (Dependencies tab), bare-hostname matching, and a deterministic `dependencies` intent answering in chat and on `/api/query` with no model call (tier1) added 2026-09-01 (ADR 0029 amendment, `docs/SERVICE_DEPENDENCIES.md`) — the FQDN-only rule had left `agentify`/`vault` at zero edges while `payments` passed only because its test workloads logged FQDNs deliberately; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go`, `src/frontend/src/components/TopologyPanel.tsx`, `docs/SERVICE_DEPENDENCIES.md` |
 | **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
-| **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, per-service health, each carrying its own evidence coverage. Data audit done 2026-09-03; blocked on pod→service attribution + P21 | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) | this file — ADR at implementation |
+| **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | **Proposed (2026-09-01)** — not built, but **its substrate now is**: `scan_coverage` (P27 phase 1, `c3e93c7`) gives measured coverage, and the Dependencies panel already ships a v0 of its central finding — the "incomplete: N edges caught in under a quarter of scans" banner. What remains is the agent and the per-finding recommendations | this file — ADR at implementation |
+| **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, per-service health, each carrying its own evidence coverage. Data audit done 2026-09-03 | **v1 SHIPPED 2026-09-03/05 as a UI view, NOT as a document.** Live in the Dependencies panel: whole-namespace inventory (`d15e466`), declared entry points, per-service coverage, service profiles — workload kind, replicas, ports, image (`7af085d`), and live pod health (`b71473e`). Its recorded hard blocker, pod→service attribution, was resolved in `5bc3a2a`. **The prose generator the name promises does not exist**; v2 (version skew over time) is unchanged | this file — **v1 shipped with no ADR.** One is owed: health is read from the Deployment's `readyReplicas` rather than from pod-watch counts, which is the non-obvious call (OPS-12 in the operational backlog below) |
+| **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) — **blocked, and the blocker worsened**: the eval set is invalid twice over, by OPS-5's degraded cluster in the baseline and by an unfunded Anthropic account failing every Tier-2 item (2026-09-05) | this file — ADR at implementation |
+| **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **still blocked on P27 phase 2**: no port is stored, so a generated policy could only say `allow all ports`. P21's coverage floor is the second prerequisite | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | Proposed (2026-09-03) | this file — ADR at implementation |
+| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 2, 4, 5 not started — phase 2 is the one that unblocks P24 | this file — **phases 1 and 3 shipped with no ADR.** One is owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
@@ -1216,7 +1216,7 @@ work across every K8s distribution, not just EKS. This item is the concrete
    how this would actually run "in the collector" surfaced that there were
    two per-cluster collectors with overlapping concerns (the original
    k8fy-adapter and Discovery) — resolved by
-   [ADR 0027](../decisions/0027-merge-k8fy-adapter-into-discovery.md)'s full
+   [ADR 0027](decisions/0027-merge-k8fy-adapter-into-discovery.md)'s full
    merge before this item started. There is now unambiguously one place
    "in the collector" means: Discovery's scan cycle
    (`src/adapters/discovery/main.py`), which already runs the metric/
@@ -1260,7 +1260,7 @@ follow-ups (per-tenant model routing/BYOK, per-tenant redaction policy) —
 tracked separately per ADR 0022 Decision #8, not solved here. The
 k8fy-adapter/collector consolidation ADR 0022 Decision #9 flagged is
 **resolved** — see
-[ADR 0027](../decisions/0027-merge-k8fy-adapter-into-discovery.md).
+[ADR 0027](decisions/0027-merge-k8fy-adapter-into-discovery.md).
 
 **Not started** — this is a design item, not yet a plan or code.
 
@@ -1776,14 +1776,26 @@ computes it today. This is the cheapest item on the ladder and the only one
 that tells you whether P22 and the unbuilt spec-011 use cases are standing on
 solid ground.
 
-**Relationship to P27, so the two do not read as rivals.** A v1 can ship on
-today's *inferred* coverage, which is why this item claims to need nothing.
-But inferred coverage cannot distinguish "called less often" from "logs became
-unreadable" from "pod not among the five sampled" — the exact ambiguity that
-made `payment-worker`'s decline uninterpretable on 2026-09-03. **P27 phase 1
-replaces the inference with a measured denominator**, and this item's findings
-get sharply better the moment it lands. Ship v1 on inference; do not design as
-if inference were the end state.
+**Relationship to P27 — resolved 2026-09-03.** P27 phase 1 shipped
+(`c3e93c7`), so the measured denominator this item wanted now exists:
+`scan_coverage` records, per service per cycle, whether the pod was sampled,
+whether its logs were readable, and how many lines came back. Build on the
+measurement; the inferred-coverage fallback described here is no longer
+needed.
+
+**A v0 of this item's central finding is already live.** The Dependencies
+panel shows "N edges are caught in under a quarter of scans … treat this graph
+as more incomplete than the counts suggest" (`bc9771b`). What remains is the
+agent: turning those signals into per-finding recommendations about someone
+else's code — "log the target host in this client", "this Deployment has no
+Service so its calls are unattributable", "this pod is multi-container so its
+logs return nothing (OPS-9)".
+
+**Three days of evidence that this item is the priority.** OPS-10, OPS-11 and
+OPS-12 were all introduced between 2026-09-03 and 2026-09-05, all of the same
+class — a subsystem reporting a confident number over data it had no right to
+trust — and all were caught by a human reading the UI, not by the platform.
+That is precisely what this item exists to do.
 
 ### Open question
 
@@ -1846,18 +1858,21 @@ assumed. Recording it so nobody repeats the audit.
 
 | Section | Source | State |
 |---|---|---|
-| Call graph, entry points, terminal services | `service_dependencies` | **Available.** The Dependencies panel already derives entry/terminal and transitive reach. |
-| Ingress exposure | `cluster_ingress_endpoints` (kind, name, host, backend_service) | **Available.** |
-| Service inventory + selectors | `cluster_services` + `selector JSONB` | **Available.** |
-| K8s version, cluster-wide pod counts | `cluster_health_snapshots` | **Available, but cluster-wide only** — one row per cluster, overwrite-in-place, so no history. |
-| Per-service replicas / ready / restarts | pod events → `current_state` (`phase`, `ready`, `restarts`) | **Data present, not joinable** — see the blocker below. |
-| Version skew per service | deploy events → `current_state` (`images`, `replicas_desired`, `entity_key` = deployment name) | **Data present, not joinable**, and no history to skew against. |
-| Completeness per section | — | **Absent.** P27 phase 1 / P21. |
+| Call graph, entry points, terminal services | `service_dependencies` | **SHIPPED.** |
+| Ingress exposure | `cluster_ingress_endpoints` (kind, name, host, backend_service) | **SHIPPED** (`d15e466`) — drawn as declared routes, visually distinct from mined edges. |
+| Service inventory + selectors | `cluster_services` + `selector JSONB` | **SHIPPED** (`d15e466`) — every service is drawn, not only those an edge mentions. |
+| What each service IS (kind, replicas, ports, image) | `cluster_services` profile columns | **SHIPPED** (`7af085d`) — from data `list_services` and the workload list already fetched and discarded. |
+| K8s version, cluster-wide pod counts | `cluster_health_snapshots` | **Available, cluster-wide only, and still unused by the panel.** One row per cluster, overwrite-in-place, so no history. The pod-count half is now redundant — `cluster_services` carries `replicas_desired`/`replicas_ready` per service, which is the granularity a diagram needs. The K8s version has no per-service equivalent and is the one thing this table still uniquely holds. |
+| Per-service replicas / ready / restarts | pod events → `current_state`, plus the Deployment's own `readyReplicas` | **SHIPPED** (`5bc3a2a` attribution, `b71473e` health, `2f10125` correctness). The ready/desired ratio comes from the **Deployment status**, not from watch counts — counting watch rows reported a 1-replica Deployment as `9/1` because `current_state` retains deleted pods (OPS-12). |
+| Version skew per service | `cluster_services.image` (`7af085d`); previously deploy events → `current_state` | **Joinable now, but still no history.** `5bc3a2a` + `7af085d` resolved the join — the image is stored against the service, so "which services run which image" is a query today. What remains is that `cluster_services` is rewritten in place every scan, so there is nothing to compare *against*: skew across services in one moment is answerable, drift of one service over time is not. Fixing that means a history table, which is a bigger decision than this item; do not describe it as skew until then. |
+| Completeness per section | `scan_coverage` | **SHIPPED** (`c3e93c7`, surfaced per node in `d15e466`). |
 
 ### What it needs first
 
-- **Pod → service attribution, Hub-side. Newly found, and a hard blocker for
-  two sections.** `normalize_pod_event`'s payload is `pod_id`, `namespace`,
+- ~~**Pod → service attribution, Hub-side.**~~ **RESOLVED 2026-09-03 in `5bc3a2a`** —
+  the collector now resolves `service` at push time, since it already computes
+  the match for dependency mining. Recorded below as originally written, because
+  the reasoning is what made the cheap fix findable: `normalize_pod_event`'s payload is `pod_id`, `namespace`,
   `phase`, `ready`, `restarts` — **no labels**. So although
   `cluster_services.selector` is right there, the Hub cannot join a pod to its
   Service, and the same gap applies to deployment → service. The consequence is
@@ -1898,9 +1913,15 @@ generator is right — so fixing it first is convenient, not required.
 
 ### Scope split, so v1 does not ship with empty sections
 
-**v1 — sourceable today (after the two hard blockers above):**
+**v1 — SHIPPED 2026-09-03/05, as a UI view rather than a document:**
 call graph, entry points and terminal services, ingress exposure, per-service
-health, and per-section coverage.
+health, and per-section coverage — all live in the Dependencies panel.
+
+**What "v1 shipped" does NOT include, despite the item's name.** There is no
+generated *document*: the data all reaches a diagram, and nothing writes prose.
+Anyone picking this up should decide whether the document is still wanted now
+that the panel answers the same questions interactively — the honest options
+are to build the generator, or to rename the item and drop the promise.
 
 **v2 — needs new capture:**
 version skew over time (`cluster_health_snapshots` is overwrite-in-place by
@@ -2166,7 +2187,7 @@ the service is calling less often, its logs became unreadable, or its pod
 stopped being among the five sampled. Three different problems, one
 indistinguishable symptom.
 
-### Phase 1 — the denominator (this is also P21's measurement half)
+### Phase 1 — the denominator (this is also P21's measurement half) — **SHIPPED `c3e93c7`**
 
 Record, per `(namespace, service, scan cycle)`: was the pod sampled? were its
 logs readable? how many lines came back? That turns coverage from a ratio
@@ -2177,7 +2198,7 @@ denominator, and it answers the `payment-worker` question above directly.
 measurement substrate; **P21 consumes and reports on it.** P21 is the agent
 and the recommendations; this is the data it needs to exist.
 
-### Phase 2 — outcome and port (pure parsing wins, biggest payoff)
+### Phase 2 — outcome and port (pure parsing wins, biggest payoff) — **NOT STARTED, and now the gate on P24**
 
 - **Outcome counters** — success / failure / timeout, and retry state where
   present. This is the single largest information loss today: it converts a
@@ -2190,7 +2211,7 @@ and the recommendations; this is the data it needs to exist.
 `timeout`), so this needs a normaliser and will be partial. Partial is fine;
 *silently* partial is not — see the warning below.
 
-### Phase 3 — reach past the namespace boundary
+### Phase 3 — reach past the namespace boundary — **PARTLY SHIPPED, partly withdrawn**
 
 Cross-namespace edges (`vault.vault`) and external egress
 (`api.anthropic.com`) are dropped **by design** today, because the miner
@@ -2204,6 +2225,22 @@ validates candidates against one namespace's Service list. Capturing them:
 *Caveat:* an external host cannot be validated against a Service list, so these
 must be stored in a separate, lower trust tier and never mixed with in-cluster
 edges in a policy without review.
+
+**What happened on 2026-09-05.** Both halves shipped (`17c324e`); the external
+half was disabled the same day (`3372d45`) after fabricating `www.nokia.com`
+(a scanner's `Referer`), `internet-measurement.com` (a scanner's `User-Agent`)
+and two `voyageai.com` hosts (URLs quoted in Voyage's own error body). The
+caveat above turned out to be the whole story rather than a footnote — see
+`docs/SERVICE_DEPENDENCIES.md` for the rejection table and the three
+conditions for re-enabling it.
+
+The cross-namespace half survives, but only after a second fix (`552791b`):
+validating just the namespace segment let a trace UUID pass as a service name,
+because `_HOSTNAME_RE` accepts hex and hyphens. Both segments are now checked
+against the target namespace's real Service list. **The lesson is recorded
+because it recurred twice in two days:** removing a validation step and
+replacing it with a shape heuristic produces confident fabrications, and the
+only reliable guard is checking a candidate against a real object.
 
 ### Phase 4 — provenance and shape
 
@@ -2303,7 +2340,7 @@ Small, non-feature actions that must not be lost between P-items.
 | OPS-2 | **Set `EVAL_AUTH_TOKEN`** | The prompt promotion gate returns 503 until it is set, now that an empty token fails closed outside dev ([ADR 0030](decisions/0030-version-pinned-prompt-evaluation.md) amendment). Same value in `infra/kubernetes/backend.yaml` (preferably a `secretKeyRef`) and the repo's Actions secrets. | 2026-09-01 |
 | OPS-3 | **`REMEDIATION_AUTH_TOKEN` and `COLLECTOR_TOKEN` still treat empty as open** | Remediation is **write-capable** (restart / scale / rollback, [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) Phase 3), so an unset token is a larger exposure than the one OPS-2 closes. Changing the posture revises ADR 0020, so it needs a decision rather than a patch. | 2026-09-01 |
 | OPS-4 | **Add a Voyage AI payment method** | Currently 3 RPM / 10K TPM. Embed writes are async and skipped on failure, so nothing breaks — vectors are simply dropped as diagnose volume rises ([SEMANTIC_MEMORY.md](../docs/SEMANTIC_MEMORY.md)). | 2026-08-31 |
-| OPS-8 | ~~payments-test manifests reference Docker Hub in a namespace with no internet route~~ **WITHDRAWN 2026-09-01 — the hypothesis was wrong.** It assumed ADR 0021's no-NAT Fargate profile still describes this account. It does not: `05-payment-test.yml` records that "this account has a NAT gateway on the payments namespace's subnet, unlike ADR 0021's original no-NAT Fargate assumption", and `02-deploy.yml` says the same. Docker Hub is reachable, the plain image references are deliberate, and the init containers' `apk add curl jq` works for the same reason. **The genuine residue is dead code:** `03-vault-bootstrap.yml` still rewrites `ACCOUNT_ID.dkr.ecr…` in three manifests that contain no such placeholder, so the `sed` is a no-op that reads as though the ECR mirror were required. Worth deleting, or restoring the placeholder if a no-NAT deployment is still a supported shape. **This is therefore NOT the cause of OPS-5** — that remains unexplained. | 2026-09-01 |
+| OPS-8 | ~~payments-test manifests reference Docker Hub in a namespace with no internet route~~ | **WITHDRAWN 2026-09-01 — the hypothesis was wrong.** It assumed ADR 0021's no-NAT Fargate profile still describes this account. It does not: `05-payment-test.yml` records that "this account has a NAT gateway on the payments namespace's subnet, unlike ADR 0021's original no-NAT Fargate assumption", and `02-deploy.yml` says the same. Docker Hub is reachable, the plain image references are deliberate, and the init containers' `apk add curl jq` works for the same reason. **The genuine residue is dead code:** `03-vault-bootstrap.yml` still rewrites `ACCOUNT_ID.dkr.ecr…` in three manifests that contain no such placeholder, so the `sed` is a no-op that reads as though the ECR mirror were required. Worth deleting, or restoring the placeholder if a no-NAT deployment is still a supported shape. **This is therefore NOT the cause of OPS-5** — that remains unexplained. | 2026-09-01 |
 | OPS-12 | **`current_state` never forgets a pod — no delete path exists** | A `DELETED` pod watch event is normalised to `event_type='pod_deleted'` and **upserted** like any other, so the row survives holding the dead pod's final state; there is no `DELETE FROM current_state` anywhere in the codebase. After ten rollouts on 2026-09-05 each agentify service had ~10 pod rows, and `ListServiceHealth` counted all of them — rendering a 1-replica Deployment as **"9/1 · 1 not ready"** while `kubectl` showed `1/1 Running`. Mitigated the same day by excluding `pod_deleted` from the query and by sourcing the ready/desired ratio from the Deployment status instead of watch counts. **The residual is real:** a pod that vanishes while the watch is reconnecting produces no DELETED event, so its row persists indefinitely and still pollutes phase and restart aggregates. Freshness cannot substitute — the watch is change-driven, so a healthy stable pod emits nothing for hours and would age out wrongly. The fix is a genuine delete path on the generic store (a design change: `current_state` has no per-row Go struct and no delete semantics, cf. ADR 0022's note) or periodic reconciliation against the live pod list the scan already fetches. | 2026-09-05 |
 | OPS-11 | **Delete the fabricated external-egress edges** | The `external` tier shipped and was disabled on 2026-09-05 (see `docs/SERVICE_DEPENDENCIES.md`). It wrote `www.nokia.com` (a scanner's `Referer`), `internet-measurement.com` (a scanner's `User-Agent`) and `dashboard.voyageai.com` / `docs.voyageai.com` (URLs quoted in Voyage's own 402 body) as dependencies of the platform — and because the receiving backend predated the `target_kind` column, they were stored in the **strong** tier as `service`. The UI now reclassifies them by shape, but the rows are still wrong. A Kubernetes Service name is an RFC 1123 label and never contains a dot, so this is exact: `DELETE FROM service_dependencies WHERE to_service LIKE '%.%' AND to_service NOT LIKE '%.svc.cluster.local';`. The three `c53b9dca-…` targets were **explained and fixed on 2026-09-05**: `_HOSTNAME_RE` accepts hex and hyphens, so a trace UUID followed by a real namespace passed the cross-namespace tier, which validated only the namespace segment. Both segments are now checked against the real Service list. Rows already written still need this DELETE. | 2026-09-05 |
 | OPS-10 | **`current_state` has `tenant_id` but no RLS policy** | Every other table carrying per-customer data has `ENABLE`/`FORCE ROW LEVEL SECURITY` plus a `tenant_isolation` policy; `current_state` has the column and no policy, because [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md) deferred it as "a query-retrofit-phase decision" and the retrofit never happened. `ListServiceHealth` (P22, added 2026-09-05) therefore filters `tenant_id` in its **own WHERE clause** with no backstop — drop that predicate and one tenant's service inventory and pod state leak to another, silently. Either add the policy (and the grant) or keep every future reader of this table auditing its own scoping. | 2026-09-05 |
