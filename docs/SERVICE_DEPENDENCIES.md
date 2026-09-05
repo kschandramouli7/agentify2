@@ -323,6 +323,54 @@ and its tooltip says so. **Do not merge the tiers** — a generated
 NetworkPolicy (P24) built from `external` edges without review would encode
 guesses as firewall rules.
 
+> ### The `external` tier is OFF by default. It was shipped and disabled the same day.
+>
+> `MINE_EXTERNAL_EGRESS=false` (2026-09-05). It produced, in one afternoon on a
+> real cluster:
+>
+> | Fabricated dependency | Actual source |
+> |---|---|
+> | `www.nokia.com` | a `Referer` header in the frontend's nginx access log |
+> | `internet-measurement.com` | an internet scanner's `User-Agent`, which embeds `+https://…` |
+> | `dashboard.voyageai.com`, `docs.voyageai.com` | URLs quoted inside Voyage's own 402 error body |
+>
+> **The flaw is structural, not a tuning problem.** The extractor cannot
+> distinguish a host we *called* from a host that merely *appears* in the log
+> text. The in-namespace miner never had this problem because it validates
+> every candidate against the live Service list — a scanner's `Referer` will
+> never be a Service name. Removing that validation removed the only thing
+> keeping it honest, and no amount of hostname-shape heuristics replaces it.
+>
+> It was also worse than it looked: the backend that received these edges
+> predated the `target_kind` column, so it **silently stored every one as
+> `service`** — the strong tier — and they rendered as `terminal · 1 caller`,
+> indistinguishable from a validated edge. The UI now falls back to
+> classifying by shape (an RFC 1123 Service name cannot contain a dot), so it
+> is honest against old rows too.
+>
+> **Cross-namespace mining stays on**, because its namespace segment *is*
+> validated against namespaces the Hub tracks. That is the guard the external
+> tier lacks entirely.
+>
+> **Conditions for turning it back on**, none of which are met:
+> 1. a discriminator on the *log line shape*, not the hostname — an outbound
+>    client call (`POST https://host/…`, an httpx/client-library prefix) looks
+>    nothing like an access-log line with a status code and a quoted
+>    User-Agent, and that difference is the real signal;
+> 2. rejection of hosts appearing inside quoted strings, which is where
+>    `Referer` and `User-Agent` always live;
+> 3. an operator-declared expected-egress allow-list, so a novel host is a
+>    *finding to confirm* rather than a fact asserted on the diagram.
+>
+> Cleaning up rows already written (a Service name never contains a dot, so
+> this is exact):
+>
+> ```sql
+> DELETE FROM service_dependencies
+>  WHERE to_service LIKE '%.%'
+>    AND to_service NOT LIKE '%.svc.cluster.local';
+> ```
+
 **The guards on the weak tier are the specification, and they live in tests.**
 A log line is full of dotted strings that are not hosts, and every one of these
 would otherwise become a fabricated dependency:

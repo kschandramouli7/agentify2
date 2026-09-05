@@ -283,6 +283,10 @@ export function TopologyPanel() {
 
   // Declared entry points become synthetic nodes and edges. Their ids are
   // prefixed so they can never collide with a real service name.
+  // Namespaces this tenant tracks, for the shape fallback above: "svc.payments"
+  // is cross-namespace, "www.nokia.com" is not.
+  const knownNamespaceSet = useMemo(() => new Set(namespaces), [namespaces]);
+
   const arch = useMemo(() => {
     const edges: FlowEdge[] = [...(data ?? [])];
     const meta = new Map<string, NodeMeta>();
@@ -295,12 +299,26 @@ export function TopologyPanel() {
     // comes from target_kind rather than being guessed from the string, so a
     // log-format change cannot silently reclassify them.
     for (const e of data ?? []) {
-      if (e.target_kind === "cross_namespace" || e.target_kind === "external") {
-        meta.set(e.to_service, {
-          kind: e.target_kind,
-          label: e.to_service,
-        });
-      }
+      // Classify by target_kind when the backend supplies it, and FALL BACK TO
+      // SHAPE when it does not.
+      //
+      // The fallback is not a guess: a Kubernetes Service name is an RFC 1123
+      // label — lowercase alphanumerics and hyphens, never a dot. So a dotted
+      // target in a namespace-scoped graph cannot be an in-namespace service,
+      // whatever the row says. This matters because a backend that predates
+      // the target_kind column silently stored every external target as
+      // 'service', which put "www.nokia.com" in the STRONG tier and drew it
+      // as "terminal · 1 caller" — indistinguishable from a validated edge.
+      const dotted = e.to_service.includes(".");
+      const kind =
+        e.target_kind === "cross_namespace" || e.target_kind === "external"
+          ? e.target_kind
+          : dotted
+            ? (knownNamespaceSet.has(e.to_service.split(".").slice(1).join("."))
+                ? "cross_namespace"
+                : "external")
+            : null;
+      if (kind) meta.set(e.to_service, { kind, label: e.to_service });
     }
 
     // Profiles double as an inventory source: they come from cluster_services,
@@ -377,7 +395,7 @@ export function TopologyPanel() {
     // mentions them, so they are always referenced by definition.
     const standalone = [...known].filter(s => !referenced.has(s)).sort();
     return { edges, meta, standalone, known };
-  }, [data, ingress, coverage, inventory, profiles, health, applied]);
+  }, [data, ingress, coverage, inventory, profiles, health, applied, knownNamespaceSet]);
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
   const rare = useMemo(() => rarelyObserved(graph.edges), [graph.edges]);

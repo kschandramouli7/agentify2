@@ -790,7 +790,13 @@ export function DependencyFlow({
             // An edge to a public host rests on hostname shape alone. Drawn
             // lighter so it can never be mistaken for a validated in-cluster
             // call, and the tooltip says why.
-            const weak = e.target_kind === "external";
+            // Same shape fallback as the panel's classifier: a dotted target
+            // cannot be an in-namespace Service (RFC 1123 labels have no
+            // dots), so it is drawn as the weaker tier even when an older
+            // backend recorded it as 'service'.
+            const weak =
+              e.target_kind === "external" ||
+              (!e.target_kind && meta?.get(e.to_service)?.kind === "external");
             const c = confidence(e);
             const stale = !declared && isStale(e);
             const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? [], ports.get(e.id));

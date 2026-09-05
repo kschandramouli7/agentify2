@@ -117,6 +117,18 @@ async def _scan_namespace(ns: str, cfg: Config, known_namespaces: Optional[Set[s
         # construction (nothing validates a public hostname), pushed with its
         # kind so the two never merge.
         for kind, target in extract_external_mentions(logs, ns, known_namespaces or set()):
+            # The external tier is OFF by default and this is why: it cannot
+            # tell a host we called from a host that merely appears in the log
+            # text. A frontend's access log carries the caller's User-Agent and
+            # Referer, and a third-party error body quotes its own docs URLs —
+            # all of which it read as outbound dependencies on 2026-09-05
+            # (www.nokia.com, internet-measurement.com, dashboard.voyageai.com).
+            #
+            # Cross-namespace stays on unconditionally: its namespace segment is
+            # checked against namespaces the Hub tracks, so it has the
+            # validation the external tier lacks.
+            if kind == "external" and not cfg.mine_external_egress:
+                continue
             await push_dependency(
                 ns, from_service, target, cfg.backend_url, cfg.collector_token, target_kind=kind,
             )

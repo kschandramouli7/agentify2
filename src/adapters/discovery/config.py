@@ -22,6 +22,19 @@ class Config:
     log_tail_lines: int
     namespace_exclude: List[str] = field(default_factory=list)
     health_port: int = 8300
+    # Mine EXTERNAL egress hostnames (ROADMAP P27 phase 3). Default OFF.
+    #
+    # Shipped on 2026-09-05 and disabled the same day: the tier cannot tell a
+    # host we CALLED from a host that merely APPEARS in a log line, and a
+    # frontend's access log is full of the latter. It produced
+    # "www.nokia.com" (a scanner's Referer), "internet-measurement.com" (a
+    # scanner's User-Agent) and "dashboard.voyageai.com" (quoted inside
+    # Voyage's own 402 error body) as dependencies of the platform.
+    #
+    # Cross-namespace mining is unaffected and stays on: its namespace segment
+    # is validated against namespaces the Hub actually tracks, which is the
+    # kind of guard the external tier lacks entirely.
+    mine_external_egress: bool = False
 
 
 def load_from_env() -> Config:
@@ -38,7 +51,15 @@ def load_from_env() -> Config:
             "kube-system,kube-public,kube-node-lease,cert-manager,monitoring,ingress-nginx",
         ),
         health_port=_int_env("HEALTH_PORT", 8300),
+        mine_external_egress=_bool_env("MINE_EXTERNAL_EGRESS", False),
     )
+
+
+def _bool_env(key: str, default: bool) -> bool:
+    value = os.getenv(key)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _int_env(key: str, default: int) -> int:
