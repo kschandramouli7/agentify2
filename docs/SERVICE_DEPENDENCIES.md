@@ -305,6 +305,41 @@ The first attempt ramped line width continuously across `evidence_count`, which
 turned "payment-batch logs more" into a visual claim that its dependencies were
 far more important. Do not reintroduce either that or the raw-count bands.
 
+### Three trust tiers, and why they must stay apart
+
+As of 2026-09-05 an edge carries a `target_kind`, because the diagram used to
+claim each namespace was a closed system and that is false as architecture —
+`agentify-agent` calls `vault.vault`, `api.anthropic.com` and an RDS endpoint,
+and none could ever appear.
+
+| `target_kind` | Validated against | Strength |
+|---|---|---|
+| `service` | the live Service list for that namespace | **strong** — a real object confirms the name |
+| `cross_namespace` | the namespace segment, against namespaces the Hub tracks | medium — the namespace is real, the service name is not checked |
+| `external` | **nothing** | **weak** — there is no Service list for the internet, so this rests on hostname-shape heuristics alone |
+
+The weak tier is drawn lighter, its nodes sit unfilled in a boundary column,
+and its tooltip says so. **Do not merge the tiers** — a generated
+NetworkPolicy (P24) built from `external` edges without review would encode
+guesses as firewall rules.
+
+**The guards on the weak tier are the specification, and they live in tests.**
+A log line is full of dotted strings that are not hosts, and every one of these
+would otherwise become a fabricated dependency:
+
+| Rejected | Why it would have matched |
+|---|---|
+| `v1.2.3` | dots, but the last label is numeric |
+| `com.example.Handler.process` | dots and alphabetic labels |
+| `config.yaml`, `go.sum`, `package.json` | passes the TLD shape test — hence an explicit suffix deny-list |
+| `localhost`, `10.0.1.5`, `127.0.0.1`, `169.254.169.254` | loopback, private, and IMDS are not egress |
+| `1.234s`, `99.9th` | measurements |
+| `printer.local`, `*.svc.cluster.local` | in-cluster; the qualified pass owns them |
+
+Matching happens in a hostname context only (`//host` or `host:port`), the last
+label must be alphabetic and at least two characters, and single-label names are
+rejected because the pod search domain makes them in-cluster.
+
 ### The matching rule
 
 A name in log text becomes a candidate in one of two forms:

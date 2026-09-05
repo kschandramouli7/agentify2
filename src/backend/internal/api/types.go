@@ -121,7 +121,7 @@ type PricingStore interface {
 // cluster_id from the request body instead (ADR 0029's trusted-internal-
 // caller override, for the Glue-based dependency miner).
 type ServiceDependencyStore interface {
-	UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService string) error
+	UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string) error
 	ListServiceDependencies(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceDependency, error)
 
 	// Scan coverage lives on this interface rather than its own because it is

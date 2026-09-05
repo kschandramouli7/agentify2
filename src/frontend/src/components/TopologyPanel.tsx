@@ -290,12 +290,27 @@ export function TopologyPanel() {
 
     for (const svc of inventory) meta.set(svc, { kind: "service" });
 
+    // Targets outside this namespace, from the edges themselves — they are not
+    // in any inventory by definition, so the edge is the only source. Kind
+    // comes from target_kind rather than being guessed from the string, so a
+    // log-format change cannot silently reclassify them.
+    for (const e of data ?? []) {
+      if (e.target_kind === "cross_namespace" || e.target_kind === "external") {
+        meta.set(e.to_service, {
+          kind: e.target_kind,
+          label: e.to_service,
+        });
+      }
+    }
+
     // Profiles double as an inventory source: they come from cluster_services,
     // which is the registry itself, so a service present there but missing
     // from /admin/tracked still gets drawn.
     for (const p of profiles) {
+      const prev = meta.get(p.service);
+      if (prev?.kind === "external" || prev?.kind === "cross_namespace") continue;
       meta.set(p.service, {
-        ...(meta.get(p.service) ?? { kind: "service" as const }),
+        ...(prev ?? { kind: "service" as const }),
         kind: "service",
         workloadKind: p.workload_kind || undefined,
         replicasReady: p.replicas_ready,
@@ -332,6 +347,7 @@ export function TopologyPanel() {
 
     for (const h of health) {
       const prev = meta.get(h.service) ?? { kind: "service" as const };
+      if (prev.kind === "external" || prev.kind === "cross_namespace") continue;
       meta.set(h.service, {
         ...prev,
         kind: "service",
@@ -357,6 +373,8 @@ export function TopologyPanel() {
     const known = new Set<string>([
       ...inventory, ...profiles.map(p => p.service), ...health.map(h => h.service),
     ]);
+    // Outside targets are never "standalone": they exist only because an edge
+    // mentions them, so they are always referenced by definition.
     const standalone = [...known].filter(s => !referenced.has(s)).sort();
     return { edges, meta, standalone, known };
   }, [data, ingress, coverage, inventory, profiles, health, applied]);

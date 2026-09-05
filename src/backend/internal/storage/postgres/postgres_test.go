@@ -533,13 +533,13 @@ func TestPostgresStores(t *testing.T) {
 		// prefetch without any Python-side change.
 		tenantID := uuid.New().String()
 
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "checkout-ui", "checkout-api"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "checkout-ui", "checkout-api", "service"); err != nil {
 			t.Fatalf("upsert cluster-a dependency: %v", err)
 		}
 		// Same namespace, same from/to service *names* but a different
 		// cluster — the realistic "downstream service lives in a different
 		// cluster" scenario use case #4 names explicitly.
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-b", "payments", "checkout-ui", "checkout-api"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-b", "payments", "checkout-ui", "checkout-api", "service"); err != nil {
 			t.Fatalf("upsert cluster-b dependency: %v", err)
 		}
 
@@ -671,15 +671,15 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	// would silently collide under the OLD (namespace, from_service,
 	// to_service) unique constraint, merging two tenants' evidence into
 	// one row.
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend"); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service"); err != nil {
 		t.Fatalf("upsert tenant A dependency: %v", err)
 	}
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantB, clusterB.ID, "payments", "payment-ui", "payment-backend"); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantB, clusterB.ID, "payments", "payment-ui", "payment-backend", "service"); err != nil {
 		t.Fatalf("upsert tenant B dependency: %v", err)
 	}
 	// Evidence again for tenant A only — proves ON CONFLICT is scoped per
 	// tenant (increments A's row), not global (which would also bump B's).
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend"); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service"); err != nil {
 		t.Fatalf("re-upsert tenant A dependency: %v", err)
 	}
 

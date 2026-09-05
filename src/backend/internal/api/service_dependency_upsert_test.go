@@ -13,12 +13,13 @@ import (
 // fakeServiceDependencyStore implements ServiceDependencyStore, recording
 // the last UpsertServiceDependency call.
 type fakeServiceDependencyStore struct {
-	lastTenantID  string
-	lastClusterID string
-	lastNamespace string
-	lastFrom      string
-	lastTo        string
-	upsertCalled  bool
+	lastTenantID   string
+	lastClusterID  string
+	lastNamespace  string
+	lastFrom       string
+	lastTo         string
+	upsertCalled   bool
+	lastTargetKind string
 
 	// Scan-coverage calls, recorded so the coverage tests can assert on them
 	// (ROADMAP P27 phase 1).
@@ -49,13 +50,14 @@ func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenan
 	return f.coverageRows, nil
 }
 
-func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService string) error {
+func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string) error {
 	f.upsertCalled = true
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
 	f.lastNamespace = namespace
 	f.lastFrom = fromService
 	f.lastTo = toService
+	f.lastTargetKind = targetKind
 	return nil
 }
 

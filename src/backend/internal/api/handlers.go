@@ -1915,6 +1915,10 @@ type serviceDependencyUpsertRequest struct {
 	FromService string `json:"from_service"`
 	ToService   string `json:"to_service"`
 	ClusterID   string `json:"cluster_id,omitempty"`
+	// "service" | "cross_namespace" | "external" (ROADMAP P27 phase 3). Empty
+	// from an older collector, which only ever reported validated in-namespace
+	// edges — the store defaults it to "service" for exactly that reason.
+	TargetKind  string `json:"target_kind,omitempty"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
@@ -2078,7 +2082,10 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 		clusterID = req.ClusterID
 	}
 	id := uuid.New().String()
-	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService); err != nil {
+	// The kind is taken from the body rather than inferred: only the miner
+	// knows which tier produced the edge, and guessing from the string shape
+	// here would silently reclassify edges on a format change.
+	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

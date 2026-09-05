@@ -18,8 +18,12 @@ export type FlowEdge = ServiceDependency & { kind?: "observed" | "declared" };
 
 /** Extra facts about a node, from inventory rather than from the edges. */
 export type NodeMeta = {
-  /** "service" (a real Kubernetes Service) or "ingress" (an entry point). */
-  kind?: "service" | "ingress";
+  /** What this box represents:
+   *    service          a Kubernetes Service in this namespace
+   *    ingress          a declared entry point from outside
+   *    cross_namespace  a service in another namespace we were seen calling
+   *    external         a public host we were seen calling — the weakest tier */
+  kind?: "service" | "ingress" | "cross_namespace" | "external";
   /** Fraction of scans in which this service's pods were readable, if known. */
   coverage?: number | null;
   /** Pods attributed to it / pods actually sampled, if known. */
@@ -290,6 +294,14 @@ export function layout(
   edges: FlowEdge[],
   deg: Map<string, { in: number; out: number }>,
   standalone: string[] = [],
+  /** Nodes to pin to the final column — targets outside this namespace.
+   *
+   *  Safe because they are sinks BY CONSTRUCTION: the miner only ever records
+   *  an in-namespace service calling out, never the reverse, so nothing in the
+   *  namespace is downstream of them. Pinning therefore groups the external
+   *  boundary at the edge of the picture without contradicting the
+   *  left-to-right call-direction reading. */
+  pinLast: Set<string> = new Set(),
 ): Layout {
   const parents = new Map<string, string[]>();
   const ids = new Set<string>();
@@ -317,6 +329,16 @@ export function layout(
     return d;
   };
   for (const id of ids) resolve(id, new Set());
+
+  // Pin the outside nodes one column past the deepest in-namespace node, so the
+  // boundary is a column of its own rather than scattered by whatever depth
+  // happened to reach each host.
+  if ([...pinLast].some(id => ids.has(id))) {
+    const deepestInside = Math.max(
+      0, ...[...ids].filter(id => !pinLast.has(id)).map(id => depth.get(id) ?? 0),
+    );
+    for (const id of pinLast) if (ids.has(id)) depth.set(id, deepestInside + 1);
+  }
 
   const maxLayer = Math.max(0, ...[...depth.values()]);
   const layers: Slot[][] = Array.from({ length: maxLayer + 1 }, () => []);
@@ -620,6 +642,11 @@ function roleText(n: Node, m?: NodeMeta): string {
   // Just "entry point": the host is already the box label, and repeating it
   // here both duplicated it and overflowed the box on a real ALB hostname.
   if (m?.kind === "ingress") return "entry point";
+  // These sit outside the namespace, so in/out degree within it says nothing
+  // useful about them — what matters is that they are external and how
+  // strongly the claim is grounded.
+  if (m?.kind === "cross_namespace") return "another namespace";
+  if (m?.kind === "external") return "outside the cluster";
   // in=0 AND out=0 is NOT an entry point — it is a service we have no evidence
   // about in either direction. Calling it "entry · calls 0" implied a finding
   // where there is only an absence.
@@ -671,9 +698,19 @@ export function DependencyFlow({
   const deg = useMemo(() => degrees(edges), [edges]);
 
   const tooBig = nodeCount > MAX_NODES || visible.length > MAX_EDGES;
+  // Outside-the-namespace targets, pinned to the boundary column.
+  const pinned = useMemo(() => {
+    const out = new Set<string>();
+    if (!meta) return out;
+    for (const [id, m] of meta) {
+      if (m.kind === "external" || m.kind === "cross_namespace") out.add(id);
+    }
+    return out;
+  }, [meta]);
+
   const l = useMemo(
-    () => layout(tooBig ? [] : visible, deg, tooBig ? [] : visibleStandalone),
-    [visible, tooBig, deg, visibleStandalone],
+    () => layout(tooBig ? [] : visible, deg, tooBig ? [] : visibleStandalone, pinned),
+    [visible, tooBig, deg, visibleStandalone, pinned],
   );
   // Attachment points, computed once per layout: orthogonal lines that share a
   // port read as a single thick line rather than as several edges.
@@ -750,6 +787,10 @@ export function DependencyFlow({
             // rest are the paths carrying impact onward and stay recessive.
             const on = !focus || e.from_service === focus || e.to_service === focus;
             const declared = e.kind === "declared";
+            // An edge to a public host rests on hostname shape alone. Drawn
+            // lighter so it can never be mistaken for a validated in-cluster
+            // call, and the tooltip says why.
+            const weak = e.target_kind === "external";
             const c = confidence(e);
             const stale = !declared && isStale(e);
             const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? [], ports.get(e.id));
@@ -766,6 +807,12 @@ export function DependencyFlow({
                         : `Seen in ${e.evidence_count} of ~${c.scans} scans since it was first ` +
                           `observed (${Math.round((c.coverage ?? 0) * 100)}%) — ${c.label}.\n`) +
                       `This counts sightings in logs, not requests: confidence, not traffic volume.\n` +
+                      (e.target_kind === "external"
+                        ? "WEAKER EVIDENCE: a public hostname, validated against nothing — no " +
+                          "Service list exists for the internet, so this rests on hostname shape.\n"
+                        : e.target_kind === "cross_namespace"
+                          ? "Cross-namespace: validated on its namespace segment only.\n"
+                          : "") +
                       (stale ? "STALE: no new evidence in over 15 minutes.\n" : "") +
                       `Last seen ${new Date(e.last_seen).toLocaleString()}`}
                 </title>
@@ -773,6 +820,7 @@ export function DependencyFlow({
                       className={
                         "flow__line" +
                         (declared ? " flow__line--declared" : "") +
+                        (weak ? " flow__line--weak" : "") +
                         (stale ? " flow__line--stale" : "")
                       }
                       strokeWidth={declared ? 2 : c.width}
@@ -794,10 +842,13 @@ export function DependencyFlow({
             const m = meta?.get(n.id);
             const profile = profileText(m);
             const trouble = troubleText(m);
-            const unobserved = n.inDeg === 0 && n.outDeg === 0 && m?.kind !== "ingress";
+            const outside = m?.kind === "ingress" || m?.kind === "cross_namespace" || m?.kind === "external";
+            const unobserved = n.inDeg === 0 && n.outDeg === 0 && !outside;
             const cls = [
               "flow__node",
               m?.kind === "ingress" ? "flow__node--ingress" : "",
+              m?.kind === "cross_namespace" ? "flow__node--other-ns" : "",
+              m?.kind === "external" ? "flow__node--external" : "",
               // Dashed outline, not dimmed: an unobserved service is present in
               // the cluster and absent from the evidence. Dimming would read as
               // "less important" rather than "not seen".

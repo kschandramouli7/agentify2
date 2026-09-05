@@ -2987,6 +2987,19 @@ code {
 .flow__edge--on .flow__line--declared { stroke: var(--ai, #8b7fd4); }
 .flow__inline-declared { color: var(--ai, #8b7fd4); font-weight: 600; }
 
+/* Outside this namespace. Two tiers, drawn differently because they are
+   grounded differently: a cross-namespace target was validated on its
+   namespace, a public host was validated against nothing. */
+.flow__node--other-ns .flow__box { stroke: var(--border-bright); stroke-dasharray: 7 3; }
+.flow__node--external .flow__box {
+  stroke: var(--dim);
+  stroke-dasharray: 2 3;
+  fill: transparent;   /* not part of the namespace, so not filled like one */
+}
+.flow__node--external .flow__label { fill: var(--muted); }
+/* An edge resting on hostname shape alone reads lighter than a validated one. */
+.flow__line--weak { opacity: 0.55; }
+
 /* An entry point from outside the cluster. */
 .flow__node--ingress .flow__box { stroke: var(--ai, #8b7fd4); stroke-dasharray: none; }
 

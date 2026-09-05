@@ -20,7 +20,7 @@ import logging
 import signal
 import sys
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from . import k8s_client, live_relay, normalize, watch
 from .config import Config, load_from_env
@@ -30,7 +30,12 @@ from .health_snapshot import push_health
 from .ingress import build_ingress_entries, build_route_entries, correlate_gateway_routes, push_ingress
 from .inventory import push_inventory
 from .log_redaction import redact_log_text
-from .service_topology import extract_service_mentions, push_dependency, push_scan_coverage
+from .service_topology import (
+    extract_external_mentions,
+    extract_service_mentions,
+    push_dependency,
+    push_scan_coverage,
+)
 
 logger = logging.getLogger("agentify.discovery")
 
@@ -55,7 +60,7 @@ def _service_for_pod(pod_labels: Dict[str, str], services: List[Dict[str, Any]])
     return service_for_labels(pod_labels, services)
 
 
-async def _scan_namespace(ns: str, cfg: Config) -> None:
+async def _scan_namespace(ns: str, cfg: Config, known_namespaces: Optional[Set[str]] = None) -> None:
     services = await k8s_client.list_services(ns)
     # Seed the shared index from the list this scan already fetched. Free, and
     # it closes the startup window in which the pods watch can deliver events
@@ -105,6 +110,16 @@ async def _scan_namespace(ns: str, cfg: Config) -> None:
             if to_service == from_service:
                 continue  # self-mention, not a dependency
             await push_dependency(ns, from_service, to_service, cfg.backend_url, cfg.collector_token)
+
+        # Beyond the namespace boundary (ROADMAP P27 phase 3): the calls that
+        # made the old diagram claim each namespace was a closed system —
+        # vault.vault, api.anthropic.com, an RDS endpoint. A weaker tier by
+        # construction (nothing validates a public hostname), pushed with its
+        # kind so the two never merge.
+        for kind, target in extract_external_mentions(logs, ns, known_namespaces or set()):
+            await push_dependency(
+                ns, from_service, target, cfg.backend_url, cfg.collector_token, target_kind=kind,
+            )
 
     await push_scan_coverage(ns, coverage, cfg.backend_url, cfg.collector_token)
 
@@ -293,9 +308,14 @@ async def _scan_once(cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
         await _scan_certificates(namespaces, cfg)
     except Exception:
         logger.exception("certificate scan failed")
+    # The namespaces this cluster actually has, passed down so a
+    # "<service>.<namespace>" mention can be validated on its namespace
+    # segment. This is the one guard in the external tier that is not a
+    # heuristic, so it matters that the list is the real one.
+    known_namespaces = set(namespaces)
     for ns in namespaces:
         try:
-            await _scan_namespace(ns, cfg)
+            await _scan_namespace(ns, cfg, known_namespaces)
         except Exception:
             logger.exception("scan failed for namespace=%s", ns)
 

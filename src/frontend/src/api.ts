@@ -402,6 +402,17 @@ export type ServiceDependency = {
   from_service: string;
   to_service: string;
   evidence_count: number;
+  /** What KIND of thing the target is, and therefore how much the edge can be
+   *  trusted (ROADMAP P27 phase 3):
+   *
+   *    service          in-namespace, validated against the live Service list
+   *    cross_namespace  <service>.<namespace>, validated on the namespace only
+   *    external         a public hostname, validated against NOTHING — there
+   *                     is no Service list for the internet, so this tier
+   *                     rests on hostname-shape heuristics alone
+   *
+   *  Absent on rows written before the column existed; treat as "service". */
+  target_kind?: "service" | "cross_namespace" | "external";
   first_seen: string;
   last_seen: string;
   tenant_id: string;

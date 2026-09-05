@@ -287,6 +287,26 @@ func (c *Client) initSchema(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_service_deps_namespace ON service_dependencies(namespace);
 
+	-- ROADMAP P27 phase 3: what KIND of thing the target is, and therefore how
+	-- much the edge can be trusted.
+	--
+	--   service          an in-namespace Service, validated against the live
+	--                    Service list. Strong evidence.
+	--   cross_namespace  <service>.<namespace> where the namespace is one the
+	--                    Hub tracks. Validated on the namespace only.
+	--   external         a public hostname. NOT validated against anything —
+	--                    no Service list exists for the internet, so this tier
+	--                    rests entirely on hostname-shape heuristics.
+	--
+	-- Defaulting to 'service' keeps every existing row correct: they were all
+	-- produced by the validated in-namespace path.
+	--
+	-- The unique key deliberately does NOT include this column. An external
+	-- target is a dotted hostname and a cross-namespace one is "svc.ns";
+	-- neither can collide with a bare Service name, so no key change is needed
+	-- and no existing row moves.
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS target_kind TEXT NOT NULL DEFAULT 'service';
+
 	-- Multi-tenancy (ADR 0022, reverses ADR 0009): tenant_id + cluster_id on
 	-- every table holding per-customer operational data. Existing rows
 	-- migrate onto DefaultTenantID ("tenant #1") automatically via the
@@ -1793,6 +1813,10 @@ type ServiceDependency struct {
 	FromService   string    `json:"from_service"`
 	ToService     string    `json:"to_service"`
 	EvidenceCount int       `json:"evidence_count"`
+	// "service" | "cross_namespace" | "external" — see the schema note. The
+	// UI must keep the tiers visually distinct; the external tier is a
+	// heuristic, not a validated fact.
+	TargetKind    string    `json:"target_kind"`
 	FirstSeen     time.Time `json:"first_seen"`
 	LastSeen      time.Time `json:"last_seen"`
 	TenantID      string    `json:"tenant_id"`
@@ -1817,7 +1841,10 @@ func setTenantContext(ctx context.Context, tx *sql.Tx, tenantID string) error {
 // UpsertServiceDependency records one piece of evidence for a from->to edge,
 // scoped to (tenantID, clusterID) — ADR 0022. Runs inside a transaction so
 // the tenant scoping above only ever applies to this one call.
-func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService string) error {
+func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string) error {
+	if targetKind == "" {
+		targetKind = "service" // an older collector reports only validated edges
+	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -1828,12 +1855,16 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 		return fmt.Errorf("set tenant context: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, evidence_count, first_seen, last_seen)
-		VALUES ($1, $2, $3, $4, $5, $6, 1, NOW(), NOW())
+		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, evidence_count, first_seen, last_seen)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 1, NOW(), NOW())
 		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service) DO UPDATE SET
 		  evidence_count = service_dependencies.evidence_count + 1,
+		  -- Kind can be corrected on a later sighting (a host first seen as
+		  -- external, later resolved as cross-namespace once its namespace is
+		  -- tracked) but never downgraded to the default by an older caller.
+		  target_kind    = COALESCE(NULLIF(EXCLUDED.target_kind, ''), service_dependencies.target_kind),
 		  last_seen      = NOW()`,
-		id, namespace, fromService, toService, tenantID, clusterID)
+		id, namespace, fromService, toService, tenantID, clusterID, targetKind)
 	if err != nil {
 		return err
 	}
@@ -1948,7 +1979,7 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, namespace, from_service, to_service, evidence_count, first_seen, last_seen,
-		       tenant_id, COALESCE(cluster_id, '')
+		       tenant_id, COALESCE(cluster_id, ''), COALESCE(target_kind, 'service')
 		FROM service_dependencies WHERE namespace = $1 ORDER BY evidence_count DESC`, namespace)
 	if err != nil {
 		return nil, err
@@ -1959,7 +1990,7 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	for rows.Next() {
 		var d ServiceDependency
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
-			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID); err != nil {
+			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind); err != nil {
 			return nil, err
 		}
 		result = append(result, d)

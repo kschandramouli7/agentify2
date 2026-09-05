@@ -16,7 +16,7 @@ already-built ingest path.
 
 import logging
 import re
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 import httpx
 
@@ -87,6 +87,105 @@ def extract_service_mentions(log_text: str, namespace: str, known_services: Set[
     return found
 
 
+# ── Beyond the namespace boundary (ROADMAP P27 phase 3) ──────────────────────
+#
+# extract_service_mentions deliberately returns only in-namespace targets
+# validated against the live Service list. That makes every edge it produces
+# trustworthy and every diagram built on it a claim about ONE namespace — which
+# is false as architecture. The agent calls vault.vault, api.anthropic.com and
+# an RDS endpoint; none of those can ever appear.
+#
+# This function captures the rest, in a SEPARATE and WEAKER trust tier. It is a
+# separate function rather than a wider return from the one above because that
+# one is duplicated in the agent, imported by the Glue miner, and pinned by 24
+# tests; widening it would put every existing edge at risk for the benefit of a
+# less certain one.
+#
+# THE WHOLE DIFFICULTY IS FALSE POSITIVES. A log line is full of dotted strings
+# that are not hosts: version numbers ("1.2.3"), Java packages
+# ("com.example.Foo"), file names ("config.yaml"), durations, JSON keys. The
+# in-cluster miner is safe because it validates against a real Service list;
+# there is no equivalent list for the public internet. So the guards are:
+#
+#   1. hostname CONTEXT only — immediately after "//" or before ":<port>";
+#   2. the last label must look like a TLD: alphabetic, at least two chars,
+#      which rejects "1.2.3", "config.yaml" (yaml passes shape but see 4),
+#      and anything ending in a digit;
+#   3. no IP addresses, no localhost, no *.local, no single-label names;
+#   4. an explicit deny-list of file-ish and package-ish suffixes that pass the
+#      TLD shape test but never name a service we call.
+#
+# A cross-namespace target is the one case that CAN be validated: its namespace
+# segment must be one the Hub actually tracks.
+_TLD_RE = re.compile(r"^[a-z]{2,}$")
+
+# Suffixes that satisfy the "looks like a TLD" test and are never a host we
+# called. Kept short and specific on purpose — a long speculative list would
+# start hiding real egress.
+_NOT_A_HOST_SUFFIX = frozenset({
+    "yaml", "yml", "json", "log", "txt", "md", "conf", "ini", "toml", "pem",
+    "crt", "key", "sql", "py", "go", "ts", "js", "tsx", "html", "css", "sh",
+    "jar", "war", "class", "java", "so", "gz", "zip", "tar", "lock", "sum",
+})
+
+_PRIVATE_PREFIXES = ("10.", "127.", "192.168.", "169.254.", "0.")
+
+
+def _looks_like_a_real_host(host: str) -> bool:
+    """A conservative "is this a hostname we called" test — see the notes above."""
+    if not host or len(host) > 253 or ".." in host:
+        return False
+    labels = host.split(".")
+    if len(labels) < 2 or any(not lab for lab in labels):
+        return False
+    if not _TLD_RE.match(labels[-1]):
+        return False                      # rejects 1.2.3, foo.bar2, trailing digits
+    if labels[-1] in _NOT_A_HOST_SUFFIX:
+        return False                      # config.yaml, Foo.class, go.sum
+    if host.startswith(_PRIVATE_PREFIXES) or host == "localhost":
+        return False
+    # An all-numeric-label name is an IP, not a host we can name.
+    if all(lab.isdigit() for lab in labels[:-1]):
+        return False
+    return True
+
+
+def extract_external_mentions(
+    log_text: str, namespace: str, known_namespaces: Set[str]
+) -> Set[Tuple[str, str]]:
+    """Targets OUTSIDE this namespace, as (kind, target) pairs.
+
+    kind is "cross_namespace" for `<service>.<other-tracked-namespace>` — the
+    only case here that can be validated, because the namespace must be one the
+    Hub tracks — or "external" for a public hostname.
+
+    Weaker evidence than extract_service_mentions by construction: nothing
+    validates that a public hostname is a service rather than a string that
+    happened to look like one. Callers must keep the two tiers apart.
+    """
+    if not log_text:
+        return set()
+
+    found: Set[Tuple[str, str]] = set()
+
+    # Qualified in-cluster names pointing at a DIFFERENT namespace. The trailing
+    # .svc.cluster.local is optional, exactly as in the same-namespace path.
+    for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(log_text):
+        if namespace_candidate == namespace:
+            continue                      # the same-namespace miner owns this
+        if namespace_candidate in known_namespaces:
+            found.add(("cross_namespace", f"{service_candidate}.{namespace_candidate}"))
+
+    # Public hostnames, in a hostname context only.
+    for host in _URL_HOST_RE.findall(log_text):
+        h = host.rstrip(".").lower()
+        if h.endswith(".svc.cluster.local") or h.endswith(".cluster.local") or h.endswith(".local"):
+            continue                      # in-cluster; handled above
+        if _looks_like_a_real_host(h):
+            found.add(("external", h))
+
+    return found
+
 async def push_scan_coverage(
     namespace: str,
     stats: Dict[str, Dict[str, int]],
@@ -126,7 +225,12 @@ async def push_scan_coverage(
 
 
 async def push_dependency(
-    namespace: str, from_service: str, to_service: str, backend_url: str, collector_token: str,
+    namespace: str,
+    from_service: str,
+    to_service: str,
+    backend_url: str,
+    collector_token: str,
+    target_kind: str = "service",
 ) -> None:
     """Record one piece of evidence for a from->to edge via the tenant-scoped
     ingest endpoint. Best-effort: any failure is logged and swallowed — one
@@ -139,7 +243,16 @@ async def push_dependency(
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/service-dependencies",
-                json={"namespace": namespace, "from_service": from_service, "to_service": to_service},
+                json={
+                    "namespace": namespace,
+                    "from_service": from_service,
+                    "to_service": to_service,
+                    # Which trust tier produced this edge (ROADMAP P27 phase 3).
+                    # Sent explicitly rather than inferred Hub-side: only the
+                    # miner knows, and inferring from the string shape would
+                    # silently reclassify edges if a log format changed.
+                    "target_kind": target_kind,
+                },
                 headers=headers,
             )
             resp.raise_for_status()
