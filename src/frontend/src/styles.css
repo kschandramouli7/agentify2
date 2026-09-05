@@ -3036,6 +3036,16 @@ code {
   opacity: 0.82;
   pointer-events: none;
 }
+/* Something is wrong with this service. Status is colour AND a word — the
+   word is the text itself, so this can never be colour-alone. */
+.flow__trouble {
+  fill: var(--crit);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+.flow__node--trouble .flow__box { stroke: var(--crit); }
 .flow__sub {
   fill: var(--muted);
   font-size: 9.5px;

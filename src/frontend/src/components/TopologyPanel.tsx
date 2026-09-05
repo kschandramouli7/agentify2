@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listServiceDependencies, listClusterIngress, listScanCoverage, listServiceProfiles,
+  listServiceHealth,
   type ServiceDependency,
 } from "../api";
 import { DependencyFlow, confidence, rarelyObserved, type FlowEdge, type NodeMeta } from "./DependencyFlow";
@@ -253,6 +254,14 @@ export function TopologyPanel() {
     queryFn: () => listServiceProfiles(applied),
     enabled: applied.length > 0,
   });
+  // LIVE pod state. Polled faster than the rest: the declared spec changes on
+  // deploys, but readiness and restarts change on their own.
+  const { data: health = [] } = useQuery({
+    queryKey: ["service-health", applied],
+    queryFn: () => listServiceHealth(applied),
+    enabled: applied.length > 0,
+    refetchInterval: 30000,
+  });
   // Full service inventory for this namespace, from the same /admin/tracked
   // the namespace picker already reads. This is what makes services with no
   // observed edges appear at all.
@@ -321,6 +330,18 @@ export function TopologyPanel() {
       });
     }
 
+    for (const h of health) {
+      const prev = meta.get(h.service) ?? { kind: "service" as const };
+      meta.set(h.service, {
+        ...prev,
+        kind: "service",
+        podsRunning: h.pods,
+        podsReadyNow: h.ready,
+        restarts: h.restarts,
+        phases: h.phases?.length ? h.phases : undefined,
+      });
+    }
+
     for (const c of coverage) {
       const prev = meta.get(c.service) ?? { kind: "service" as const };
       meta.set(c.service, {
@@ -333,10 +354,12 @@ export function TopologyPanel() {
 
     // Services in the inventory that no edge (observed or declared) mentions.
     const referenced = new Set(edges.flatMap(e => [e.from_service, e.to_service]));
-    const known = new Set<string>([...inventory, ...profiles.map(p => p.service)]);
+    const known = new Set<string>([
+      ...inventory, ...profiles.map(p => p.service), ...health.map(h => h.service),
+    ]);
     const standalone = [...known].filter(s => !referenced.has(s)).sort();
     return { edges, meta, standalone, known };
-  }, [data, ingress, coverage, inventory, profiles, applied]);
+  }, [data, ingress, coverage, inventory, profiles, health, applied]);
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
   const rare = useMemo(() => rarelyObserved(graph.edges), [graph.edges]);

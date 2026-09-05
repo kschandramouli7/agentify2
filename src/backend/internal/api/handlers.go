@@ -2510,6 +2510,47 @@ type clusterServiceSelectorsResponse struct {
 // Namespace-scoped and cluster-agnostic, unlike
 // HandleClusterServiceSelectors: the architecture view is drawn per namespace
 // and does not know or care which cluster a service runs in.
+// HandleServiceHealthList returns live pod state per service for one namespace
+// (ROADMAP P22) — pod count, ready count, cumulative restarts, and any
+// non-Running phases.
+//
+// Distinct from GET /api/cluster-health, which is one row per CLUSTER. That
+// answers "is the cluster up"; this answers "which service is broken", which
+// is the question the architecture view has to be able to show.
+func (h *Handler) HandleServiceHealthList(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if h.clusterHealthStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.ServiceHealth{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	health, err := h.clusterHealthStore.ListServiceHealth(r.Context(), tenantID, namespace)
+	if err != nil {
+		// Degrade to empty rather than failing the panel: structure without
+		// state is still worth drawing.
+		h.logger.Warn("failed to list service health", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.ServiceHealth{})
+		return
+	}
+	if health == nil {
+		health = []pgstore.ServiceHealth{}
+	}
+	writeJSON(w, http.StatusOK, health)
+}
+
 func (h *Handler) HandleServiceProfileList(w http.ResponseWriter, r *http.Request) {
 	namespace := r.URL.Query().Get("namespace")
 	if namespace == "" {

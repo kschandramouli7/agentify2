@@ -180,6 +180,11 @@ type ClusterIngressStore interface {
 type ClusterHealthStore interface {
 	UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int) error
 	ListClusterHealthSnapshots(ctx context.Context, tenantID string) ([]pgstore.ClusterHealthSnapshot, error)
+
+	// Per-SERVICE live pod state, for the architecture view (ROADMAP P22).
+	// The snapshot above is cluster-wide; this is the granularity an operator
+	// actually needs.
+	ListServiceHealth(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceHealth, error)
 }
 
 // IntegrationStore is the integration CRUD interface implemented by the Postgres

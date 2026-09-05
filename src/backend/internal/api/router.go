@@ -113,6 +113,10 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	// Namespace-scoped and cluster-agnostic, unlike the selectors read above.
 	mux.HandleFunc("GET /api/service-profiles", h.HandleServiceProfileList)
 
+	// Live pod state per service — the granularity GET /api/cluster-health
+	// (one row per cluster) cannot give (ROADMAP P22).
+	mux.HandleFunc("GET /api/service-health", h.HandleServiceHealthList)
+
 	// Admin: on-demand cert renewal — issues from Vault PKI + updates K8s Secret
 	mux.HandleFunc("POST /admin/certs/renew", h.HandleCertRenew)
 

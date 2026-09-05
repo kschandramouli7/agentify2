@@ -441,6 +441,25 @@ export type ServiceProfile = {
   cluster_id?: string;
 };
 
+/** Live pod state for one service — the difference between a diagram that
+ *  describes the system and one worth opening during an incident.
+ *
+ *  Distinct from the cluster health snapshot, which is one row per cluster. */
+export type ServiceHealth = {
+  namespace: string;
+  service: string;
+  pods: number;
+  ready: number;
+  restarts: number;
+  phases: string[];   // non-Running phases when any exist, else the actual phase
+};
+
+export async function listServiceHealth(namespace: string): Promise<ServiceHealth[]> {
+  const res = await fetch(`/api/service-health?namespace=${encodeURIComponent(namespace)}`);
+  if (!res.ok) return [];   // structure without state is still worth drawing
+  return (await res.json()) as ServiceHealth[];
+}
+
 export async function listServiceProfiles(namespace: string): Promise<ServiceProfile[]> {
   const res = await fetch(`/api/service-profiles?namespace=${encodeURIComponent(namespace)}`);
   if (!res.ok) return [];   // best-effort: the graph is still worth drawing without profiles

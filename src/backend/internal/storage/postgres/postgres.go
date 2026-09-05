@@ -2319,6 +2319,90 @@ type ClusterHealthSnapshot struct {
 	UpdatedAt  time.Time
 }
 
+// ServiceHealth is the live state of one service's pods, aggregated from the
+// per-pod rows the collector's watch keeps in current_state.
+//
+// This is what turns a structural diagram into one worth opening during an
+// incident: "Deployment · 0/2" says something is wrong, "0/2 · 47 restarts ·
+// CrashLoopBackOff" says what.
+type ServiceHealth struct {
+	Namespace string   `json:"namespace"`
+	Service   string   `json:"service"`
+	Pods      int      `json:"pods"`
+	Ready     int      `json:"ready"`
+	Restarts  int      `json:"restarts"`
+	Phases    []string `json:"phases"` // distinct pod phases, Running first excluded when others exist
+}
+
+// ListServiceHealth aggregates live pod state per service for one namespace.
+//
+// TENANT SCOPING IS EXPLICIT HERE, unlike every other read in this file.
+// current_state carries tenant_id but has NO row-level-security policy — ADR
+// 0022 deferred that as "a query-retrofit-phase decision", and the retrofit
+// has not happened. So this query filters tenant_id in its own WHERE clause
+// and must keep doing so: dropping that predicate would leak one tenant's
+// service inventory to another, with no RLS backstop to catch it.
+//
+// Attribution comes from payload->>'service', written at push time by the
+// collector (service_index). Pods with no attributable Service are counted
+// separately by the caller rather than silently folded in.
+func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace string) ([]ServiceHealth, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT payload->>'service'                                        AS service,
+		       count(*)                                                   AS pods,
+		       count(*) FILTER (WHERE payload->>'ready' = 'true')         AS ready,
+		       COALESCE(SUM(COALESCE(NULLIF(payload->>'restarts', '')::int, 0)), 0) AS restarts,
+		       -- string_agg rather than array_agg: lib/pq is imported blank here
+		       -- (driver registration only), and a comma-joined TEXT needs no
+		       -- pq.StringArray and no change to that import.
+		       COALESCE(string_agg(DISTINCT payload->>'phase', ','), '')   AS phases
+		  FROM current_state
+		 WHERE tenant_id = $1
+		   AND event_namespace = 'k8fy.live-state'
+		   AND payload->>'namespace' = $2
+		   AND COALESCE(payload->>'service', '') <> ''
+		 GROUP BY 1
+		 ORDER BY 1`, tenantID, namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ServiceHealth
+	for rows.Next() {
+		var h ServiceHealth
+		var phaseCSV string
+		if err := rows.Scan(&h.Service, &h.Pods, &h.Ready, &h.Restarts, &phaseCSV); err != nil {
+			return nil, err
+		}
+		h.Namespace = namespace
+		phases := strings.Split(phaseCSV, ",")
+		// "Running" alongside a failure phase is noise — the failure is the
+		// headline. Keep Running only when it is the whole story.
+		h.Phases = nil
+		for _, ph := range phases {
+			if ph != "" && ph != "Running" {
+				h.Phases = append(h.Phases, ph)
+			}
+		}
+		if h.Phases == nil {
+			for _, ph := range phases {
+				if ph != "" {
+					h.Phases = append(h.Phases, ph)
+				}
+			}
+		}
+		if h.Phases == nil {
+			h.Phases = []string{}
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // UpsertClusterHealthSnapshot replaces one cluster's current snapshot —
 // always reflects the most recent scan cycle, not history, so this is a
 // single-row overwrite-in-place (ON CONFLICT DO UPDATE), not the

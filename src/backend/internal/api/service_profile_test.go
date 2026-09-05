@@ -110,3 +110,77 @@ func TestServiceProfileList_EmptyIsAnArrayNotNull(t *testing.T) {
 		t.Errorf("body = %q, want []", got)
 	}
 }
+
+// ── per-service health (ROADMAP P22) ────────────────────────────────────────
+
+func healthHandler(store *fakeClusterHealthStore) *Handler {
+	return &Handler{
+		clusterHealthStore: store,
+		integrationStore:   &fakeIntegrationStore{},
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+func getHealth(t *testing.T, h *Handler, q string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/service-health"+q, nil)
+	rec := httptest.NewRecorder()
+	h.HandleServiceHealthList(rec, req)
+	return rec
+}
+
+func TestServiceHealthList_ReturnsPerServiceState(t *testing.T) {
+	store := &fakeClusterHealthStore{serviceHealth: map[string][]pgstore.ServiceHealth{
+		"payments": {
+			{Namespace: "payments", Service: "payment-api", Pods: 2, Ready: 0, Restarts: 47,
+				Phases: []string{"CrashLoopBackOff"}},
+			{Namespace: "payments", Service: "payment", Pods: 1, Ready: 1, Restarts: 0,
+				Phases: []string{"Running"}},
+		},
+	}}
+	rec := getHealth(t, healthHandler(store), "?namespace=payments")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var out []pgstore.ServiceHealth
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("got %d rows, want 2", len(out))
+	}
+	// The shape that matters: 0 ready of 2 with a failure phase is the whole
+	// point of this endpoint existing.
+	if out[0].Ready != 0 || out[0].Pods != 2 || out[0].Restarts != 47 {
+		t.Errorf("payment-api = %+v", out[0])
+	}
+	if len(out[0].Phases) != 1 || out[0].Phases[0] != "CrashLoopBackOff" {
+		t.Errorf("phases = %v", out[0].Phases)
+	}
+}
+
+func TestServiceHealthList_RequiresNamespace(t *testing.T) {
+	if rec := getHealth(t, healthHandler(&fakeClusterHealthStore{}), ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// Structure without state is still worth drawing, so a health failure must not
+// fail the panel.
+func TestServiceHealthList_ErrorDegradesToEmptyArray(t *testing.T) {
+	store := &fakeClusterHealthStore{serviceHealthErr: errors.New("db down")}
+	rec := getHealth(t, healthHandler(store), "?namespace=payments")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := string(rec.Body.Bytes()); got != "[]\n" && got != "[]" {
+		t.Errorf("body = %q, want []", got)
+	}
+}
+
+func TestServiceHealthList_EmptyIsAnArrayNotNull(t *testing.T) {
+	rec := getHealth(t, healthHandler(&fakeClusterHealthStore{}), "?namespace=nothing")
+	if got := string(rec.Body.Bytes()); got != "[]\n" && got != "[]" {
+		t.Errorf("body = %q, want []", got)
+	}
+}

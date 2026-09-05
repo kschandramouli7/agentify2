@@ -21,6 +21,17 @@ type fakeClusterHealthStore struct {
 	lastPodsReady  int
 	snapshots      []pgstore.ClusterHealthSnapshot
 	listErr        error
+
+	// Per-service health (ROADMAP P22).
+	serviceHealth    map[string][]pgstore.ServiceHealth // namespace -> rows
+	serviceHealthErr error
+}
+
+func (f *fakeClusterHealthStore) ListServiceHealth(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceHealth, error) {
+	if f.serviceHealthErr != nil {
+		return nil, f.serviceHealthErr
+	}
+	return f.serviceHealth[namespace], nil
 }
 
 func (f *fakeClusterHealthStore) UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int) error {
