@@ -3059,6 +3059,14 @@ code {
   pointer-events: none;
 }
 .flow__node--trouble .flow__box { stroke: var(--crit); }
+
+/* "Silent": the pod watch has stopped reporting this service while its
+   neighbours keep reporting. Amber, not critical red — the service may be
+   perfectly healthy, and the claim being made is about our evidence, not
+   about the service. Dashed reuses the same "this is not evidence" idiom the
+   unobserved node already uses, so the two read as one family. */
+.flow__node--silent .flow__box   { stroke: var(--warn); stroke-dasharray: 5 3; }
+.flow__node--silent .flow__trouble { fill: var(--warn); }
 .flow__sub {
   fill: var(--muted);
   font-size: 9.5px;

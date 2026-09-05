@@ -468,6 +468,119 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P22: ListServiceHealth reports WHEN it observed the state, and still excludes deleted pods", func(t *testing.T) {
+		// Two things at once, because they are the same defect twice.
+		//
+		// This SQL had no database-level test at all before today — only
+		// handler tests against a fake store, which cannot catch a wrong
+		// query. That is how OPS-12 shipped: the aggregate counted rows for
+		// pods that no longer existed and rendered a 1-replica Deployment as
+		// "9/1 ready". The pod_deleted predicate that fixed it is asserted
+		// here so it cannot silently regress.
+		//
+		// The new half is observed_at. Without it the panel drew live pod
+		// health with no way to distinguish 30 seconds from 3 hours, so a dead
+		// collector was indistinguishable from a stable deployment.
+		tenantID := uuid.New().String()
+		cs := client.CurrentStateStore()
+		pod := "k8fy.live-state." + tenantID
+
+		store := func(entity, service, phase string, ready bool, restarts int, eventType string) {
+			if _, err := cs.Store(ctx, pod, map[string]interface{}{
+				"entity_key":      entity,
+				"event_namespace": "k8fy.live-state",
+				"type":            eventType,
+				"payload": map[string]interface{}{
+					"namespace": "payments", "service": service, "phase": phase,
+					"ready": ready, "restarts": fmt.Sprintf("%d", restarts),
+				},
+				"tenant_id": tenantID,
+			}); err != nil {
+				t.Fatalf("store %s: %v", entity, err)
+			}
+		}
+		// One live pod, plus nine that the watch saw deleted — the exact shape
+		// that produced "9/1" before the predicate existed.
+		store("api-live", "payment-api", "Running", true, 0, "pod_modified")
+		for i := 0; i < 9; i++ {
+			store(fmt.Sprintf("api-dead-%d", i), "payment-api", "Running", true, 3, "pod_deleted")
+		}
+
+		health, err := client.ListServiceHealth(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list service health: %v", err)
+		}
+		if len(health) != 1 {
+			t.Fatalf("want 1 service, got %d (%+v)", len(health), health)
+		}
+		h := health[0]
+		if h.Pods != 1 || h.Ready != 1 {
+			t.Errorf("OPS-12 regression: want 1 pod / 1 ready, got %d/%d — deleted pods are being counted",
+				h.Pods, h.Ready)
+		}
+		// Restarts must come only from the live pod. Summing the dead ones
+		// would report 27 for a service that has never restarted.
+		if h.Restarts != 0 {
+			t.Errorf("restarts=%d, want 0 — the sum is including deleted pods", h.Restarts)
+		}
+		if h.ObservedAt == nil {
+			t.Fatal("ObservedAt is nil: the panel cannot tell a live reading from a frozen one")
+		}
+		if age := time.Since(*h.ObservedAt); age < 0 || age > time.Hour {
+			t.Errorf("ObservedAt %v is not a plausible just-written time (age %v)", *h.ObservedAt, age)
+		}
+
+		// It must track the NEWEST pod write, not the oldest: a service whose
+		// pods are reported continuously must never read as stale because one
+		// of its pods was first seen hours ago.
+		before := *h.ObservedAt
+		store("api-live-2", "payment-api", "Running", true, 0, "pod_modified")
+		health, err = client.ListServiceHealth(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("re-list service health: %v", err)
+		}
+		if health[0].ObservedAt.Before(before) {
+			t.Errorf("ObservedAt went backwards (%v -> %v): it is MIN, not MAX, over the pods",
+				before, *health[0].ObservedAt)
+		}
+	})
+
+	t.Run("ROADMAP P22: ListServiceProfiles reports when the collector last rewrote the spec", func(t *testing.T) {
+		// Declared state changes only on deploy, so an old timestamp here is
+		// not itself a finding — what it detects is the collector having
+		// stopped, which otherwise looks exactly like a stable deployment.
+		tenantID := uuid.New().String()
+		// A namespace unique to this subtest. The suite's client connects as a
+		// SUPERUSER, which bypasses RLS, so a shared namespace name would also
+		// return rows other subtests wrote for other tenants — the same trap
+		// that made an earlier tenant-isolation test pass for the wrong reason.
+		ns := "payments-" + tenantID[:8]
+		two := 2
+		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]ServiceEntry{
+			ns: {{
+				Name: "payment-api", Selector: map[string]string{"app": "payment-api"},
+				ServiceType: "ClusterIP", WorkloadKind: "Deployment",
+				ReplicasDesired: &two, ReplicasReady: &two, Image: "payments:1.4.2",
+				Ports: []ServicePort{{Port: 8080, Protocol: "TCP"}},
+			}},
+		}); err != nil {
+			t.Fatalf("upsert cluster services: %v", err)
+		}
+		profiles, err := client.ListServiceProfiles(ctx, tenantID, ns)
+		if err != nil {
+			t.Fatalf("list service profiles: %v", err)
+		}
+		if len(profiles) != 1 {
+			t.Fatalf("want 1 profile, got %d", len(profiles))
+		}
+		if profiles[0].UpdatedAt == nil {
+			t.Fatal("UpdatedAt is nil: a stopped collector is indistinguishable from a stable deploy")
+		}
+		if age := time.Since(*profiles[0].UpdatedAt); age < 0 || age > time.Hour {
+			t.Errorf("UpdatedAt %v is not a plausible just-written time (age %v)", *profiles[0].UpdatedAt, age)
+		}
+	})
+
 	t.Run("ROADMAP P27 phase 1: scan_coverage ACCUMULATES across cycles, so a denominator survives collector restarts", func(t *testing.T) {
 		// The core of the feature is the ON CONFLICT arithmetic. The collector
 		// reports only what it did this cycle and has no durable memory across
@@ -1298,4 +1411,31 @@ func TestTracePromptProvenance(t *testing.T) {
 			t.Errorf("listed PromptVersion = %d, want nil", *fallback.PromptVersion)
 		}
 	})
+}
+
+// TestPinUTC guards the DSN rewriting that keeps naive TIMESTAMP columns
+// comparable with Go's clock. Pure function, no database — the database-level
+// proof is the ObservedAt age assertion in TestPostgresStores, which failed by
+// exactly the host's UTC offset before this existed.
+func TestPinUTC(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"url without params", "postgres://u:p@h:5432/db", "postgres://u:p@h:5432/db?timezone=UTC"},
+		{"url with params", "postgres://h/db?sslmode=require", "postgres://h/db?sslmode=require&timezone=UTC"},
+		{"postgresql scheme", "postgresql://h/db", "postgresql://h/db?timezone=UTC"},
+		{"key=value form", "host=h dbname=db sslmode=disable", "host=h dbname=db sslmode=disable timezone=UTC"},
+		{"empty", "", "timezone=UTC"},
+		// An explicit caller wins: someone deliberately running a non-UTC
+		// session must not be silently overridden.
+		{"already set", "postgres://h/db?timezone=Australia/Sydney", "postgres://h/db?timezone=Australia/Sydney"},
+		{"already set, different case", "host=h TimeZone=UTC", "host=h TimeZone=UTC"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := pinUTC(c.in); got != c.want {
+				t.Errorf("pinUTC(%q)\n got %q\nwant %q", c.in, got, c.want)
+			}
+		})
+	}
 }

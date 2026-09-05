@@ -53,6 +53,25 @@ export type NodeMeta = {
   podsReadyNow?: number;
   restarts?: number;
   phases?: string[];
+  /** WHEN each layer above was last confirmed, so a number can be disbelieved.
+   *
+   *  Every other field here is a claim about the present tense. Until these
+   *  existed the diagram could not distinguish "this service is healthy" from
+   *  "nobody has told us about this service since Tuesday" — the two render
+   *  identically, and the second is the more urgent of the two. Same failure
+   *  class as OPS-10/11/12: a confident number over data with no validity
+   *  check. Edges already had this (`last_seen`, dashed past 15m); the node
+   *  boxes did not.
+   *
+   *  `liveAt`/`scanAt` are ISO strings for the tooltip. `unreportedForMs` is
+   *  the comparison the panel makes on its behalf — how far this service's
+   *  live state lags the NEWEST live state in the namespace — because that is
+   *  the discriminating question: if every service is stale the collector is
+   *  down, but if one service is stale while its neighbours are current, that
+   *  one service has gone dark and the number in its box is a fossil. */
+  liveAt?: string;
+  scanAt?: string;
+  unreportedForMs?: number;
 };
 
 /** The middle line of a node: what this service IS.
@@ -101,16 +120,47 @@ function profileText(m?: NodeMeta): string | null {
  *  it would cry wolf. */
 function troubleText(m?: NodeMeta): string | null {
   if (!m) return null;
-  const bad = (m.phases ?? []).filter(p => p && p !== "Running" && p !== "Succeeded");
-  if (bad.length) return fit(bad.join(", "), 24);
-  // "Not ready" from the DEPLOYMENT's own numbers, for the same reason as the
-  // ratio above. Deriving it from watch counts produced "8 not ready" for a
-  // service whose single pod was Running 1/1, because the subtraction was over
-  // pods that no longer existed.
+  // ORDERING IS A CORRECTNESS CONCERN HERE, because the four findings below
+  // do not come from the same place and do not go stale together:
+  //
+  //   replicasReady/replicasDesired  cluster_services — the Deployment status,
+  //                                  refreshed by the periodic scan
+  //   phases / restarts              current_state — the pod WATCH, a separate
+  //                                  stream that can go quiet on its own
+  //
+  // `unreportedForMs` measures the watch stream only. So it may invalidate
+  // phases and restarts, and it may NOT outrank the replica ratio: a first
+  // draft put it first and thereby hid a real, freshly-reported "0 of 2 ready"
+  // behind a staleness notice about an unrelated source. The declared ratio is
+  // checked first for exactly that reason.
+  const staleLive = m.unreportedForMs != null;
+  const silent = (): string => {
+    const mins = Math.round((m.unreportedForMs ?? 0) / 60000);
+    return mins >= 60 ? `silent ${Math.round(mins / 60)}h` : `silent ${mins}m`;
+  };
+
+  // 1. A current outage, from the source that is still reporting.
+  //
+  //    The ratio is the DEPLOYMENT's own readyReplicas/replicas, never the
+  //    watch's pod counts: deriving it from the watch produced "8 not ready"
+  //    for a service whose single pod was Running 1/1, because the subtraction
+  //    ran over pods that no longer existed (OPS-12). 0/2 is a real and urgent
+  //    finding, so a zero must print — only null is unknown.
   if (m.replicasReady != null && m.replicasDesired != null && m.replicasReady < m.replicasDesired) {
     return `${m.replicasDesired - m.replicasReady} not ready`;
   }
-  // PER POD, not total. A 3-pod StatefulSet with 6 lifetime restarts is two
+  // 2. A bad pod phase — but only while the watch is still reporting. A
+  //    CrashLoopBackOff last seen 40 minutes ago is not a current phase.
+  if (!staleLive) {
+    const badNow = (m.phases ?? []).filter(p => p && p !== "Running" && p !== "Succeeded");
+    if (badNow.length) return fit(badNow.join(", "), 24);
+  }
+  // 3. Nothing is provably wrong, but the watch has gone quiet for this
+  //    service while its neighbours keep reporting. "0 restarts, all ready"
+  //    from a dead stream is not health, it is the last health seen — so say
+  //    that instead of the number.
+  if (staleLive) return silent();
+  // 4. PER POD, not total. A 3-pod StatefulSet with 6 lifetime restarts is two
   // each — normal churn. Flagging that in red is how a status colour gets
   // trained out of a reader, so the threshold scales with the replica count.
   //
@@ -241,6 +291,46 @@ export function rarelyObserved(edges: FlowEdge[]): FlowEdge[] {
 }
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // matches TopologyPanel's threshold
+
+/** Which services the pod watch has gone quiet about *while still reporting
+ *  their neighbours* — and by how long, as of `now`.
+ *
+ *  RELATIVE, not absolute, and that is the whole design. If the collector is
+ *  down, every service is equally old; flagging all of them says nothing about
+ *  any one of them and is one banner's worth of information, not N warnings.
+ *  The finding worth a mark on the diagram is the asymmetric case: other
+ *  services reported seconds ago, so the pipeline demonstrably works, and this
+ *  one has gone dark — which means the numbers in its box are a fossil rather
+ *  than a reading. OPS-12's residual failure has exactly this shape: a pod that
+ *  disappears while the watch is reconnecting never emits a DELETED event, so
+ *  its row freezes at its last known state and reads as healthy indefinitely.
+ *
+ *  The reference is the NEWEST report in the namespace rather than a mean or a
+ *  median: one fresh service is sufficient proof that the pipeline is alive,
+ *  and an average would be dragged stale by the very services we are trying to
+ *  single out.
+ *
+ *  Returns lag since each silent service's own last report — the number a
+ *  reader wants ("silent 47m") — not the lag behind the reference. */
+export function silentServices(
+  health: { service: string; observed_at?: string }[],
+  now: number = Date.now(),
+  staleAfterMs: number = STALE_AFTER_MS,
+): Map<string, number> {
+  const seen = new Map<string, number>();
+  for (const h of health) {
+    if (!h.observed_at) continue; // no timestamp: unknown, and unknown is not a finding
+    const t = new Date(h.observed_at).getTime();
+    if (Number.isFinite(t)) seen.set(h.service, t);
+  }
+  const out = new Map<string, number>();
+  if (seen.size === 0) return out;
+  const newest = Math.max(...seen.values());
+  for (const [service, t] of seen) {
+    if (newest - t > staleAfterMs) out.set(service, now - t);
+  }
+  return out;
+}
 
 function isStale(e: ServiceDependency): boolean {
   return Date.now() - new Date(e.last_seen).getTime() > STALE_AFTER_MS;
@@ -715,6 +805,11 @@ export function DependencyFlow({
   const deg = useMemo(() => degrees(edges), [edges]);
 
   const tooBig = nodeCount > MAX_NODES || visible.length > MAX_EDGES;
+  // Does any drawn node carry the silent marker? Drives the legend entry only.
+  const anySilent = useMemo(
+    () => [...(meta?.values() ?? [])].some(m => m.unreportedForMs != null),
+    [meta],
+  );
   // Outside-the-namespace targets, pinned to the boundary column.
   const pinned = useMemo(() => {
     const out = new Set<string>();
@@ -878,7 +973,15 @@ export function DependencyFlow({
               unobserved ? "flow__node--unobserved" : "",
               // Status is colour + a word, never colour alone — the same rule
               // the rest of the panel follows.
-              trouble ? "flow__node--trouble" : "",
+              //
+              // "Silent" is deliberately NOT the same colour as a failure.
+              // Critical red says "this service is broken"; amber-and-dashed
+              // says "I cannot currently tell you whether it is broken". An
+              // operator who cannot separate those two learns to distrust both,
+              // and the reserved status colours exist precisely so that a
+              // data-quality caveat never borrows the vocabulary of an outage.
+              trouble && m?.unreportedForMs == null ? "flow__node--trouble" : "",
+              m?.unreportedForMs != null ? "flow__node--silent" : "",
               n.id === focus ? "flow__node--focus" : "",
               // Direct neighbours of the focus read stronger than distant ones,
               // so hop distance is visible without a second colour channel.
@@ -910,6 +1013,17 @@ export function DependencyFlow({
                    (m?.coverage != null
                      ? `\nObserved in ${Math.round(m.coverage * 100)}% of scans` +
                        (m.podsSeen != null ? ` (${m.podsSampled ?? 0} of ${m.podsSeen} pods sampled)` : "")
+                     : "") +
+                   // Provenance in the tooltip on EVERY node, not only stale
+                   // ones: "as of when" is the question that makes the numbers
+                   // above interpretable, and a reader should be able to ask it
+                   // of a healthy box too.
+                   (m?.liveAt ? `\nLive state as of ${new Date(m.liveAt).toLocaleString()}` : "") +
+                   (m?.scanAt ? `\nLast scanned ${new Date(m.scanAt).toLocaleString()}` : "") +
+                   (m?.unreportedForMs != null
+                     ? "\n⚠ Its neighbours have reported since. The collector is alive and has " +
+                       "stopped hearing about THIS service, so the numbers above are the last " +
+                       "ones seen, not the current ones."
                      : "") +
                    (unobserved
                      ? "\nIn the inventory but referenced by no observed call — either it makes " +
@@ -973,6 +1087,17 @@ export function DependencyFlow({
             </svg>
             declared route
           </span>
+          {/* Only when the mark is actually on screen. A legend that explains
+              symbols the diagram is not using trains the reader to skim it. */}
+          {anySilent && (
+            <span className="flow__key-band">
+              <svg width="26" height="12" aria-hidden="true">
+                <rect x="0.5" y="1" width="25" height="10" rx="2" fill="none"
+                      stroke="var(--warn)" strokeDasharray="5 3" />
+              </svg>
+              silent (state not current)
+            </span>
+          )}
         </span>
         <span>
           <strong>Two different claims are drawn here.</strong> A solid arrow is{" "}
@@ -981,6 +1106,12 @@ export function DependencyFlow({
           <span className="flow__inline-declared">declared route</span> comes from a
           Kubernetes Ingress object: a fact, with no count to give. A box with a dashed
           outline is in the inventory but referenced by no observed call.
+          {anySilent && (
+            <> An <strong>amber</strong> box means the pod watch stopped reporting that
+            service while its neighbours kept reporting — the numbers in it are the last
+            ones seen, not the current ones. That is a gap in our evidence, not a
+            diagnosis of the service.</>
+          )}
           {focus && <> · <button type="button" className="topo-link" onClick={() => onFocus(null)}>show everything</button></>}
         </span>
       </div>

@@ -216,6 +216,37 @@ Past **24 nodes or 60 edges** the diagram deliberately refuses to draw and tells
 you to focus a service or read the table. A picture of 200 edges is a hairball,
 not an answer.
 
+**Freshness of the node boxes — added 2026-09-05, and the reason matters.**
+Until then only the *edges* carried a staleness signal (dashed past 15 minutes,
+with a "Stale edges" stat). The boxes drew live pod health — replicas ready,
+restarts, pod phase — with no way to tell a reading 30 seconds old from one
+three hours old, so a dead collector and a stable deployment rendered
+identically. Two signals now close that, and they answer different questions:
+
+| Signal | Condition | What it means |
+|---|---|---|
+| **`not live` banner** above the diagram | *no* service in the namespace has reported for >15 min | The collector has most likely stopped. Every live number below is a snapshot from that moment. The declared structure — services, ingress, ports — is still accurate. |
+| **Amber dashed box, `silent 47m`** | this service is >15 min behind the *newest* report in the namespace | The pipeline demonstrably works, and it has stopped hearing about **this** service. The numbers in the box are the last ones seen. |
+
+The per-node test is **relative, not absolute**, and that is deliberate. If the
+collector is down, every service is equally old — marking all of them says
+nothing about any one of them, which is a banner's job, not a per-node mark. The
+asymmetric case is the finding, and it is exactly OPS-12's residual failure
+shape: a pod that disappears while the watch is reconnecting never emits a
+`DELETED` event, so its `current_state` row freezes at its last known state and
+reads as healthy indefinitely.
+
+**Amber, not red, and never mixed with a failure.** `silent` is a claim about
+our evidence; `1 not ready` is a claim about the service. An operator who cannot
+separate "broken" from "I can't currently tell" learns to distrust both. For the
+same reason the box's headline prefers a **freshly-reported outage** over a
+staleness notice: the replica ratio comes from the Deployment status via the
+periodic scan, while `silent` measures the *pod watch* — two independent streams
+that go stale independently, so a stale watch must never mask a current `0/2`.
+
+**Every node's tooltip carries "as of"**, healthy ones included, since "as of
+when" is what makes the numbers above it interpretable.
+
 **Focus lists.** For the focused service: what it calls, and what calls it, each
 with evidence and freshness.
 
@@ -232,7 +263,10 @@ observation counts.
 There are no categorical series in this data, so no hue means "identity." The
 accent marks the focused subgraph; hop distance is shown by opacity, not a
 second hue. Freshness is a state → the app's reserved status tokens, always with
-a word (`fresh` / `stale`), never colour alone. Everything reuses the existing
+a word (`fresh` / `stale` / `silent Nm`), never colour alone. Critical red is
+reserved for "this service is failing"; amber-plus-dashed means "we cannot
+currently tell", reusing the dashed idiom the unobserved node already uses so
+the two read as one family. Everything reuses the existing
 CSS token system, so dark mode and the rest of the console stay consistent.
 
 ## 3. Where the data comes from
@@ -524,6 +558,15 @@ its logs) and why it has its own Service (so its calls are attributable).
   `first_seen`; a dependency removed months ago keeps its count and only its
   `last_seen` goes stale. Read freshness, not volume, to judge whether an edge
   is current.
+- **Every timestamp column is naive `TIMESTAMP` written with `NOW()`**, so it
+  holds the *server's* local time while the Go driver hands it back labelled
+  UTC. The two only agree when the server's zone is UTC. RDS defaults to UTC so
+  production has always been right by luck; `pinUTC` (in
+  [postgres.go](../src/backend/internal/storage/postgres/postgres.go)) now pins
+  every session to UTC so it is right by construction. **If a freshness figure
+  in this panel is ever off by a whole number of hours, look here first** — the
+  offset will equal the database server's UTC offset. Migrating the columns to
+  `TIMESTAMPTZ` would be the thorough fix and has not been done.
 
 ## References
 

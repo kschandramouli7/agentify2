@@ -450,6 +450,11 @@ export type ServiceProfile = {
   image: string;
   schedule: string;                     // CronJob only
   cluster_id?: string;
+  /** When the collector last rewrote this row. Declared state changes only on
+   *  deploy, so an old timestamp is NOT a finding by itself — what it detects
+   *  is the collector having stopped, which otherwise looks exactly like a
+   *  stable deployment. Absent on rows written before the field existed. */
+  updated_at?: string;
 };
 
 /** Live pod state for one service — the difference between a diagram that
@@ -463,6 +468,12 @@ export type ServiceHealth = {
   ready: number;
   restarts: number;
   phases: string[];   // non-Running phases when any exist, else the actual phase
+  /** When the pod watch last reported ANY pod of this service. This is the
+   *  fastest-moving data the diagram draws, and until 2026-09-05 it was the
+   *  only layer with no staleness signal — "all ready, 0 restarts" rendered
+   *  identically whether it was 30 seconds or 3 hours old, which is the same
+   *  class of defect as OPS-10/11/12. Absent = no timestamped pod row. */
+  observed_at?: string;
 };
 
 export async function listServiceHealth(namespace: string): Promise<ServiceHealth[]> {
@@ -496,6 +507,12 @@ export type ScanCoverage = {
   pods_sampled: number;
   logs_readable: number;
   log_lines: number;
+  /** First and most recent cycle that scanned this service. `last_scan` was
+   *  already on the wire and simply undeclared here, so the panel discarded
+   *  it. It is the miner's own heartbeat: coverage is a ratio and cannot say
+   *  WHEN it was measured. */
+  first_scan?: string;
+  last_scan?: string;
 };
 
 export async function listScanCoverage(namespace: string): Promise<ScanCoverage[]> {

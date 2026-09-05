@@ -5,7 +5,7 @@ import {
   listServiceHealth,
   type ServiceDependency,
 } from "../api";
-import { DependencyFlow, confidence, rarelyObserved, type FlowEdge, type NodeMeta } from "./DependencyFlow";
+import { DependencyFlow, confidence, rarelyObserved, silentServices, type FlowEdge, type NodeMeta } from "./DependencyFlow";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
 //
@@ -373,6 +373,7 @@ export function TopologyPanel() {
         podsReadyNow: h.ready,
         restarts: h.restarts,
         phases: h.phases?.length ? h.phases : undefined,
+        liveAt: h.observed_at,
       });
     }
 
@@ -383,8 +384,24 @@ export function TopologyPanel() {
         coverage: c.pods_seen > 0 ? c.pods_sampled / c.pods_seen : null,
         podsSeen: c.pods_seen,
         podsSampled: c.pods_sampled,
+        scanAt: c.last_scan,
       });
     }
+
+    // Services the pod watch has gone quiet about while still reporting their
+    // neighbours. See silentServices for why the test is relative, not
+    // absolute — the collector-down case is one banner below, not N marks.
+    for (const [service, lag] of silentServices(health)) {
+      const prev = meta.get(service);
+      if (!prev || prev.kind !== "service") continue;
+      meta.set(service, { ...prev, unreportedForMs: lag });
+    }
+    const liveTimes = health
+      .map(h => (h.observed_at ? new Date(h.observed_at).getTime() : NaN))
+      .filter(t => Number.isFinite(t));
+    // Newest, for the collector-down banner: if even one service reported
+    // recently the pipeline is alive and the banner must stay quiet.
+    const newestLive = liveTimes.length ? Math.max(...liveTimes) : null;
 
     // Services in the inventory that no edge (observed or declared) mentions.
     const referenced = new Set(edges.flatMap(e => [e.from_service, e.to_service]));
@@ -394,7 +411,7 @@ export function TopologyPanel() {
     // Outside targets are never "standalone": they exist only because an edge
     // mentions them, so they are always referenced by definition.
     const standalone = [...known].filter(s => !referenced.has(s)).sort();
-    return { edges, meta, standalone, known };
+    return { edges, meta, standalone, known, newestLive };
   }, [data, ingress, coverage, inventory, profiles, health, applied, knownNamespaceSet]);
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
@@ -520,6 +537,32 @@ export function TopologyPanel() {
               The miner samples only 5 pods per namespace and the last 200 log lines, so edges
               it rarely catches are a sign it is <strong>missing others entirely</strong> — treat
               this graph as more incomplete than the counts suggest.
+            </p>
+          )}
+
+          {/* The collector-down banner.
+            *
+            * Deliberately ONE banner rather than a warning on every node: if
+            * the whole pipeline has stopped, every box is equally old and
+            * marking them all individually communicates less, not more. The
+            * per-node marker (see NodeMeta.unreportedForMs) handles the
+            * opposite, asymmetric case.
+            *
+            * This is the layer that had no staleness signal at all until
+            * 2026-09-05. Edges have had one since they shipped — dashed past
+            * 15 minutes, with a "Stale edges" stat above. The node boxes drew
+            * live pod health with no way to tell 30 seconds from 3 hours,
+            * which is the same defect class as OPS-10/11/12: a confident
+            * number over data with no validity check. */}
+          {arch.newestLive !== null && Date.now() - arch.newestLive > STALE_AFTER_MS && (
+            <p className="topo-gap">
+              <span className="adm-badge adm-badge--warn">not live</span>{" "}
+              No pod state has been reported for <strong>any</strong> service in this namespace
+              since {relTime(new Date(arch.newestLive).toISOString())} (
+              {absTime(new Date(arch.newestLive).toISOString())}). Replica counts, readiness and
+              restarts below are a <strong>snapshot from then</strong>, not current state — the
+              discovery collector has most likely stopped. The declared structure (services,
+              ingress, ports) is still accurate; only the live numbers are frozen.
             </p>
           )}
 

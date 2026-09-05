@@ -33,7 +33,45 @@ type Client struct {
 	logger *slog.Logger
 }
 
-// NewClient opens the connection and initializes both schemas.
+// pinUTC forces every pooled connection's session time zone to UTC.
+//
+// WHY THIS IS NECESSARY, not cosmetic. Every timestamp column in this schema is
+// `TIMESTAMP` — naive, no zone — and is written with `NOW()`, which yields the
+// SERVER's local time. lib/pq then hands the value back to Go labelled UTC. The
+// two only agree when the server's zone IS UTC, and nothing was enforcing that:
+//
+//   - AWS RDS defaults to UTC, so production has always been correct by luck;
+//   - the embedded-postgres test instance inherits the host zone, so on an
+//     AEST machine every timestamp read back ten hours in the future.
+//
+// The consequence is not a cosmetic offset. Any freshness comparison —
+// `Date.now() - last_seen` for edge staleness, `observed_at` for the live-state
+// banner — is a subtraction between a real clock and a mislabelled one, so on a
+// non-UTC deployment the panel would declare everything permanently stale (or,
+// with the sign the other way, permanently fresh, which is worse). Pinning the
+// session zone makes the assumption the schema already depends on explicit, and
+// is a no-op wherever the server is already UTC.
+//
+// Done per connection via the DSN rather than as `ALTER DATABASE`: it needs no
+// privileges beyond connecting, applies to every connection in the pool, and is
+// reverted by deleting this function. A caller that sets its own timezone wins.
+func pinUTC(connStr string) string {
+	if strings.Contains(strings.ToLower(connStr), "timezone=") {
+		return connStr // caller was explicit; do not override
+	}
+	// The two DSN forms lib/pq accepts separate parameters differently.
+	if strings.HasPrefix(connStr, "postgres://") || strings.HasPrefix(connStr, "postgresql://") {
+		if strings.Contains(connStr, "?") {
+			return connStr + "&timezone=UTC"
+		}
+		return connStr + "?timezone=UTC"
+	}
+	if strings.TrimSpace(connStr) == "" {
+		return "timezone=UTC"
+	}
+	return connStr + " timezone=UTC"
+}
+
 // NewClient opens the connection and initializes both schemas.
 //
 // ctx controls how long to wait for the initial Postgres ping. Pass a context
@@ -45,7 +83,7 @@ type Client struct {
 // Pass a context with a short deadline (e.g. 5 s) in tests so a missing Postgres
 // instance returns an error quickly and the test can call t.Skip().
 func NewClient(ctx context.Context, connStr string, logger *slog.Logger) (*Client, error) {
-	db, err := sql.Open("postgres", connStr)
+	db, err := sql.Open("postgres", pinUTC(connStr))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres: %w", err)
 	}
@@ -2040,6 +2078,12 @@ type ServiceProfile struct {
 	Image           string        `json:"image"`
 	Schedule        string        `json:"schedule"`
 	ClusterID       string        `json:"cluster_id,omitempty"`
+	// When the collector last rewrote this row. A profile is DECLARED state, so
+	// it only changes on deploy — a profile hours old is normal, and the reason
+	// this is exposed is the opposite case: nothing here changes when the
+	// collector DIES, so without a timestamp a dead collector and a stable
+	// deployment are indistinguishable. Nil = pre-dates the column.
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
 // UpsertClusterServices replaces the full known-service set for one
@@ -2183,7 +2227,8 @@ func (c *Client) ListServiceProfiles(ctx context.Context, tenantID, namespace st
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT namespace, service, service_type, ports, workload_kind,
-		       replicas_desired, replicas_ready, image, schedule, COALESCE(cluster_id, '')
+		       replicas_desired, replicas_ready, image, schedule, COALESCE(cluster_id, ''),
+		       updated_at
 		FROM cluster_services WHERE namespace = $1 ORDER BY service`, namespace)
 	if err != nil {
 		return nil, err
@@ -2194,9 +2239,18 @@ func (c *Client) ListServiceProfiles(ctx context.Context, tenantID, namespace st
 	for rows.Next() {
 		var p ServiceProfile
 		var portsJSON []byte
+		// updated_at is `TIMESTAMP DEFAULT NOW()` — nullable in the DDL, so it
+		// cannot scan into a time.Time. NullTime keeps a NULL as "unknown"
+		// rather than as the zero time, which the UI would render as 1 AD.
+		var updatedAt sql.NullTime
 		if err := rows.Scan(&p.Namespace, &p.Service, &p.ServiceType, &portsJSON, &p.WorkloadKind,
-			&p.ReplicasDesired, &p.ReplicasReady, &p.Image, &p.Schedule, &p.ClusterID); err != nil {
+			&p.ReplicasDesired, &p.ReplicasReady, &p.Image, &p.Schedule, &p.ClusterID,
+			&updatedAt); err != nil {
 			return nil, err
+		}
+		if updatedAt.Valid {
+			t := updatedAt.Time
+			p.UpdatedAt = &t
 		}
 		// A malformed ports blob must not fail the whole namespace — the rest
 		// of the profile is still useful.
@@ -2363,6 +2417,12 @@ type ServiceHealth struct {
 	Ready     int      `json:"ready"`
 	Restarts  int      `json:"restarts"`
 	Phases    []string `json:"phases"` // distinct pod phases, Running first excluded when others exist
+	// The most recent current_state write across this service's pods — i.e.
+	// when the pod watch last said anything at all about it. This is the
+	// fastest-moving data the UI draws and was the only layer with no
+	// staleness signal, so "0 restarts, all ready" rendered identically
+	// whether it was 30 seconds or 3 hours old. Nil = no timestamp on any row.
+	ObservedAt *time.Time `json:"observed_at,omitempty"`
 }
 
 // ListServiceHealth aggregates live pod state per service for one namespace.
@@ -2386,7 +2446,13 @@ func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace stri
 		       -- string_agg rather than array_agg: lib/pq is imported blank here
 		       -- (driver registration only), and a comma-joined TEXT needs no
 		       -- pq.StringArray and no change to that import.
-		       COALESCE(string_agg(DISTINCT payload->>'phase', ','), '')   AS phases
+		       COALESCE(string_agg(DISTINCT payload->>'phase', ','), '')   AS phases,
+		       -- When the watch last said ANYTHING about this service. Not a
+		       -- proxy for pod age: current_state is upserted on every event,
+		       -- so this going quiet means the COLLECTOR went quiet, which is
+		       -- the failure the UI could not previously distinguish from a
+		       -- stable deployment.
+		       MAX(updated_at)                                             AS observed_at
 		  FROM current_state
 		 WHERE tenant_id = $1
 		   AND event_namespace = 'k8fy.live-state'
@@ -2419,8 +2485,14 @@ func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace stri
 	for rows.Next() {
 		var h ServiceHealth
 		var phaseCSV string
-		if err := rows.Scan(&h.Service, &h.Pods, &h.Ready, &h.Restarts, &phaseCSV); err != nil {
+		var observedAt sql.NullTime // nullable column; see the profile scan above
+		if err := rows.Scan(&h.Service, &h.Pods, &h.Ready, &h.Restarts, &phaseCSV,
+			&observedAt); err != nil {
 			return nil, err
+		}
+		if observedAt.Valid {
+			t := observedAt.Time
+			h.ObservedAt = &t
 		}
 		h.Namespace = namespace
 		phases := strings.Split(phaseCSV, ",")
