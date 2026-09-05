@@ -315,7 +315,7 @@ and none could ever appear.
 | `target_kind` | Validated against | Strength |
 |---|---|---|
 | `service` | the live Service list for that namespace | **strong** — a real object confirms the name |
-| `cross_namespace` | the namespace segment, against namespaces the Hub tracks | medium — the namespace is real, the service name is not checked |
+| `cross_namespace` | **both** segments — the namespace must exist and the service must be a real Service in it | strong |
 | `external` | **nothing** | **weak** — there is no Service list for the internet, so this rests on hostname-shape heuristics alone |
 
 The weak tier is drawn lighter, its nodes sit unfilled in a boundary column,
@@ -348,9 +348,15 @@ guesses as firewall rules.
 > classifying by shape (an RFC 1123 Service name cannot contain a dot), so it
 > is honest against old rows too.
 >
-> **Cross-namespace mining stays on**, because its namespace segment *is*
-> validated against namespaces the Hub tracks. That is the guard the external
-> tier lacks entirely.
+> **Cross-namespace mining stays on** — but validating only its namespace
+> segment turned out to be the same mistake one level narrower. On 2026-09-05 a
+> trace UUID followed by a real namespace
+> (`c53b9dca-f4c0-44f9-….vault`) passed as a service call and drew three phantom
+> boxes, because `_HOSTNAME_RE`'s character class accepts hex and hyphens. It
+> now validates **both** segments against the real Service list of the target
+> namespace, which is the guard the same-namespace miner has always had and the
+> reason that tier never had this problem. Rejecting UUID *shapes* would have
+> been another heuristic; requiring a real Service removes the class.
 >
 > **Conditions for turning it back on**, none of which are met:
 > 1. a discriminator on the *log line shape*, not the hostname — an outbound

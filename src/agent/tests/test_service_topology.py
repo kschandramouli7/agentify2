@@ -286,11 +286,19 @@ async def test_mine_service_dependencies_no_known_services_is_noop(monkeypatch):
 # where it stops. Loosening any of them lets version numbers, stack traces and
 # file names become "services we call".
 
-_NAMESPACES = {"payments", "vault", "agentify", "kube-system"}
+# Every namespace's REAL Service names. Both segments of a cross-namespace
+# mention are validated against this, which is what stops a trace UUID passing
+# as a service name.
+_SERVICES_BY_NS = {
+    "payments": {"payment", "payment-api", "payment-batch", "payment-worker"},
+    "vault": {"vault"},
+    "agentify": {"agentify-backend", "agentify-agent", "agentify-frontend"},
+    "kube-system": {"kube-dns"},
+}
 
 
 def _ext(line, namespace="agentify"):
-    return st.extract_external_mentions(line, namespace, _NAMESPACES)
+    return st.extract_external_mentions(line, namespace, _SERVICES_BY_NS)
 
 
 def test_captures_a_cross_namespace_call():
@@ -374,3 +382,43 @@ def test_empty_and_malformed_input_is_safe():
     assert st.extract_external_mentions("x", "ns", set()) == set()
     assert _ext("http://..//") == set()
     assert _ext("http://" + "a" * 300 + ".com/") == set()   # over the DNS length limit
+
+
+def test_a_uuid_cannot_pass_as_a_service_name():
+    """Regression for the three phantom boxes on 2026-09-05.
+
+    _HOSTNAME_RE's character class accepts hex and hyphens, so a trace UUID
+    followed by a real namespace matched as a service call and drew
+    "c53b9dca-f4c0-44f9-9… / another namespace" on the architecture diagram
+    three times over.
+
+    Validating only the namespace segment was not enough. Both segments are now
+    checked against the real Service list, which removes the class rather than
+    pattern-matching UUIDs — a random token, a hash, a build id and anything
+    else shaped like a DNS label all fail the same way now.
+    """
+    assert _ext("trace c53b9dca-f4c0-44f9-9abc-def012345678.vault completed") == set()
+    assert _ext("embedded incident 7f3ba3ef-c5a0-18d9-54f0-58bbea53372a.payments") == set()
+    assert _ext("build 4a9f2c1e-0000-1111-2222-333344445555.agentify done") == set()
+
+
+def test_a_real_service_in_another_namespace_still_matches():
+    """The fix must not cost the capability it was built for: vault.vault is a
+    real Service in a real namespace and must still produce an edge."""
+    got = _ext("GET http://vault.vault.svc.cluster.local:8200/v1/pki/issue -> 200")
+    assert ("cross_namespace", "vault.vault") in got
+    got2 = _ext("calling https://payment-api.payments.svc.cluster.local/")
+    assert ("cross_namespace", "payment-api.payments") in got2
+
+
+def test_an_unknown_service_in_a_known_namespace_is_rejected():
+    """The namespace being real is not sufficient — that was the bug."""
+    assert _ext("thing not-a-service.payments happened") == set()
+
+
+def test_no_service_map_disables_cross_namespace_mining():
+    """An inventory failure must produce NO edges rather than unvalidated
+    ones — the same fail-closed choice the collector makes for the cycle."""
+    assert st.extract_external_mentions(
+        "GET http://vault.vault.svc.cluster.local:8200/x", "agentify", {}
+    ) == set()

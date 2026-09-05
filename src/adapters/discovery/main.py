@@ -60,7 +60,9 @@ def _service_for_pod(pod_labels: Dict[str, str], services: List[Dict[str, Any]])
     return service_for_labels(pod_labels, services)
 
 
-async def _scan_namespace(ns: str, cfg: Config, known_namespaces: Optional[Set[str]] = None) -> None:
+async def _scan_namespace(
+    ns: str, cfg: Config, services_by_namespace: Optional[Dict[str, Set[str]]] = None
+) -> None:
     services = await k8s_client.list_services(ns)
     # Seed the shared index from the list this scan already fetched. Free, and
     # it closes the startup window in which the pods watch can deliver events
@@ -116,7 +118,7 @@ async def _scan_namespace(ns: str, cfg: Config, known_namespaces: Optional[Set[s
         # vault.vault, api.anthropic.com, an RDS endpoint. A weaker tier by
         # construction (nothing validates a public hostname), pushed with its
         # kind so the two never merge.
-        for kind, target in extract_external_mentions(logs, ns, known_namespaces or set()):
+        for kind, target in extract_external_mentions(logs, ns, services_by_namespace or {}):
             # The external tier is OFF by default and this is why: it cannot
             # tell a host we called from a host that merely appears in the log
             # text. A frontend's access log carries the caller's User-Agent and
@@ -197,7 +199,13 @@ async def _namespace_services(ns: str) -> Optional[List[Dict[str, Any]]]:
     return None  # inactive
 
 
-async def _scan_inventory(namespaces: List[str], cfg: Config) -> None:
+async def _scan_inventory(namespaces: List[str], cfg: Config) -> Dict[str, Set[str]]:
+    """Push the inventory, and return every namespace's real Service names.
+
+    The return value is what makes cross-namespace mining trustworthy: both
+    segments of a "<service>.<namespace>" mention are checked against it, so a
+    trace UUID cannot pass as a service the way it did on 2026-09-05.
+    """
     namespace_services: Dict[str, List[Dict[str, Any]]] = {}
     for ns in namespaces:
         services = await _namespace_services(ns)
@@ -219,6 +227,7 @@ async def _scan_inventory(namespaces: List[str], cfg: Config) -> None:
         ]
     if namespace_services:
         await push_inventory(namespace_services, cfg.backend_url, cfg.collector_token)
+    return {ns: {svc["name"] for svc in svcs} for ns, svcs in namespace_services.items()}
 
 
 async def _scan_ingress(namespaces: List[str], cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
@@ -300,8 +309,13 @@ async def _scan_certificates(namespaces: List[str], cfg: Config) -> None:
 
 async def _scan_once(cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
     namespaces = await k8s_client.list_namespaces(exclude=set(cfg.namespace_exclude))
+    # The real Service names per namespace, captured for cross-namespace
+    # validation below. An inventory failure leaves it empty, which disables
+    # cross-namespace mining for that cycle — the right way to fail: no edges
+    # rather than unvalidated ones.
+    services_by_namespace: Dict[str, Set[str]] = {}
     try:
-        await _scan_inventory(namespaces, cfg)
+        services_by_namespace = await _scan_inventory(namespaces, cfg)
     except Exception:
         logger.exception("inventory scan failed")
     try:
@@ -320,14 +334,13 @@ async def _scan_once(cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
         await _scan_certificates(namespaces, cfg)
     except Exception:
         logger.exception("certificate scan failed")
-    # The namespaces this cluster actually has, passed down so a
-    # "<service>.<namespace>" mention can be validated on its namespace
-    # segment. This is the one guard in the external tier that is not a
-    # heuristic, so it matters that the list is the real one.
-    known_namespaces = set(namespaces)
+    # Every namespace's REAL Service names, so a "<service>.<namespace>"
+    # mention is validated on BOTH segments. Validating only the namespace let
+    # a trace UUID through as a service name on 2026-09-05 — the same class of
+    # failure that disabled the external tier, one level narrower.
     for ns in namespaces:
         try:
-            await _scan_namespace(ns, cfg, known_namespaces)
+            await _scan_namespace(ns, cfg, services_by_namespace)
         except Exception:
             logger.exception("scan failed for namespace=%s", ns)
 

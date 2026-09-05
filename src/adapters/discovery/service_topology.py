@@ -151,17 +151,25 @@ def _looks_like_a_real_host(host: str) -> bool:
 
 
 def extract_external_mentions(
-    log_text: str, namespace: str, known_namespaces: Set[str]
+    log_text: str, namespace: str, services_by_namespace: Dict[str, Set[str]]
 ) -> Set[Tuple[str, str]]:
     """Targets OUTSIDE this namespace, as (kind, target) pairs.
 
-    kind is "cross_namespace" for `<service>.<other-tracked-namespace>` — the
-    only case here that can be validated, because the namespace must be one the
-    Hub tracks — or "external" for a public hostname.
+    `services_by_namespace` maps every namespace this cluster has to its real
+    Service names. BOTH segments of a cross-namespace target are checked
+    against it — the namespace must exist AND the service must be a real
+    Service in that namespace.
 
-    Weaker evidence than extract_service_mentions by construction: nothing
-    validates that a public hostname is a service rather than a string that
-    happened to look like one. Callers must keep the two tiers apart.
+    Validating only the namespace was not enough, and the failure was live on
+    2026-09-05: `_HOSTNAME_RE`'s character class accepts hex and hyphens, so a
+    trace UUID followed by a dot and a real namespace ("c53b9dca-f4c0-….vault")
+    passed as a service call and drew three phantom boxes. Requiring the
+    service segment to be a real Service removes the entire class rather than
+    pattern-matching UUIDs, which is what the same-namespace miner has always
+    done and why it has never had this problem.
+
+    "external" (a public hostname) remains unvalidatable and is gated off by
+    default — see MINE_EXTERNAL_EGRESS.
     """
     if not log_text:
         return set()
@@ -173,7 +181,8 @@ def extract_external_mentions(
     for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(log_text):
         if namespace_candidate == namespace:
             continue                      # the same-namespace miner owns this
-        if namespace_candidate in known_namespaces:
+        # BOTH segments, not just the namespace. See the docstring.
+        if service_candidate in services_by_namespace.get(namespace_candidate, frozenset()):
             found.add(("cross_namespace", f"{service_candidate}.{namespace_candidate}"))
 
     # Public hostnames, in a hostname context only.
