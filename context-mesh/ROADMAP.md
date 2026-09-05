@@ -46,7 +46,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; review dashboard (Dependencies tab), bare-hostname matching, and a deterministic `dependencies` intent answering in chat and on `/api/query` with no model call (tier1) added 2026-09-01 (ADR 0029 amendment, `docs/SERVICE_DEPENDENCIES.md`) — the FQDN-only rule had left `agentify`/`vault` at zero edges while `payments` passed only because its test workloads logged FQDNs deliberately; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go`, `src/frontend/src/components/TopologyPanel.tsx`, `docs/SERVICE_DEPENDENCIES.md` |
 | **P19** | Self-improving agent — an Evaluator Agent that reviews past conversations and proposes prompt/pre-fetch improvements, human-approved via Langfuse prompt versions or a GitHub PR | **Proposed (2026-08-29). Prerequisites A/B/C ✅ done (2026-08-29); P19 itself not started.** The prerequisite re-check found Langfuse prompt-loading already wired (11 prompts) — the real blockers were 6 smaller gaps, **all now built except D2's Langfuse webhook**: A (3 prompts never seeded), B (prompts frozen at process start, so label promotion was inert), C (no prompt provenance on `traces`), D1 (version-pinned evaluation, ADR 0030), D2 (the promotion gate — the webhook trigger is a manual Langfuse UI step, so the gate runs via `workflow_dispatch` today), **E (the agent emitted no Langfuse observations — the true blocker, since judges attach to observations)** and F (`traces.session_id`, without which a conversation cannot be reconstructed) — see below | `src/agent/k8fy/prompt_manager.py`, [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 | **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | **Proposed (2026-09-01)** — not built, but **its substrate now is**: `scan_coverage` (P27 phase 1, `c3e93c7`) gives measured coverage, and the Dependencies panel already ships a v0 of its central finding — the "incomplete: N edges caught in under a quarter of scans" banner. What remains is the agent and the per-finding recommendations | this file — ADR at implementation |
-| **P22** | **Architecture Autodoc** — a cluster's architecture, regenerated from observation on every scan: entry points, call graph, terminal dependencies, ingress exposure, per-service health, each carrying its own evidence coverage. Data audit done 2026-09-03 | **v1 SHIPPED 2026-09-03/05 as a UI view, NOT as a document.** Live in the Dependencies panel: whole-namespace inventory (`d15e466`), declared entry points, per-service coverage, service profiles — workload kind, replicas, ports, image (`7af085d`), and live pod health (`b71473e`). Its recorded hard blocker, pod→service attribution, was resolved in `5bc3a2a`. **The prose generator the name promises does not exist**; v2 (version skew over time) is unchanged | this file — **v1 shipped with no ADR.** One is owed: health is read from the Deployment's `readyReplicas` rather than from pod-watch counts, which is the non-obvious call (OPS-12 in the operational backlog below) |
+| **P22** | **Architecture View** — a cluster's architecture drawn from observation and kept current, delivered as the Dependencies panel: entry points, call graph, terminal dependencies, ingress exposure, per-service profile and live health, each carrying its own coverage | **v1 SHIPPED 2026-09-03/05.** Live in the Dependencies panel: whole-namespace inventory (`d15e466`), declared entry points, per-service coverage, service profiles — workload kind, replicas, ports, image (`7af085d`), and live pod health (`b71473e`). Its recorded hard blocker, pod→service attribution, was resolved in `5bc3a2a`. **Renamed from "Architecture Autodoc" 2026-09-05 to drop the generated-document promise**; v2 (version skew over time) is unchanged | this file — **v1 shipped with no ADR.** One is owed: health is read from the Deployment's `readyReplicas` rather than from pod-watch counts, which is the non-obvious call (OPS-12 in the operational backlog below) |
 | **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) — **blocked, and the blocker worsened**: the eval set is invalid twice over, by OPS-5's degraded cluster in the baseline and by an unfunded Anthropic account failing every Tier-2 item (2026-09-05) | this file — ADR at implementation |
 | **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **still blocked on P27 phase 2**: no port is stored, so a generated policy could only say `allow all ports`. P21's coverage floor is the second prerequisite | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
@@ -1805,7 +1805,7 @@ is more honest and less popular.
 
 ---
 
-## P22 — Architecture Autodoc: a cluster's architecture, regenerated from observation (proposed 2026-09-01, was "cluster archaeology")
+## P22 — Architecture View: a cluster's architecture, drawn from observation and kept current (proposed 2026-09-01; renamed twice — was "cluster archaeology", then "Architecture Autodoc")
 
 **Name — and what it commits us to.** Chosen 2026-09-01 from a considered set:
 *Architecture Recovery* (the established academic term for reconstructing a
@@ -1818,27 +1818,39 @@ compelling name and the most limiting — it frames a single event),
 describes the present) and *Topology Reconstruction* (sounds graph-only,
 drops ingress and risk notes).
 
-"Autodoc" is the most demanding of these, and that is a deliberate choice, so
-it must be honoured rather than quietly softened: **it promises the document
-is always current.** A one-off report that goes stale would be a bait and
-switch under this name. Two consequences follow, and they change the design:
+**Renamed to "Architecture View" on 2026-09-05, and the document promise is
+withdrawn with it.** "Autodoc" promised a generated *document*; v1 shipped a
+UI view and answered the same questions interactively, so the generator was
+never built. Rather than carry an unbuilt promise in the item's name, the
+Dependencies panel is now declared to *be* the deliverable. This is a
+deliberate scope reduction, not a discovery that the document was
+impossible — if a written artefact is wanted later (a handover PDF, a
+diffable Markdown file committed per scan), that is a new item with its own
+pitch, not a debt owed by this one.
+
+**What survives the rename is the design the demanding name forced**, because
+both consequences turned out to be right on their own merits and both are
+already built:
 
 1. **It regenerates on a schedule, not on request.** The collector already
    pushes inventory, ingress and health every 60s and mines edges continuously;
-   the document is a rendering of that state, not a separate act of
-   investigation.
-2. **Every section must carry its own freshness and coverage**, because a
-   confidently-worded architecture document that is silently 20 minutes or 95%
-   of scans out of date is worse than no document — see P21, which this now
-   hard-depends on rather than merely prefers.
+   the view is a rendering of that state, not a separate act of investigation.
+   *Shipped:* the panel polls every 30s.
+2. **Every section carries its own freshness and coverage**, because a
+   confidently-drawn architecture that is silently 20 minutes or 95% of scans
+   out of date is worse than nothing — a diagram is trusted the same way a
+   document is, so dropping the word "document" does not relax this. *Shipped:*
+   per-node coverage (`d15e466`) and the incomplete-graph banner (`bc9771b`);
+   see P21 for the half still owed.
 
 **The pitch:** connect a collector, get your architecture back — and keep
 getting it. Entry points, the call graph, terminal dependencies, ingress
-exposure, per-service health, and the risks worth knowing, as a written
-document plus the interactive map (`docs/architecture-map.html` is the
-hand-built proof that the artefact is useful; this generates it per cluster,
-continuously). Version skew was in the original pitch and has moved to v2 —
-see the data audit below for why.
+exposure, per-service profile and live health, and the risks worth knowing,
+drawn per cluster and refreshed continuously. `docs/architecture-map.html`
+remains the hand-built proof that such an artefact is useful, but it is a map
+of *agentify itself* and is not what this item generates — this item draws the
+*customer's* cluster, in the Dependencies panel. Version skew was in the
+original pitch and has moved to v2 — see the data audit below for why.
 
 ### Why this is the strongest wedge
 
@@ -1886,42 +1898,51 @@ assumed. Recording it so nobody repeats the audit.
   time, since it already computes it; adding `labels` to the payload would also
   work but ships data nothing else needs.
 
-- **P21, as a hard dependency, not a preference.** A generated architecture
-  that silently omits 95% of an edge's evidence is worse than no document —
-  under a name promising it is current, it will be trusted. Every section must
-  carry its own completeness, per service. In turn P21 wants **P27 phase 1**,
-  so the completeness is measured rather than inferred.
+- **P21, as a hard dependency, not a preference.** An architecture view that
+  silently omits 95% of an edge's evidence is worse than nothing: a diagram is
+  believed on sight, more readily than prose, so the rename makes this *more*
+  important rather than less. Every section must carry its own completeness,
+  per service. In turn P21 wanted **P27 phase 1**, so the completeness is
+  measured rather than inferred — that shipped (`c3e93c7`).
 
 - **OPS-9 — blocks *shipping*, not *building*.** Every current workload is
   single-container, so development against this cluster works today. In any
   service-mesh cluster the mined half goes dark, which is exactly the kind of
   cluster worth selling to. Not a reason to wait; a reason not to demo.
 
-- **A document generator.** The map exists but is hand-authored with hardcoded
-  node coordinates; generating it per cluster means parameterising it from the
-  read APIs (`/api/service-dependencies`, `/api/cluster-ingress`,
-  `/api/cluster-health`, `/api/cluster-service-selectors`, `/admin/tracked` —
-  all already present). The prose generator does not exist at all.
+- ~~**A document generator.**~~ **DROPPED 2026-09-05 with the rename.** The
+  reasoning is kept because it is what made the drop the right call: the
+  read APIs it would have consumed (`/api/service-dependencies`,
+  `/api/cluster-ingress`, `/api/cluster-health`,
+  `/api/cluster-service-selectors`, `/admin/tracked`) were all already
+  present, so the *data* was never the obstacle — the obstacle was that a
+  second rendering of the same data has to be maintained in step with the
+  first, and nobody had asked for the prose. `docs/architecture-map.html`
+  shows the cost: hand-authored, hardcoded node coordinates, and stale the
+  moment the system moves.
 
 ### Not a blocker, though it looks like one
 
 **OPS-5** (`payment-worker` flapping since 2026-09-01) is arguably a **test
-case** rather than an obstacle: an honest autodoc should say "this service is
-flapping and its dependencies are only observed in 2% of scans". It does make
-validation harder — ground truth is unstable while you are checking whether the
-generator is right — so fixing it first is convenient, not required.
+case** rather than an obstacle: an honest architecture view should say "this
+service is flapping and its dependencies are only observed in 2% of scans" —
+which, as of `b71473e`, it does. It does make validation harder — ground truth
+is unstable while you are checking whether the view is right — so fixing it
+first is convenient, not required.
 
 ### Scope split, so v1 does not ship with empty sections
 
-**v1 — SHIPPED 2026-09-03/05, as a UI view rather than a document:**
-call graph, entry points and terminal services, ingress exposure, per-service
-health, and per-section coverage — all live in the Dependencies panel.
+**v1 — SHIPPED 2026-09-03/05, as the Dependencies panel:** call graph, entry
+points and terminal services, ingress exposure, whole-namespace inventory,
+per-service profile and live health, and per-section coverage.
 
-**What "v1 shipped" does NOT include, despite the item's name.** There is no
-generated *document*: the data all reaches a diagram, and nothing writes prose.
-Anyone picking this up should decide whether the document is still wanted now
-that the panel answers the same questions interactively — the honest options
-are to build the generator, or to rename the item and drop the promise.
+**The open question this section used to carry is closed.** It asked whether
+the generated document was still wanted now that the panel answers the same
+questions interactively. **Decided 2026-09-05: no** — the item was renamed
+"Architecture View" and the promise dropped, so v1 is not a partial delivery
+against a larger scope. Further work on this item means making the *view*
+better (see P27's UI table for what each capture phase unlocks, and P21 for
+the honesty layer), not writing prose beside it.
 
 **v2 — needs new capture:**
 version skew over time (`cluster_health_snapshots` is overwrite-in-place by

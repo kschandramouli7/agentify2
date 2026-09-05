@@ -4,6 +4,16 @@ The **Dependencies** tab (`⇄`) in the ops console shows the mined
 service-to-service call graph. ROADMAP P18 use case #2;
 [ADR 0029](../context-mesh/decisions/0029-glue-based-dependency-mining.md).
 
+**This panel is also ROADMAP P22 (Architecture View) — it *is* that item's
+deliverable, as of the 2026-09-05 rename.** P22 was previously called
+"Architecture Autodoc" and promised a generated document; that promise was
+dropped in favour of this panel, so nothing is written to a file and nothing
+is owed one. Practically: work that makes the architecture more legible
+belongs here, not in a parallel generator, and the panel is held to a
+document's standard of honesty about its own gaps — hence the coverage
+figure on every node and the incomplete-graph banner ("Confidence is
+coverage, not the count", §3).
+
 > **Read this first.** Every edge is *evidence that a caller logged a callee's
 > hostname*, not an observed network flow. There is no sidecar, no eBPF, no
 > service mesh here. So:
