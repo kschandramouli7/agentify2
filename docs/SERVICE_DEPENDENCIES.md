@@ -271,6 +271,62 @@ CSS token system, so dark mode and the rest of the console stay consistent.
 
 ## 3. Where the data comes from
 
+### End-to-end flow — and what's deterministic vs LLM
+
+**The entire write path (mining) is deterministic. No model call happens
+anywhere in it.** `extract_service_mentions` is a plain extraction function,
+not a Claude call — the same principle ADR 0028 applies to its own fan-out,
+and ADR 0029 states outright: "mining 'does log text mention another known
+service' is a plain extraction task; no Claude call belongs anywhere in this
+pipeline."
+
+The **read** path is where a model can enter — and only for one of the three
+ways to ask, and only after the graph itself is already fetched
+deterministically.
+
+```mermaid
+flowchart TD
+    subgraph WRITE["Write path — mining (deterministic, no LLM anywhere)"]
+        direction TB
+        A1["Discovery: _scan_namespace()<br/>live pod logs via K8s API<br/>every 60s, per cluster"]:::det
+        A2["Fargate Fluent Bit<br/>tags every log line with cluster_id<br/>ships Firehose to S3/Glue"]:::det
+        A3["dependency_miner.py (agent)<br/>Athena query per cluster+namespace<br/>every 3600s"]:::det
+        A4["diagnose skill: mine_service_dependencies()<br/>reuses the log tail already fetched<br/>per query, opportunistic"]:::det
+        EXTRACT["extract_service_mentions()<br/>one pure function, all 3 producers<br/>validated against the live Service list"]:::det
+        UPSERT["POST /api/service-dependencies<br/>UPSERT on (tenant, cluster, ns, from, to)<br/>evidence_count += 1, last_seen = NOW()"]:::det
+        A1 --> EXTRACT
+        A2 --> A3 --> EXTRACT
+        A4 --> EXTRACT
+        EXTRACT --> UPSERT
+    end
+
+    UPSERT --> DB[("service_dependencies<br/>(Postgres, one shared table)")]
+
+    subgraph READ["Read path — deterministic, except one branch"]
+        direction TB
+        DB --> R1["GET /api/service-dependencies<br/>Dependencies tab, table, Mermaid export"]:::det
+        DB --> R2{{"Chat or /api/query<br/>question classified"}}
+        R2 -->|"pure dependency question<br/>_chat_route / isDependencyQuestion"| R3["DependencyGraphSkill<br/>tier1 — answered from the graph directly<br/>no model call, no tokens, no cost"]:::det
+        R2 -->|"diagnostic question<br/>'why slow', 'root cause', health/certs/logs"| R4["Pattern-A skill prefetch<br/>fetch_service_dependencies() — plain HTTP GET"]:::det
+        R4 --> R5["Claude reasoning call<br/>synthesizes graph + health + logs + certs<br/>tier2 — the only LLM step in this whole flow"]:::llm
+    end
+
+    classDef det fill:#dbe9ff,stroke:#3b6ea5,color:#0b2a4a;
+    classDef llm fill:#ffe0b3,stroke:#b5651d,color:#4a2600;
+```
+
+**Legend:** blue = deterministic (plain code, DB reads, pure-function
+extraction — same answer every time, free, no latency beyond a query).
+Orange = the one place a Claude call happens — synthesizing a diagnostic
+answer from *several* prefetched signals, of which the dependency graph is
+only one.
+
+The routing rule (blue vs orange on the read side) is implemented **twice**
+— `isDependencyQuestion` in Go, `_chat_route` in Python — deliberately kept
+in sync by a shared table of test questions (§1b/§1c) rather than by one
+side calling the other, so a chat question and the same question through
+`/api/query` always take the same path.
+
 Three producers write to one table. All three share the *same* extraction
 function, so the matching rule below is true of all of them.
 
