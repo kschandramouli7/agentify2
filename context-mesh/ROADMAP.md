@@ -51,7 +51,8 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **still blocked on P27 phase 2**: no port is stored, so a generated policy could only say `allow all ports`. P21's coverage floor is the second prerequisite | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 2, 4, 5 not started — phase 2 is the one that unblocks P24 | this file — **phases 1 and 3 shipped with no ADR.** One is owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
+| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 2, 4, 5 not started — phase 2 is the one that unblocks P24. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file — **phases 1 and 3 shipped with no ADR.** One is owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
+| **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
@@ -1957,6 +1958,20 @@ version skew over time (`cluster_health_snapshots` is overwrite-in-place by
 design, so there is no history; and P27 phase 5 covers image-at-observation),
 and anything derived from utilisation rather than restart counts.
 
+**Also raised 2026-09-12, for platform/capacity planning specifically —
+checked against the code, neither exists today:**
+- **Resource requests/limits vs. actual usage (CPU/mem) per service.**
+  `ServiceProfile` (`postgres.go`) has no such fields, and nothing in
+  `discovery`/`agent` reads a metrics-server or Prometheus usage source —
+  this is new capture, not a missing join.
+- **Replica count *trend* / HPA behavior.** The profile already shows a live
+  `replicas_ready`/`replicas_desired` snapshot (e.g. "2/2"), but there is no
+  history, so the panel cannot say whether that reading is steady-state or a
+  scale event mid-flight. Same underlying gap as the version-skew item just
+  above — `cluster_services` is rewritten in place every scan, nothing to
+  compare against — so a history table likely serves both at once rather
+  than being built twice.
+
 **One constraint found while wiring the attribution (2026-09-03):** the ADR
 0007 egress allowlist permits `service` on a payload, so per-service health
 reaches the agent — but **`images`, `replicas_desired`, `deployment`,
@@ -1987,6 +2002,28 @@ Deliberately undesigned beyond that — open questions before this is built:
 **Shipped 2026-09-12:** a disabled placeholder button, "Ask about
 dependencies," in `TopologyPanel.tsx`'s header (right of Refresh) — marks the
 intended entry point in the UI without committing to any of the above.
+
+### Also raised 2026-09-12: chat should reflect real-time failure state, not just the mined graph
+
+Today, the deterministic `dependencies` route (tier1,
+`docs/SERVICE_DEPENDENCIES.md` §1b) answers from `service_dependencies`
+alone — mined evidence, no live health joined in. The ask: when an edge's
+endpoints are *currently* failing or erroring, an answer should say so, not
+recite historical call counts as if the graph were also a status page.
+
+**This is a design decision, not a mechanical add.** Tier1's whole
+justification (docs §1b: "a plain extraction task... no Claude call belongs
+in this pipeline") rests on being a lookup with one correct answer. Joining
+in live health (`ListServiceHealth`/`current_state` — the same data
+Pattern-A's `diagnose` skill already fetches) is still deterministic, but the
+moment it has to judge what counts as "failing" — a `503` rate above what
+threshold, one restart or three — it stops being a lookup and starts being a
+policy, which needs a decision, not just a join. Doing this well is also
+gated on P27 phase 2 (outcome/error-rate per edge, not started) — without
+it, "failing" can only mean pod-level health, not edge-level (which upstream
+call is actually erroring), which is the more useful half of the question.
+
+**Status: not started.**
 
 ### Deliberately out of scope
 
@@ -2249,6 +2286,34 @@ denominator, and it answers the `payment-worker` question above directly.
 measurement substrate; **P21 consumes and reports on it.** P21 is the agent
 and the recommendations; this is the data it needs to exist.
 
+### Also raised 2026-09-12: the fix for a low denominator is to widen it, not just measure it
+
+Phase 1 measures how much of the truth the miner sees; it does not increase
+it. **[Likely]** an ops team investigating an incident disproportionately
+cares about exactly the edges the fixed sample
+(`MAX_PODS_PER_NAMESPACE=5`, `LOG_TAIL_LINES=200` —
+`docs/SERVICE_DEPENDENCIES.md` §4, items 4–5) is worst at catching: retries,
+fallbacks, and error-path calls that by nature fire rarely. Richer per-edge
+attributes (phases 2/4/6/7) add false precision on top of a graph that is
+systematically missing exactly the edges an incident conversation needs
+most, unless this is addressed first — or, at minimum, unless every added
+attribute stays as visibly partial as the warning below already requires.
+
+Two directions, recorded rather than decided between:
+- **Widen the fixed window** — raise the pod-sample and line-tail constants.
+  Cheapest change; cost scales roughly linearly (more K8s API reads per live
+  cycle, more Athena bytes scanned per Glue cycle), and it still leaves a
+  fixed window, just a bigger one.
+- **A streaming aggregator instead of a fixed tail** — consume Firehose (or
+  the live pod-log watch) continuously rather than re-reading the last N
+  lines per cycle, so extraction stops being bounded by a snapshot window at
+  all. A materially bigger design change, closer in shape to the per-call
+  capture mode this item's own "not a phase of this item" note (below)
+  describes for a mined sequence diagram than to a constant bump.
+
+Either direction should feed the same Phase 1 denominator, so the
+improvement is itself measurable rather than asserted.
+
 ### Phase 2 — outcome and port (pure parsing wins, biggest payoff) — **NOT STARTED, and now the gate on P24**
 
 - **Outcome counters** — success / failure / timeout, and retry state where
@@ -2315,6 +2380,63 @@ only reliable guard is checking a candidate against a real object.
 - **Image/version at time of observation** → also P25 ("this edge appeared at
   `payment-worker` v1.2, disappeared at v1.3").
 
+### Phase 6 — non-pod destinations, typed (raised 2026-09-12) — **NOT STARTED**
+
+Phase 3 already reaches past the namespace boundary, but `external` is one
+flat, weak bucket, disabled by default (`MINE_EXTERNAL_EGRESS=false`)
+because the extractor cannot tell a host actually *called* from one that
+merely appears in log text. **[Certain]** this is the more fundamental gap
+of the two raised 2026-09-12 — for an ops team, "what does `payment-api`
+talk to besides other pods" (its database, its cache, a queue, a
+third-party API, a secrets store) is frequently the more operationally
+critical question, because that is disproportionately where outages and
+latency actually originate, and the panel cannot represent any of it today,
+not even weakly.
+
+Not "re-enable `external`" — the three conditions recorded for that
+(`docs/SERVICE_DEPENDENCIES.md`) are unmet. A **different, additive
+taxonomy**, using signals stronger than bare hostname-shape, one per
+category:
+- **Database / cache** — connection-string patterns (`postgres://`,
+  `redis://`, JDBC URLs) in logs, or — stronger, and arguably more correct
+  than log-mining at all for this category — reading the Secret/ConfigMap a
+  pod actually mounts for its DSN.
+- **Queue** — topic/queue names, which SQS/Kafka/RabbitMQ client libraries
+  tend to log on publish/consume.
+- **SaaS / third-party API** — an operator-maintained allow-list of known
+  vendor hostnames (Stripe, Anthropic, Voyage, …) — this *is* condition 3
+  already specified for re-enabling `external` generally, so a novel host
+  becomes a finding to confirm, not a fact asserted on the diagram.
+- **Secrets store** — Vault/Secrets Manager access is not a log-mined edge
+  in most setups; likely needs a *declared* signal (IRSA / service-account-
+  to-secret binding) rather than being forced through the log-extraction
+  pipeline like everything else.
+
+Should make the graph end to end in the sense actually asked for: not just
+what talks to what inside the cluster, but what a service depends on to be
+up at all. Reuses the existing trust-tier rendering (a new `target_kind`
+value per category) rather than a parallel data model.
+
+### Phase 7 — contract attributes (raised 2026-09-12) — **NOT STARTED**
+
+Distinct from phase 6 (*where* an edge goes) and phases 2/4 (outcome, path):
+*how* a call is made.
+- **Protocol** (HTTP / gRPC / queue topic / event) and **sync vs async** —
+  phase 2's port/scheme is adjacent but does not distinguish these.
+- **API or schema version in play** — helps identify which caller breaks on
+  a callee's deploy; overlaps phase 5's deferred image/version-at-
+  observation idea and may end up sharing its storage.
+- **Auth mechanism and trust-boundary crossing** (mTLS, service account,
+  public) — the same trust-tier concept phase 6 applies to *where* a call
+  goes, applied instead to *how* it's authenticated.
+- **Circuit-breaker state**, where a client library exposes it — a distinct
+  signal from phase 2's raw timeout/retry counters: open/half-open/closed is
+  the caller's own verdict on the callee, not just a count of failures.
+
+Same caveat as everywhere else in this item: per-logger vocabulary means
+partial capture, and partial must stay *visibly* partial (see the warning
+below) rather than silently read as complete.
+
 ### What each phase unlocks in the UI
 
 Asked 2026-09-03: what diagrams would enrich the Dependencies panel? The honest
@@ -2378,6 +2500,55 @@ So every field here ships with **its own capture-rate counter, surfaced in the
 UI** — "port known for 62% of edges" — or it will be believed when it is
 empty. That is not gold-plating; it is the only thing that has reliably caught
 this class of bug in this codebase.
+
+---
+
+## P28 — Ad-hoc log upload & diagnostic agent (proposed 2026-09-12)
+
+**The idea:** let an operator hand the system a log excerpt — file upload or
+pasted text — outside the normal collector pipeline, and get back a
+diagnosis: which service the excerpt belongs to, what's failing, and which
+upstream/downstream services (per the existing `service_dependencies` graph)
+sit on the affected path.
+
+**Why this is not another mining producer.** The three producers in
+[ADR 0029](decisions/0029-glue-based-dependency-mining.md) /
+`docs/SERVICE_DEPENDENCIES.md` §3 mine *routine, continuously-collected*
+logs for dependency *evidence* — a deterministic extraction task,
+explicitly kept free of any Claude call ("no Claude call belongs anywhere
+in this pipeline"). This is a different shape: an operator supplies a
+specific excerpt *because something is already wrong* and wants an answer
+about *this incident*, not another data point toward `evidence_count`. That
+is exactly the shape Pattern-A skills (`diagnose.py`) already handle —
+deterministic prefetch, then one Claude call synthesizes the answer — so
+this is closer to a new skill than a new miner.
+
+**Sketch, not a design:**
+1. An upload surface (UI file/paste input, or an API endpoint) accepting a
+   raw log excerpt, optionally with a namespace hint.
+2. Deterministic pre-processing, reusing what already exists rather than
+   rebuilding it: parse the excerpt the way the Glue miner parses a CRI line
+   (`_parse_cri_message`), extract candidate service mentions via the
+   existing `extract_service_mentions` (the same function all three
+   producers already share — see the flow chart in
+   `docs/SERVICE_DEPENDENCIES.md` §3), and run `log_redaction.py`
+   unconditionally before anything reaches a model.
+3. A dedicated Claude call reasoning over: the excerpt's content, the
+   mentioned service(s)' current position in `service_dependencies`
+   (upstream/downstream), and their current health (see P22's real-time
+   failure-state item above) — producing an answer shaped like "X is
+   failing because Y, on the path between Z and W," not just parsed
+   structure.
+4. **Does not write to `service_dependencies`.** An ad-hoc paste is not
+   continuous evidence; mixing the two would corrupt the confidence/coverage
+   model `docs/SERVICE_DEPENDENCIES.md` §3 defines.
+
+**Open, deliberately unresolved:** whether this is a new skill or a new mode
+of `diagnose.py`; how to attribute an excerpt carrying no pod/Service signal
+at all (an operator pasting a bare exception); how much of the excerpt is
+safe to send to the model beyond what `log_redaction.py` already strips.
+
+**Status: not started.** ADR at implementation.
 
 ---
 
