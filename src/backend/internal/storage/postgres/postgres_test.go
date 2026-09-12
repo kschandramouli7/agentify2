@@ -644,15 +644,26 @@ func TestPostgresStores(t *testing.T) {
 		// both edges appear in the same query — this is what makes them
 		// "just start appearing" in get_service_dependencies/DiagnoseSkill's
 		// prefetch without any Python-side change.
+		//
+		// Relies on being the FIRST subtest in this function to write into
+		// service_dependencies: `client` connects as the embedded instance's
+		// bootstrap superuser (see TestServiceDependencyTenantIsolation's
+		// comment on why that test opens a SEPARATE restricted-role
+		// connection instead), and RLS never applies to superusers
+		// regardless of FORCE ROW LEVEL SECURITY — so ListServiceDependencies
+		// here returns every "payments" row in the table, not just this
+		// tenant's. A later subtest touching this table must either run
+		// after this one or filter its own query results (see the P27 phase
+		// 2 subtest below, which does both).
 		tenantID := uuid.New().String()
 
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "checkout-ui", "checkout-api", "service"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "checkout-ui", "checkout-api", "service", 0, ""); err != nil {
 			t.Fatalf("upsert cluster-a dependency: %v", err)
 		}
 		// Same namespace, same from/to service *names* but a different
 		// cluster — the realistic "downstream service lives in a different
 		// cluster" scenario use case #4 names explicitly.
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-b", "payments", "checkout-ui", "checkout-api", "service"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-b", "payments", "checkout-ui", "checkout-api", "service", 0, ""); err != nil {
 			t.Fatalf("upsert cluster-b dependency: %v", err)
 		}
 
@@ -666,6 +677,89 @@ func TestPostgresStores(t *testing.T) {
 		gotClusters := map[string]bool{deps[0].ClusterID: true, deps[1].ClusterID: true}
 		if !gotClusters["cluster-a"] || !gotClusters["cluster-b"] {
 			t.Errorf("want edges tagged cluster-a and cluster-b, got %v", gotClusters)
+		}
+	})
+
+	t.Run("ROADMAP P27 phase 2 (ADR 0031): outcome counters accumulate, and a row is split by port", func(t *testing.T) {
+		// The core of the feature, same shape as phase 1's accumulation test:
+		// outcome counters must ADD UP across repeated observations, not
+		// replace, since evidence_count already works this way and the two
+		// must stay interpretable together (e.g. "3 of 5 evidenced calls
+		// failed"). A separate concern pinned in the same test: splitting
+		// rows by port must not silently merge two different ports' evidence
+		// into one row, which would defeat the entire reason P24 needs port.
+		//
+		// Uses distinct service names from every other subtest AND filters
+		// its own ListServiceDependencies result by from/to service, rather
+		// than relying on len(deps) the way the P18 use case #4 subtest
+		// above does — see that subtest's comment on why this shared client
+		// can't rely on RLS/tenant_id to isolate subtests from each other.
+		tenantID := uuid.New().String()
+
+		// Three observations for (outcome-caller -> outcome-callee, port
+		// 8443): two failures, one success. Must land on ONE row with
+		// evidence_count=3, outcome_failure_count=2, outcome_success_count=1.
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "failure"); err != nil {
+			t.Fatalf("upsert #1: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "failure"); err != nil {
+			t.Fatalf("upsert #2: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "success"); err != nil {
+			t.Fatalf("upsert #3: %v", err)
+		}
+		// Same (from, to) pair, but port unknown (0) — a qualified-FQDN-form
+		// sighting, say. Must land on a SEPARATE row from the port=8443 one.
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 0, ""); err != nil {
+			t.Fatalf("upsert port-unknown row: %v", err)
+		}
+
+		deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list dependencies: %v", err)
+		}
+		byPort := map[int]ServiceDependency{}
+		for _, d := range deps {
+			if d.FromService == "outcome-caller" && d.ToService == "outcome-callee" {
+				byPort[d.Port] = d
+			}
+		}
+		if len(byPort) != 2 {
+			t.Fatalf("want 2 rows (one per port) for outcome-caller->outcome-callee, got %d: %+v", len(byPort), byPort)
+		}
+
+		port8443, ok := byPort[8443]
+		if !ok {
+			t.Fatalf("no row for port 8443; got %+v", byPort)
+		}
+		if port8443.EvidenceCount != 3 {
+			t.Errorf("port 8443 evidence_count = %d, want 3", port8443.EvidenceCount)
+		}
+		if port8443.OutcomeFailureCount != 2 {
+			t.Errorf("port 8443 outcome_failure_count = %d, want 2", port8443.OutcomeFailureCount)
+		}
+		if port8443.OutcomeSuccessCount != 1 {
+			t.Errorf("port 8443 outcome_success_count = %d, want 1", port8443.OutcomeSuccessCount)
+		}
+		if port8443.OutcomeTimeoutCount != 0 {
+			t.Errorf("port 8443 outcome_timeout_count = %d, want 0", port8443.OutcomeTimeoutCount)
+		}
+		// unknown = evidence_count - (success+failure+timeout) = 3-3 = 0: every
+		// observation on this row carried a classifiable outcome.
+		unknown := port8443.EvidenceCount - port8443.OutcomeSuccessCount - port8443.OutcomeFailureCount - port8443.OutcomeTimeoutCount
+		if unknown != 0 {
+			t.Errorf("port 8443 derived unknown count = %d, want 0", unknown)
+		}
+
+		portUnknown, ok := byPort[0]
+		if !ok {
+			t.Fatalf("no row for port 0 (unknown); got %+v", byPort)
+		}
+		if portUnknown.EvidenceCount != 1 {
+			t.Errorf("port-unknown evidence_count = %d, want 1", portUnknown.EvidenceCount)
+		}
+		if portUnknown.OutcomeSuccessCount != 0 || portUnknown.OutcomeFailureCount != 0 || portUnknown.OutcomeTimeoutCount != 0 {
+			t.Errorf("port-unknown row should have no classified outcomes yet, got %+v", portUnknown)
 		}
 	})
 
@@ -784,15 +878,15 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	// would silently collide under the OLD (namespace, from_service,
 	// to_service) unique constraint, merging two tenants' evidence into
 	// one row.
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service"); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service", 0, ""); err != nil {
 		t.Fatalf("upsert tenant A dependency: %v", err)
 	}
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantB, clusterB.ID, "payments", "payment-ui", "payment-backend", "service"); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantB, clusterB.ID, "payments", "payment-ui", "payment-backend", "service", 0, ""); err != nil {
 		t.Fatalf("upsert tenant B dependency: %v", err)
 	}
 	// Evidence again for tenant A only — proves ON CONFLICT is scoped per
 	// tenant (increments A's row), not global (which would also bump B's).
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service"); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service", 0, ""); err != nil {
 		t.Fatalf("re-upsert tenant A dependency: %v", err)
 	}
 

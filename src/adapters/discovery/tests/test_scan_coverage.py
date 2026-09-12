@@ -170,3 +170,32 @@ async def test_coverage_fraction_reproduces_the_payment_worker_case(monkeypatch,
     assert rep["worker"]["pods_seen"] == 1 and rep["worker"]["pods_sampled"] == 0
     # The interpretation the denominator makes possible:
     assert rep["worker"]["pods_sampled"] / rep["worker"]["pods_seen"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_scan_namespace_pushes_port_and_last_known_outcome(monkeypatch, captured):
+    """ROADMAP P27 phase 2: port is captured from the bare host:port form,
+    and when a pod's log tail mentions the same target twice, the LAST known
+    outcome wins — a later unclassifiable line must not erase an earlier
+    confident one."""
+    pushed = []
+
+    async def fake_push_dependency(ns, from_service, to_service, backend_url, token, target_kind="service", port=None, outcome=None):
+        pushed.append((from_service, to_service, port, outcome))
+
+    monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
+
+    services = [
+        {"name": "batch", "selector": {"app": "batch"}},
+        {"name": "api", "selector": {"app": "api"}},
+    ]
+    pods = [_pod("batch-1", "batch")]
+    logs = "\n".join([
+        "called api:8443 ok",
+        "called api:8443 unreachable",   # last known outcome for (api, 8443)
+        "GET api.payments.svc.cluster.local",  # same service, no port, no outcome
+    ])
+    await _run(monkeypatch, services, pods, {"batch-1": logs})
+
+    assert ("batch", "api", 8443, "failure") in pushed
+    assert ("batch", "api", 0, None) in pushed

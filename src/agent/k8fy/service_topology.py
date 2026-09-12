@@ -25,6 +25,7 @@ rather than something wrong.
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -74,26 +75,108 @@ def extract_service_mentions(log_text: str, namespace: str, known_services: Set[
     Either way the name must be in `known_services` — real ground truth, not
     just regex-shaped text. Returns the set of validated service names (never
     includes `namespace` itself, never raises on malformed input).
+
+    Implemented in terms of extract_service_calls (ROADMAP P27 phase 2) —
+    same matches, this just drops the port/outcome detail nothing here needs.
+    """
+    return {obs.service for obs in extract_service_calls(log_text, namespace, known_services)}
+
+
+# ── Outcome and port capture (ROADMAP P27 phase 2) ───────────────────────────
+#
+# A mined edge today is four facts — from_service, to_service, evidence_count,
+# first/last_seen — so a healthy call and a failed one produce identical rows.
+# CallObservation and extract_service_calls add two fields already sitting in
+# the log text and previously discarded: which port was called (bare host:port
+# form only — a qualified FQDN mention carries no port in the matched text
+# itself, and no attempt is made to guess one nearby), and whether that
+# specific call succeeded, failed, or timed out.
+#
+# extract_service_mentions is NOT changed in place — it is pinned by ~26 tests
+# across this file and its Discovery twin, and imported verbatim by
+# dependency_miner.py. Instead it is reimplemented below in terms of this
+# richer function, which is behavior-preserving: none of the regexes above can
+# match across a newline (no character class includes "\n"), so scanning
+# line-by-line here finds exactly the same mentions extract_service_mentions
+# always has — line-splitting only adds per-line context for outcome
+# inference, it does not change which hostnames are found.
+@dataclass(frozen=True)
+class CallObservation:
+    """One validated service mention, plus what could be learned about that
+    specific call from the same log line it appeared on."""
+    service: str
+    port: Optional[int] = None      # known only for the bare `host:port` form
+    outcome: Optional[str] = None   # "success" | "failure" | "timeout" | None (unknown)
+
+
+# Trigger words/symbols that make a following 3-digit number a plausible HTTP
+# status code rather than a coincidental number (a duration, a retry count, a
+# port). Checked first, before any keyword, because it's the strongest signal
+# available in ordinary log text.
+_HTTP_STATUS_RE = re.compile(
+    r"(?:->|status(?:=|\s*:\s*|\s+is\s+)?|responded|response|returned)\s*\**\b([1-5]\d{2})\b",
+    re.IGNORECASE,
+)
+_TIMEOUT_RE = re.compile(r"\b(?:timeout|timed out)\b", re.IGNORECASE)
+_FAILURE_WORDS_RE = re.compile(r"\b(?:unreachable|refused|failed|failure|unavailable)\b", re.IGNORECASE)
+_SUCCESS_WORDS_RE = re.compile(r"\bok\b", re.IGNORECASE)
+
+
+def _infer_outcome(line: str) -> Optional[str]:
+    """Best-effort outcome classification for one log line. Deliberately
+    conservative and ordered by confidence, so a weaker keyword elsewhere on
+    the line never overrides a stronger signal. Returns None (unknown) far
+    more often than a real APM would — that is by design: outcome vocabulary
+    is per-logger, so a wrong guess here corrupts the confidence model this
+    data feeds (evidence_count / coverage), while an honest "unknown" just
+    stays out of the outcome counters and is visible as such."""
+    m = _HTTP_STATUS_RE.search(line)
+    if m:
+        code = int(m.group(1))
+        return "success" if code < 400 else "failure"
+    if _TIMEOUT_RE.search(line):
+        return "timeout"
+    if _FAILURE_WORDS_RE.search(line):
+        return "failure"
+    if _SUCCESS_WORDS_RE.search(line):
+        return "success"
+    return None
+
+
+def extract_service_calls(log_text: str, namespace: str, known_services: Set[str]) -> List[CallObservation]:
+    """Like extract_service_mentions, but keeps the port (bare host:port form
+    only) and infers an outcome from the same line each mention appeared on.
+
+    Iterates line-by-line — unlike extract_service_mentions, which scans the
+    whole blob at once — because outcome context is local to one line; see
+    the module note above for why this doesn't change which mentions are
+    found. Returns one CallObservation per (line, mention): a repeated
+    mention across multiple lines yields multiple entries, since each one may
+    carry a different outcome. Callers that need "at most once per cycle"
+    dedup (all three miners do) decide that policy themselves.
     """
     if not log_text or not known_services:
-        return set()
+        return []
 
-    found: Set[str] = set()
-    for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(log_text):
-        if namespace_candidate == namespace and service_candidate in known_services:
-            found.add(service_candidate)
+    observations: List[CallObservation] = []
+    for line in log_text.split("\n"):
+        outcome = _infer_outcome(line)
 
-    # Bare short names, hostname contexts only (see the regexes above).
-    for host in _URL_HOST_RE.findall(log_text):
-        if "." in host:
-            continue  # dotted form — the qualified pass above already ruled on it
-        if host in known_services:
-            found.add(host)
-    for name, _port in _HOST_PORT_RE.findall(log_text):
-        if name in known_services:
-            found.add(name)
+        for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(line):
+            if namespace_candidate == namespace and service_candidate in known_services:
+                observations.append(CallObservation(service=service_candidate, port=None, outcome=outcome))
 
-    return found
+        for host in _URL_HOST_RE.findall(line):
+            if "." in host:
+                continue
+            if host in known_services:
+                observations.append(CallObservation(service=host, port=None, outcome=outcome))
+
+        for name, port_str in _HOST_PORT_RE.findall(line):
+            if name in known_services:
+                observations.append(CallObservation(service=name, port=int(port_str), outcome=outcome))
+
+    return observations
 
 
 # ── Beyond the namespace boundary (ROADMAP P27 phase 3) ──────────────────────
@@ -246,15 +329,34 @@ async def get_known_services(namespace: str, backend_url: str) -> Set[str]:
     return services
 
 
-async def upsert_service_dependency(namespace: str, from_service: str, to_service: str, backend_url: str) -> None:
+async def upsert_service_dependency(
+    namespace: str,
+    from_service: str,
+    to_service: str,
+    backend_url: str,
+    port: Optional[int] = None,
+    outcome: Optional[str] = None,
+) -> None:
     """Record one piece of evidence for a from->to edge. Best-effort: any
     failure is logged and swallowed — losing one piece of evidence never
-    surfaces as a diagnosis error."""
+    surfaces as a diagnosis error.
+
+    port/outcome (ROADMAP P27 phase 2) are sent as 0/"" when unknown, not
+    omitted — the Hub's schema uses 0 as port's "not captured" sentinel
+    (NULL would break the UNIQUE constraint that accumulates evidence per
+    port) and "" the same way for outcome.
+    """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 f"{backend_url.rstrip('/')}/api/service-dependencies",
-                json={"namespace": namespace, "from_service": from_service, "to_service": to_service},
+                json={
+                    "namespace": namespace,
+                    "from_service": from_service,
+                    "to_service": to_service,
+                    "port": port or 0,
+                    "outcome": outcome or "",
+                },
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:
@@ -308,7 +410,19 @@ async def mine_service_dependencies(namespace: str, from_service: str, log_text:
     known_services = await get_known_services(namespace, backend_url)
     if not known_services:
         return
-    for to_service in extract_service_mentions(log_text, namespace, known_services):
-        if to_service == from_service:
+
+    # Last KNOWN outcome per (to_service, port) wins within this one log_text
+    # (ROADMAP P27 phase 2) — extract_service_calls returns observations in
+    # line order, so a later one reflects more recent state than an earlier
+    # one for the same target. A line that mentions the target again without
+    # a classifiable outcome must not erase an earlier confident one.
+    last_outcome: Dict[Tuple[str, int], Optional[str]] = {}
+    for obs in extract_service_calls(log_text, namespace, known_services):
+        if obs.service == from_service:
             continue  # not a dependency, just the service mentioning itself
-        await upsert_service_dependency(namespace, from_service, to_service, backend_url)
+        key = (obs.service, obs.port or 0)
+        if key not in last_outcome or obs.outcome is not None:
+            last_outcome[key] = obs.outcome
+
+    for (to_service, port), outcome in last_outcome.items():
+        await upsert_service_dependency(namespace, from_service, to_service, backend_url, port=port, outcome=outcome)

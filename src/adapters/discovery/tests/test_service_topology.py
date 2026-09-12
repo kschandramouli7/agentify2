@@ -122,6 +122,109 @@ def test_extract_empty_inputs_return_empty_set():
     assert st.extract_service_mentions("payment-backend.payments", "payments", set()) == set()
 
 
+# ── _infer_outcome (ROADMAP P27 phase 2) ─────────────────────────────────────
+#
+# Deliberately conservative: outcome vocabulary is per-logger, so a wrong
+# guess corrupts the confidence model service_dependencies feeds. These tests
+# pin both the positive cases (the roadmap's own motivating examples) and the
+# false-positive guards — a bare 3-digit number with no trigger word must
+# never be read as an HTTP status.
+
+@pytest.mark.parametrize("line,expected", [
+    ("payment-batch: called payment-api ok", "success"),
+    ("payment-batch: called payment-api unreachable", "failure"),
+    ("upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3)", "failure"),
+    ("GET http://vault.vault.svc.cluster.local:8200/v1/pki/issue -> 200", "success"),
+    ("connection refused by payment-api", "failure"),
+    ("call to payment-api timed out after 5s", "timeout"),
+    ("request to payment-api hit a timeout", "timeout"),
+])
+def test_infer_outcome_positive_cases(line, expected):
+    assert st._infer_outcome(line) == expected
+
+
+@pytest.mark.parametrize("line", [
+    "retrying after 300ms",                       # a duration, not a status
+    "attempt 3/3 for payment-api",                 # a retry count
+    "payment-api has 404 open connections",        # a number, no status trigger word
+    "GET http://payment-api/charge",               # no outcome signal at all
+    "",
+])
+def test_infer_outcome_returns_none_without_a_confident_signal(line):
+    assert st._infer_outcome(line) is None
+
+
+def test_infer_outcome_status_code_wins_over_a_stray_keyword_elsewhere():
+    """The strongest signal (an HTTP status) must not lose to a weaker
+    keyword coincidentally present on the same line."""
+    line = "payment-api not-quite-ok, responded 503"
+    assert st._infer_outcome(line) == "failure"
+
+
+# ── extract_service_calls (ROADMAP P27 phase 2) ──────────────────────────────
+
+def test_extract_service_calls_captures_port_for_bare_form_only():
+    log_text = "dialing agentify-agent:8001 for reasoning"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-agent"})
+    assert calls == [st.CallObservation(service="agentify-agent", port=8001, outcome=None)]
+
+
+def test_extract_service_calls_qualified_form_has_no_port():
+    log_text = "calling payment-backend.payments now"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
+    assert calls == [st.CallObservation(service="payment-backend", port=None, outcome=None)]
+
+
+def test_extract_service_calls_attaches_outcome_from_the_same_line():
+    log_text = "upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3)"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert calls == [st.CallObservation(service="payment-api", port=8443, outcome="failure")]
+
+
+def test_extract_service_calls_outcome_is_local_to_its_own_line():
+    """A mention's outcome must come from ITS line, not a neighboring one —
+    otherwise a success on one line could mask a failure on another."""
+    log_text = "\n".join([
+        "called payment-api:8443 ok",
+        "called payment-api:8443 unreachable",
+    ])
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert [c.outcome for c in calls] == ["success", "failure"]
+
+
+def test_extract_service_calls_returns_one_entry_per_line_not_deduped():
+    """Dedup-per-cycle is the CALLER's job (all producers do it their own
+    way) — this function reports every observation, since only the caller
+    knows what window/granularity to collapse over."""
+    log_text = "\n".join(["ok payment-api:8443", "ok payment-api:8443", "ok payment-api:8443"])
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert len(calls) == 3
+
+
+def test_extract_service_calls_empty_inputs_return_empty_list():
+    assert st.extract_service_calls("", "payments", {"payment-api"}) == []
+    assert st.extract_service_calls("payment-api:8443", "payments", set()) == []
+
+
+def test_extract_service_mentions_still_matches_extract_service_calls_exactly():
+    """extract_service_mentions is reimplemented in terms of
+    extract_service_calls (ROADMAP P27 phase 2) — this pins that the two stay
+    in lockstep on a line mixing every form the miners see."""
+    log_text = "\n".join([
+        "http://payment-backend.payments.svc.cluster.local:8080/charge",
+        "dialing agentify-agent:8001 for reasoning",
+        "payment-backend restarted due to OOMKilled",
+    ])
+    known = {"payment-backend", "agentify-agent"}
+    mentioned = st.extract_service_mentions(log_text, "payments", known)
+    from_calls = {c.service for c in st.extract_service_calls(log_text, "payments", known)}
+    # A bare mention is namespace-local by construction (validated only
+    # against known_services, not the `namespace` param) — see
+    # test_extract_bare_name_is_namespace_local above — so agentify-agent
+    # matches here even though the scanned namespace is "payments".
+    assert mentioned == from_calls == {"payment-backend", "agentify-agent"}
+
+
 # ── push_dependency ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -138,6 +241,47 @@ async def test_push_dependency_sends_bearer_token(monkeypatch):
     await st.push_dependency("payments", "payment-ui", "payment-backend", "http://backend", "secret-token")
 
     assert seen["auth"] == "Bearer secret-token"
+
+
+@pytest.mark.asyncio
+async def test_push_dependency_sends_port_and_outcome_sentinels_when_unknown(monkeypatch):
+    """0/"" (ROADMAP P27 phase 2's "not captured" sentinels), never omitted —
+    see upsert_service_dependency's identical note in the agent's copy."""
+    import json as _json
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_dependency("payments", "payment-ui", "payment-backend", "http://backend", "secret-token")
+
+    assert captured["body"]["port"] == 0
+    assert captured["body"]["outcome"] == ""
+
+
+@pytest.mark.asyncio
+async def test_push_dependency_sends_captured_port_and_outcome(monkeypatch):
+    import json as _json
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_dependency(
+        "payments", "payment-ui", "payment-backend", "http://backend", "secret-token",
+        port=8443, outcome="failure",
+    )
+
+    assert captured["body"]["port"] == 8443
+    assert captured["body"]["outcome"] == "failure"
 
 
 @pytest.mark.asyncio

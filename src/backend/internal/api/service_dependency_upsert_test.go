@@ -20,6 +20,9 @@ type fakeServiceDependencyStore struct {
 	lastTo         string
 	upsertCalled   bool
 	lastTargetKind string
+	// ROADMAP P27 phase 2 (ADR 0031).
+	lastPort    int
+	lastOutcome string
 
 	// Scan-coverage calls, recorded so the coverage tests can assert on them
 	// (ROADMAP P27 phase 1).
@@ -50,7 +53,7 @@ func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenan
 	return f.coverageRows, nil
 }
 
-func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string) error {
+func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome string) error {
 	f.upsertCalled = true
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
@@ -58,6 +61,8 @@ func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context
 	f.lastFrom = fromService
 	f.lastTo = toService
 	f.lastTargetKind = targetKind
+	f.lastPort = port
+	f.lastOutcome = outcome
 	return nil
 }
 
@@ -151,6 +156,54 @@ func TestHandleServiceDependencyUpsert_ClusterIDOverride(t *testing.T) {
 		}
 		if store.upsertCalled {
 			t.Error("UpsertServiceDependency should not have been called")
+		}
+	})
+}
+
+// TestHandleServiceDependencyUpsert_PortAndOutcome pins ROADMAP P27 phase 2
+// (ADR 0031): port/outcome pass through from the request body to the store
+// unchanged, including the "absent from the body" case, where Go's JSON
+// decoder leaves both at their zero values (0/"") — exactly the sentinels
+// the schema already treats as "not captured", so no special-casing is
+// needed in the handler.
+func TestHandleServiceDependencyUpsert_PortAndOutcome(t *testing.T) {
+	t.Run("port and outcome present in the body are passed through as-is", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api","port":8443,"outcome":"failure"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastPort != 8443 {
+			t.Errorf("port: want 8443, got %d", store.lastPort)
+		}
+		if store.lastOutcome != "failure" {
+			t.Errorf("outcome: want %q, got %q", "failure", store.lastOutcome)
+		}
+	})
+
+	t.Run("port and outcome absent from the body default to the zero-value sentinels", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastPort != 0 {
+			t.Errorf("port: want 0 (unknown sentinel), got %d", store.lastPort)
+		}
+		if store.lastOutcome != "" {
+			t.Errorf("outcome: want empty (unknown sentinel), got %q", store.lastOutcome)
 		}
 	})
 }

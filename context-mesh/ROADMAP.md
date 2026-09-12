@@ -51,7 +51,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **still blocked on P27 phase 2**: no port is stored, so a generated policy could only say `allow all ports`. P21's coverage floor is the second prerequisite | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 2, 4, 5 not started — phase 2 is the one that unblocks P24. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file — **phases 1 and 3 shipped with no ADR.** One is owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
+| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 2 SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)) — outcome (success/failure/timeout) and port now captured by all three producers; `service_dependencies` splits rows by port and carries outcome counters; **this is what unblocks P24**, not yet acted on. **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 4, 5 not started. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file, [ADR 0031](decisions/0031-edge-outcome-and-port-capture.md) — **phases 1 and 3 shipped with no ADR.** One is still owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 | **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
 | **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | Proposed (2026-09-12) — **two complementary halves: a path-filtered view of the mined graph (needs P27 phase 4, achievable), and an on-demand raw-log search keyed by trace ID/URL text (buildable on the existing Glue/Athena store; bounded by whether onboarded services already log a trace ID — not audited)** | this file — ADR at implementation |
 
@@ -2321,18 +2321,31 @@ Two directions, recorded rather than decided between:
 Either direction should feed the same Phase 1 denominator, so the
 improvement is itself measurable rather than asserted.
 
-### Phase 2 — outcome and port (pure parsing wins, biggest payoff) — **NOT STARTED, and now the gate on P24**
+### Phase 2 — outcome and port (pure parsing wins, biggest payoff) — **SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md))
 
-- **Outcome counters** — success / failure / timeout, and retry state where
-  present. This is the single largest information loss today: it converts a
-  topology graph into a **health** graph, and "is this dependency working"
-  is a more useful question than "does it exist".
-- **Port and scheme** — **P24 is not buildable without this.** A NetworkPolicy
-  with no port can only say `allow all ports`.
+- **Outcome counters** — success / failure / timeout captured per edge
+  (retry state is not part of this phase — see phase 7's circuit-breaker
+  item, proposed the same day). This converts a topology graph into a
+  **health** graph: "is this dependency working" is a more useful question
+  than "does it exist".
+- **Port** — captured from the bare `host:port` log form only (not scheme —
+  a qualified FQDN mention carries no port in the matched text). **P24 is
+  now buildable** on this axis; not yet acted on.
 
-*Caveat:* outcome vocabulary is per-logger (`ok`, `unreachable`, `200`, `503`,
-`timeout`), so this needs a normaliser and will be partial. Partial is fine;
-*silently* partial is not — see the warning below.
+`service_dependencies` gained `port` (a row is now split by port; `0` is
+the "not captured" sentinel, never `NULL` — see the ADR for why) and three
+outcome counters, accumulated the same way `evidence_count` already is.
+`extract_service_mentions` itself was left untouched (pinned by ~26 tests)
+in favor of a new `extract_service_calls` it's now implemented in terms of,
+verified behavior-preserving by the existing suite passing unchanged.
+
+*Caveat, as anticipated:* outcome vocabulary is per-logger (`ok`,
+`unreachable`, `200`, `503`, `timeout`), so classification is deliberately
+conservative and returns "unknown" often — no per-field capture-rate
+counter was added for outcome/port specifically (unlike scan_coverage's
+denominator), so *silently* partial remains a real, accepted risk here
+until the panel surfaces these fields — see the warning below, and P22's
+still-pending real-time-failure-state item, which depends on this.
 
 ### Phase 3 — reach past the namespace boundary — **PARTLY SHIPPED, partly withdrawn**
 

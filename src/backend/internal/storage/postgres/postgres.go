@@ -432,6 +432,47 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- ROADMAP P27 phase 2 (ADR 0031): outcome and port capture. port is a
+	-- sentinel INT (0 = "not captured"), never NULL -- Postgres treats every
+	-- NULL as distinct from every other NULL in a UNIQUE constraint, exactly
+	-- the bug backfilling cluster_id above already worked around once; NULL
+	-- here would silently defeat evidence accumulation for every edge whose
+	-- port was never observed. Real ports are 1-65535, so 0 is unambiguous.
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS port INT NOT NULL DEFAULT 0;
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS outcome_success_count INT NOT NULL DEFAULT 0;
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS outcome_failure_count INT NOT NULL DEFAULT 0;
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS outcome_timeout_count INT NOT NULL DEFAULT 0;
+	-- No separate "unknown" counter: it is evidence_count minus the three
+	-- above, derivable rather than stored.
+
+	-- Splitting rows by port (ROADMAP P27's "one schema decision"):
+	-- aggregating every port into one edge would lose exactly the field P24
+	-- (Policy Synthesis) needs -- a NetworkPolicy with no port can only say
+	-- "allow all ports". Same drop-and-recreate pattern as the tenant/cluster
+	-- constraint migration above, generalized the same way: find whatever
+	-- unique constraint currently exists on this table and replace it, so
+	-- this runs correctly whether it follows the migration above or (on a
+	-- fresh database) runs right after CREATE TABLE.
+	DO $$
+	DECLARE
+		old_constraint_name TEXT;
+	BEGIN
+		SELECT conname INTO old_constraint_name
+		FROM pg_constraint
+		WHERE conrelid = 'service_dependencies'::regclass
+		  AND contype = 'u'
+		  AND conname != 'service_dependencies_tenant_cluster_ns_svc_port_key';
+		IF old_constraint_name IS NOT NULL THEN
+			EXECUTE format('ALTER TABLE service_dependencies DROP CONSTRAINT %I', old_constraint_name);
+		END IF;
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'service_dependencies_tenant_cluster_ns_svc_port_key'
+		) THEN
+			ALTER TABLE service_dependencies ADD CONSTRAINT service_dependencies_tenant_cluster_ns_svc_port_key
+				UNIQUE (tenant_id, cluster_id, namespace, from_service, to_service, port);
+		END IF;
+	END $$;
+
 	-- Service->cluster registry (ROADMAP P16 / ADR 0023): which cluster(s)
 	-- run a given (namespace, service), populated deterministically by
 	-- agentify-discovery's inventory push (POST /api/cluster-inventory) —
@@ -1859,6 +1900,16 @@ type ServiceDependency struct {
 	LastSeen      time.Time `json:"last_seen"`
 	TenantID      string    `json:"tenant_id"`
 	ClusterID     string    `json:"cluster_id,omitempty"`
+	// ROADMAP P27 phase 2. Port is 0 when never captured for this edge (only
+	// the bare host:port log form carries one) — a row is now split by port,
+	// so two ports for the same (from, to) pair are two distinct rows, one of
+	// which may be port=0 (unknown). The outcome counters are cumulative
+	// since first_seen; there is no separate "unknown" counter because it is
+	// EvidenceCount minus the sum of the three below.
+	Port                 int `json:"port"`
+	OutcomeSuccessCount  int `json:"outcome_success_count"`
+	OutcomeFailureCount  int `json:"outcome_failure_count"`
+	OutcomeTimeoutCount  int `json:"outcome_timeout_count"`
 }
 
 // UpsertServiceDependency records one piece of evidence for a from->to edge —
@@ -1879,7 +1930,15 @@ func setTenantContext(ctx context.Context, tx *sql.Tx, tenantID string) error {
 // UpsertServiceDependency records one piece of evidence for a from->to edge,
 // scoped to (tenantID, clusterID) — ADR 0022. Runs inside a transaction so
 // the tenant scoping above only ever applies to this one call.
-func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string) error {
+//
+// port/outcome (ROADMAP P27 phase 2, ADR 0031): port is 0 when the caller
+// never captured one (the unique key includes port, so a row is per-port —
+// see the schema migration's comment for why 0, not NULL); outcome is one
+// of "success"/"failure"/"timeout"/"" (unknown, e.g. an older collector that
+// predates this phase). The CASE expressions below increment at most one
+// outcome counter per call, never more than one, since a single observation
+// has exactly one outcome or none.
+func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome string) error {
 	if targetKind == "" {
 		targetKind = "service" // an older collector reports only validated edges
 	}
@@ -1893,16 +1952,25 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 		return fmt.Errorf("set tenant context: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, evidence_count, first_seen, last_seen)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 1, NOW(), NOW())
-		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service) DO UPDATE SET
-		  evidence_count = service_dependencies.evidence_count + 1,
+		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, port,
+		                                   evidence_count, outcome_success_count, outcome_failure_count, outcome_timeout_count,
+		                                   first_seen, last_seen)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1,
+		        CASE WHEN $9 = 'success' THEN 1 ELSE 0 END,
+		        CASE WHEN $9 = 'failure' THEN 1 ELSE 0 END,
+		        CASE WHEN $9 = 'timeout' THEN 1 ELSE 0 END,
+		        NOW(), NOW())
+		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port) DO UPDATE SET
+		  evidence_count         = service_dependencies.evidence_count + 1,
+		  outcome_success_count  = service_dependencies.outcome_success_count + CASE WHEN $9 = 'success' THEN 1 ELSE 0 END,
+		  outcome_failure_count  = service_dependencies.outcome_failure_count + CASE WHEN $9 = 'failure' THEN 1 ELSE 0 END,
+		  outcome_timeout_count  = service_dependencies.outcome_timeout_count + CASE WHEN $9 = 'timeout' THEN 1 ELSE 0 END,
 		  -- Kind can be corrected on a later sighting (a host first seen as
 		  -- external, later resolved as cross-namespace once its namespace is
 		  -- tracked) but never downgraded to the default by an older caller.
 		  target_kind    = COALESCE(NULLIF(EXCLUDED.target_kind, ''), service_dependencies.target_kind),
 		  last_seen      = NOW()`,
-		id, namespace, fromService, toService, tenantID, clusterID, targetKind)
+		id, namespace, fromService, toService, tenantID, clusterID, targetKind, port, outcome)
 	if err != nil {
 		return err
 	}
@@ -2017,7 +2085,8 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, namespace, from_service, to_service, evidence_count, first_seen, last_seen,
-		       tenant_id, COALESCE(cluster_id, ''), COALESCE(target_kind, 'service')
+		       tenant_id, COALESCE(cluster_id, ''), COALESCE(target_kind, 'service'),
+		       port, outcome_success_count, outcome_failure_count, outcome_timeout_count
 		FROM service_dependencies WHERE namespace = $1 ORDER BY evidence_count DESC`, namespace)
 	if err != nil {
 		return nil, err
@@ -2028,7 +2097,8 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	for rows.Next() {
 		var d ServiceDependency
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
-			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind); err != nil {
+			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind,
+			&d.Port, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount); err != nil {
 			return nil, err
 		}
 		result = append(result, d)

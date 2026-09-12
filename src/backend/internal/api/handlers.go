@@ -1919,6 +1919,11 @@ type serviceDependencyUpsertRequest struct {
 	// from an older collector, which only ever reported validated in-namespace
 	// edges — the store defaults it to "service" for exactly that reason.
 	TargetKind  string `json:"target_kind,omitempty"`
+	// ROADMAP P27 phase 2 (ADR 0031). 0/"" are the "not captured" sentinels a
+	// producer sends explicitly (never omits) when it has no port/outcome for
+	// this observation — see service_topology.py's upsert_service_dependency.
+	Port    int    `json:"port"`
+	Outcome string `json:"outcome"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
@@ -2085,7 +2090,7 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 	// The kind is taken from the body rather than inferred: only the miner
 	// knows which tier produced the edge, and guessing from the string shape
 	// here would silently reclassify edges on a format change.
-	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind); err != nil {
+	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

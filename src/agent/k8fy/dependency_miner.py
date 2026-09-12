@@ -6,9 +6,10 @@ Complements, not replaces, agentify-discovery's existing live per-cluster
 mining (src/adapters/discovery/main.py's _scan_namespace) — this runs
 centrally, in the Agent process, alongside log_router.py's existing Athena
 connector, querying the same shared Glue table Firehose already aggregates
-across every onboarded cluster in one place. Reuses extract_service_mentions
-verbatim (the actual "does this log mention service X" logic) — this miner
-is simply a third caller of that function.
+across every onboarded cluster in one place. Reuses extract_service_calls
+verbatim (the actual "does this log mention service X, on what port, with
+what outcome" logic, ROADMAP P27 phase 2) — this miner is simply a third
+caller of that function.
 
 Runs as a periodic background task (app.py's startup event), not a Claude
 tool or an on-demand HTTP handler — same "deterministic, not agentic"
@@ -27,7 +28,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import boto3
 import httpx
 
-from k8fy.service_topology import extract_service_mentions
+from k8fy.service_topology import extract_service_calls
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ _MAX_POLL_SECONDS = 10.0
 # Matches a Fargate Fluent Bit CRI log line: "<RFC3339 timestamp> <stream>
 # <tag> <message>" (e.g. "2026-07-24T22:22:26Z stdout F <app log line>").
 # Group 1 is the application's own message text — the only part
-# extract_service_mentions should ever see, not Fluent Bit's framing.
+# extract_service_calls should ever see, not Fluent Bit's framing.
 _CRI_LINE_RE = re.compile(r"^\S+\s+\S+\s+\S\s+(.*)$", re.DOTALL)
 
 
@@ -168,7 +169,7 @@ async def _fetch_registered_clusters(backend_url: str) -> List[Dict[str, Any]]:
 
 async def _fetch_selectors(backend_url: str, cluster_id: str, namespace: str) -> Dict[str, Dict[str, str]]:
     """One (cluster, namespace)'s known services and their selectors (ADR
-    0029). Doubles as the known-services set extract_service_mentions needs
+    0029). Doubles as the known-services set extract_service_calls needs
     — its keys ARE the known service names, no separate fetch required."""
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -183,12 +184,25 @@ async def _fetch_selectors(backend_url: str, cluster_id: str, namespace: str) ->
         return {}
 
 
-async def _push_edge(backend_url: str, cluster_id: str, namespace: str, from_service: str, to_service: str) -> None:
+async def _push_edge(
+    backend_url: str,
+    cluster_id: str,
+    namespace: str,
+    from_service: str,
+    to_service: str,
+    port: Optional[int] = None,
+    outcome: Optional[str] = None,
+) -> None:
     """Push one discovered edge — no bearer token (ADR 0029's trusted-
     internal-caller path; this miner is the Agent, on the same trusted,
     unauthenticated boundary every other Agent-to-Hub call already uses).
     Best-effort: log-and-swallow on failure, same as every other push_* in
-    this codebase — one dropped edge never blocks the rest of the cycle."""
+    this codebase — one dropped edge never blocks the rest of the cycle.
+
+    port/outcome (ROADMAP P27 phase 2) are sent as 0/"" when unknown — see
+    service_topology.py's upsert_service_dependency for why 0/"" rather than
+    omitting the fields (0/"" are the Hub schema's "not captured" sentinels).
+    """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
@@ -198,6 +212,8 @@ async def _push_edge(backend_url: str, cluster_id: str, namespace: str, from_ser
                     "from_service": from_service,
                     "to_service": to_service,
                     "cluster_id": cluster_id,
+                    "port": port or 0,
+                    "outcome": outcome or "",
                 },
             )
             resp.raise_for_status()
@@ -212,9 +228,13 @@ async def _mine_namespace(
     backend_url: str, athena_config: Dict[str, str], cluster_id: str, namespace: str, hours_back: int,
 ) -> None:
     """Mine one (cluster, namespace)'s recently-landed log partition for
-    service-dependency edges, pushing each discovered edge at most once per
-    cycle (evidence_count already accumulates cluster-side across cycles —
-    no need to push a duplicate within one)."""
+    service-dependency edges, pushing each discovered (from, to, port) at
+    most once per cycle (evidence_count already accumulates cluster-side
+    across cycles — no need to push a duplicate within one). port is part of
+    the dedup key as of ROADMAP P27 phase 2, since a row is now split by
+    port; the outcome pushed for that one push is the last KNOWN outcome
+    seen for that (to, port) within this pod's own log window — a later
+    unclassifiable line never erases an earlier confident one."""
     selectors = await _fetch_selectors(backend_url, cluster_id, namespace)
     if not selectors:
         return  # no known services (or the fetch failed) — nothing to attribute logs to
@@ -235,10 +255,10 @@ async def _mine_namespace(
         logger.warning("dependency_miner: %s (cluster=%s namespace=%s)", result["error"], cluster_id, namespace)
         return
 
-    # Group each pod's log lines together so extract_service_mentions sees
-    # that pod's full recently-landed text at once, not one line at a time —
-    # matches Discovery's own live-mining unit of work (one pod's fetched
-    # tail as a whole), not a per-line scan.
+    # Group each pod's log lines together so extract_service_calls sees that
+    # pod's full recently-landed text at once (it splits by line internally
+    # only for outcome context, ROADMAP P27 phase 2) — matches Discovery's
+    # own live-mining unit of work (one pod's fetched tail as a whole).
     by_pod: Dict[str, List[str]] = {}
     pod_labels: Dict[str, Dict[str, str]] = {}
     for row in result.get("rows", []):
@@ -246,20 +266,33 @@ async def _mine_namespace(
         pod_labels.setdefault(pod_name, _parse_athena_map(row["labels"]))
         by_pod.setdefault(pod_name, []).append(_parse_cri_message(row["log"]))
 
-    pushed: Set[Tuple[str, str]] = set()
+    pushed: Set[Tuple[str, str, int]] = set()
     for pod_name, lines in by_pod.items():
         from_service = _service_for_labels(pod_labels.get(pod_name, {}), selectors)
         if not from_service:
             continue
         log_text = "\n".join(lines)
-        for to_service in extract_service_mentions(log_text, namespace, known_services):
-            if to_service == from_service:
+
+        # Last KNOWN outcome per (to_service, port) wins within this pod's
+        # own log window (ROADMAP P27 phase 2) — extract_service_calls
+        # returns observations in line order, so a later one reflects more
+        # recent state than an earlier one for the same target. A line that
+        # mentions the target again without a classifiable outcome must not
+        # erase an earlier confident one.
+        last_outcome: Dict[Tuple[str, int], Optional[str]] = {}
+        for obs in extract_service_calls(log_text, namespace, known_services):
+            if obs.service == from_service:
                 continue
-            edge = (from_service, to_service)
+            key = (obs.service, obs.port or 0)
+            if key not in last_outcome or obs.outcome is not None:
+                last_outcome[key] = obs.outcome
+
+        for (to_service, port), outcome in last_outcome.items():
+            edge = (from_service, to_service, port)
             if edge in pushed:
                 continue
             pushed.add(edge)
-            await _push_edge(backend_url, cluster_id, namespace, from_service, to_service)
+            await _push_edge(backend_url, cluster_id, namespace, from_service, to_service, port=port, outcome=outcome)
 
 
 async def run_once(backend_url: str, athena_config: Dict[str, str], hours_back: int = 2) -> None:
