@@ -391,6 +391,18 @@ func (c *Client) initSchema(ctx context.Context) error {
 	-- credential presented) this phase cares most about getting right.
 	UPDATE service_dependencies SET cluster_id = '' WHERE cluster_id IS NULL;
 	ALTER TABLE IF EXISTS service_dependencies ALTER COLUMN cluster_id SET DEFAULT '';
+	-- BUG FOUND LIVE (2026-09-12): this block and the port-based one below
+	-- (ROADMAP P27 phase 2 / ADR 0031) each only recognized their OWN target
+	-- constraint name as "already migrated". Once the port-based migration
+	-- ran once and renamed the constraint, THIS block ran again on the next
+	-- pod start, saw a name it didn't recognize, dropped it, and tried to
+	-- recreate the narrower 5-column constraint -- which then failed outright
+	-- (a real unique-index violation, since real data already had multiple
+	-- rows differing only by port) and took the WHOLE Postgres connection
+	-- down with it (buildBackendFactory treats a schema-init failure as
+	-- total relational+kv unavailability, not just this table). The two
+	-- migrations must each recognize the OTHER's target name as an
+	-- acceptable already-done state, not just their own.
 	DO $$
 	DECLARE
 		old_constraint_name TEXT;
@@ -399,12 +411,18 @@ func (c *Client) initSchema(ctx context.Context) error {
 		FROM pg_constraint
 		WHERE conrelid = 'service_dependencies'::regclass
 		  AND contype = 'u'
-		  AND conname != 'service_dependencies_tenant_cluster_ns_svc_key';
+		  AND conname NOT IN (
+		      'service_dependencies_tenant_cluster_ns_svc_key',
+		      'service_dependencies_tenant_cluster_ns_svc_port_key'
+		  );
 		IF old_constraint_name IS NOT NULL THEN
 			EXECUTE format('ALTER TABLE service_dependencies DROP CONSTRAINT %I', old_constraint_name);
 		END IF;
 		IF NOT EXISTS (
-			SELECT 1 FROM pg_constraint WHERE conname = 'service_dependencies_tenant_cluster_ns_svc_key'
+			SELECT 1 FROM pg_constraint WHERE conname IN (
+			    'service_dependencies_tenant_cluster_ns_svc_key',
+			    'service_dependencies_tenant_cluster_ns_svc_port_key'
+			)
 		) THEN
 			ALTER TABLE service_dependencies ADD CONSTRAINT service_dependencies_tenant_cluster_ns_svc_key
 				UNIQUE (tenant_id, cluster_id, namespace, from_service, to_service);

@@ -763,6 +763,49 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P27 phase 2 regression: re-running schema init after port-differentiated data exists must not fail", func(t *testing.T) {
+		// Found live (2026-09-12): initSchema's ADR 0022 tenant/cluster
+		// migration and its P27-phase-2 port migration each only recognized
+		// THEIR OWN target constraint name as "already migrated". On a pod
+		// restart, the ADR 0022 block ran again, didn't recognize the
+		// port-based constraint name, dropped it, and tried to recreate the
+		// narrower 5-column one -- which failed outright once real data had
+		// multiple rows differing only by port (exactly what this table now
+		// legitimately contains), and took down the ENTIRE Postgres
+		// connection (buildBackendFactory treats initSchema failure as total
+		// relational+kv unavailability, not just this one table). This
+		// reproduces it directly: insert two rows that collide under the
+		// OLD 5-column constraint but not the current 6-column one, then
+		// re-run initSchema exactly as a pod restart would.
+		tenantID := uuid.New().String()
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart-caller", "restart-callee", "service", 8443, ""); err != nil {
+			t.Fatalf("upsert port 8443: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart-caller", "restart-callee", "service", 0, ""); err != nil {
+			t.Fatalf("upsert port 0: %v", err)
+		}
+
+		if err := client.initSchema(ctx); err != nil {
+			t.Fatalf("initSchema must be idempotent even with port-differentiated data present, got: %v", err)
+		}
+
+		// The data survives, unchanged, and is still queryable — proving this
+		// isn't just "doesn't error" but "genuinely left the schema alone".
+		deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list after re-init: %v", err)
+		}
+		byPort := map[int]bool{}
+		for _, d := range deps {
+			if d.FromService == "restart-caller" && d.ToService == "restart-callee" {
+				byPort[d.Port] = true
+			}
+		}
+		if !byPort[8443] || !byPort[0] {
+			t.Fatalf("want both port rows to survive a schema re-init, got %+v", byPort)
+		}
+	})
+
 	t.Run("ROADMAP P18 use case #5: cluster_health_snapshots overwrites in place, fleet-wide listing surfaces every cluster", func(t *testing.T) {
 		tenantID := uuid.New().String()
 
