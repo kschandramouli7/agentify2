@@ -53,6 +53,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 2, 4, 5 not started — phase 2 is the one that unblocks P24. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file — **phases 1 and 3 shipped with no ADR.** One is owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 | **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
+| **P29** | **API/URL-scoped request traceability** — given a URL or path, show upstream/downstream microservices for that specific call as a filtered dependency diagram | Proposed (2026-09-12) — **splits into a path-filtered view of the mined graph (needs P27 phase 4, achievable) vs. genuine real-time per-request tracing (needs customer-side trace-ID instrumentation or a mesh/eBPF — a different architecture than this platform's log-mining approach)** | this file — ADR at implementation |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
@@ -2003,6 +2004,12 @@ Deliberately undesigned beyond that — open questions before this is built:
 dependencies," in `TopologyPanel.tsx`'s header (right of Refresh) — marks the
 intended entry point in the UI without committing to any of the above.
 
+**Also raised 2026-09-12, as a specific shape this button should support:**
+scoping the question to one API/URL path rather than a whole namespace — see
+**P29** below, which splits that into an achievable path-filtered view and a
+materially harder real-time-tracing ask, and should not be answered as if it
+were only the easy half.
+
 ### Also raised 2026-09-12: chat should reflect real-time failure state, not just the mined graph
 
 Today, the deterministic `dependencies` route (tier1,
@@ -2547,6 +2554,75 @@ this is closer to a new skill than a new miner.
 of `diagnose.py`; how to attribute an excerpt carrying no pod/Service signal
 at all (an operator pasting a bare exception); how much of the excerpt is
 safe to send to the model beyond what `log_redaction.py` already strips.
+
+**Status: not started.** ADR at implementation.
+
+---
+
+## P29 — API/URL-scoped request traceability: upstream/downstream for one specific call path (proposed 2026-09-12)
+
+**The pitch, in the terms it was raised:** given a URL or path (e.g.
+`POST /charge`), show — as a diagram, filtered to just that call — every
+microservice a request to that endpoint touches, upstream and downstream,
+and how the response returns. Same shape as the existing Dependencies
+panel, scoped to one API rather than a whole namespace, reached from the
+chat entry point already placeholdered under P22.
+
+**This conflates two asks of very different difficulty, and they must not
+be answered as if they were one.**
+
+1. **A path-filtered view of the already-mined graph.** Achievable, moderate
+   scope. `service_dependencies` already exists; what's missing is per-edge
+   path attribution — **P27 phase 4** ("Path / operation class — `/health`
+   versus `/charge`," not started) — plus a UI/query filter that narrows
+   `DependencyFlow` to edges whose recorded path matches the requested URL,
+   composed with focus's existing hop-distance traversal. Once phase 4
+   ships, this is largely a filter on data already being pushed, not new
+   infrastructure.
+
+2. **A genuine real-time trace of one live invocation of that path.** A
+   fundamentally different capability from anything built today, and the
+   docs already say why in their opening line: "Every edge is evidence that
+   a caller logged a callee's hostname, not an observed network flow. There
+   is no sidecar, no eBPF, no service mesh here"
+   (`docs/SERVICE_DEPENDENCIES.md`). The mining architecture aggregates
+   hostname mentions across a scan cycle (60s live, 3600s Glue) — it has
+   never seen an individual request, only that a hostname appeared
+   somewhere in a log tail. P27's own "Not a phase of this item — a new
+   capture mode" section already named exactly this gap for a *mined
+   sequence diagram* and deliberately left it unbuilt, flagging that it
+   needs per-call timestamps, ordering across pods, and clock-skew handling
+   between them — none of which a 60-second or hourly aggregate cycle
+   provides. Real per-request tracing needs either **(a)** a correlation ID
+   (e.g. a W3C `traceparent`) that every service already propagates and
+   logs — an instrumentation requirement on the *customer's* application
+   code, not something a log-mining collector can retrofit after the fact —
+   or **(b)** network-level capture (eBPF/service mesh), which is precisely
+   what P22's "outbound-only collector, no mesh, day-one value" pitch is
+   built to avoid requiring.
+
+**Recommendation embedded here, not yet decided:** build (1) first, as an
+extension of P27 phase 4 plus a filter — real value, no new infrastructure,
+and an honest answer to "upstream/downstream for this API call" *as this
+architecture can actually answer it*: the paths this endpoint has been
+observed to participate in, not a live single-request trace. Reserve
+"real-time" language for (2), and be explicit in the UI about which one is
+on screen, so an operator mid-incident does not mistake an aggregate for a
+live trace — the same "lower bound, not a network flow" honesty the panel
+already applies everywhere else in `docs/SERVICE_DEPENDENCIES.md`.
+
+**Delivery vehicle, per the request:** the chat entry point already
+placeholdered in P22 ("Ask about dependencies") — a question like "trace
+`POST /charge`" would resolve to a namespace + path filter and render the
+existing `DependencyFlow` diagram, scoped.
+
+**What it needs first:**
+- P27 phase 4 (path/operation-class capture) — hard prerequisite for (1),
+  not started.
+- A decision on (2) if it's pursued at all — it is a product-shape question
+  (what instrumentation a customer's services must already do) more than a
+  feature to schedule, and deserves its own item rather than being folded
+  into this one on the strength of a shared UI.
 
 **Status: not started.** ADR at implementation.
 
