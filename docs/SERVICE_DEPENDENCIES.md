@@ -205,6 +205,29 @@ not change when you focus.
 Line weight is **confidence in three bands**, not volume — see §3. The count is
 printed on every arrow regardless.
 
+**Health of the edges — added 2026-09-12 (ROADMAP P27 phase 2, ADR 0031),
+answering a different question from confidence.** Confidence is about how
+often the miner *catches* a call; health is about what happened on the calls
+it caught and could classify — success, failure, or timeout, read off the log
+line itself (an HTTP status code, or a handful of keywords). Most evidence
+has **no** classified outcome, on purpose: the classifier returns "unknown"
+far more often than a real APM would, because a wrong guess here would
+corrupt a signal an operator reads as fact, while an honest "not enough
+evidence" does not. So a verdict only draws once an edge has **at least 3
+classified observations** — below that it renders exactly as before this
+phase, no colour, no word.
+
+Once there is enough evidence: an edge whose classified calls are **mostly
+failing** turns its line **critical red**; **some** failures turn it **amber**;
+**all** succeeding leaves it unchanged — deliberately, on the same principle
+node `troubleText` already established (a diagram where every edge carries a
+status word trains the eye to skip it; a word only appears when something is
+actually wrong). A short word (`"33/33 failed"`) is printed alongside the
+count for a degraded or failing edge; colour alone never carries the finding.
+A banner above the diagram lists every degraded/failing edge by name when any
+exist, and says outright that this is a **lower bound** — most evidence is
+still unclassified, so the true unhealthy count is likely higher, not lower.
+
 Click a node (or a chip below) to focus it. Focus draws the **transitive**
 closure with hop distance, not one hop, and states the blast radius in prose:
 *"if payment-api fails, 2 services upstream are affected: payment-batch
@@ -250,9 +273,13 @@ when" is what makes the numbers above it interpretable.
 **Focus lists.** For the focused service: what it calls, and what calls it, each
 with evidence and freshness.
 
-**Table (the text alternative).** Every edge with From / To / Evidence / Last
-seen / First seen, sorted by evidence. This exists both for accessibility and
-because sometimes you want the numbers, not the shape.
+**Table (the text alternative).** Every edge with From / To / Port / Evidence /
+Health / Last seen / First seen, sorted by evidence. This exists both for
+accessibility and because sometimes you want the numbers, not the shape.
+Unlike the diagram, the Health column always prints a word — `healthy`,
+`N/M failed`, or `—` when there isn't yet enough classified evidence to
+judge — because a blank table cell reads as "nothing here," not "unknown,"
+which the diagram's tooltip can say but a bare cell cannot.
 
 **Mermaid export.** A `graph LR` block to paste into a PR, ADR or incident
 writeup — GitHub renders it, and it costs no runtime library. Edge labels are
@@ -266,8 +293,13 @@ second hue. Freshness is a state → the app's reserved status tokens, always wi
 a word (`fresh` / `stale` / `silent Nm`), never colour alone. Critical red is
 reserved for "this service is failing"; amber-plus-dashed means "we cannot
 currently tell", reusing the dashed idiom the unobserved node already uses so
-the two read as one family. Everything reuses the existing
-CSS token system, so dark mode and the rest of the console stay consistent.
+the two read as one family. **Edge health (added 2026-09-12) reuses the exact
+same two tokens for the exact same claims** — critical red for "this
+dependency is failing", amber for "some of it is" — rather than inventing a
+third meaning for an existing colour, and it is silent (no colour, no word)
+below the classified-evidence minimum, the edge-level equivalent of "we cannot
+currently tell." Everything reuses the existing CSS token system, so dark
+mode and the rest of the console stay consistent.
 
 ## 3. Where the data comes from
 

@@ -290,6 +290,78 @@ export function rarelyObserved(edges: FlowEdge[]): FlowEdge[] {
   return edges.filter(e => e.kind !== "declared" && confidence(e).key === "rare");
 }
 
+// Health — is this dependency WORKING, not just does it exist (ROADMAP P27
+// phase 2, ADR 0031). Deliberately separate from CONFIDENCE above: confidence
+// is about how often the miner catches the call at all; health is about what
+// happened on the calls it did catch and could classify.
+//
+// Most evidence is NOT classified — outcome inference is a conservative
+// per-line heuristic (an HTTP status code, or a handful of keywords) that
+// returns "unknown" far more often than a real APM would, on purpose: a
+// wrong guess here would corrupt a signal an operator reads as fact, while
+// an honest "not enough evidence yet" does not. So a verdict is only drawn
+// once there is a minimum amount of CLASSIFIED evidence — below that, this
+// reads as "unknown", the same as an edge with no outcome data at all.
+const MIN_CLASSIFIED_FOR_HEALTH = 3;
+
+export type EdgeHealth = {
+  key: "healthy" | "degraded" | "failing" | "unknown";
+  label: string;       // full sentence, for the tooltip
+  short: string;        // a few words, for the on-diagram word (degraded/failing only)
+  classified: number;   // success + failure + timeout
+  badCount: number;     // failure + timeout
+};
+
+export function edgeHealth(e: FlowEdge): EdgeHealth {
+  const success = e.outcome_success_count ?? 0;
+  const failure = e.outcome_failure_count ?? 0;
+  const timeout = e.outcome_timeout_count ?? 0;
+  const classified = success + failure + timeout;
+  const badCount = failure + timeout;
+
+  if (classified < MIN_CLASSIFIED_FOR_HEALTH) {
+    return {
+      key: "unknown",
+      label: classified === 0
+        ? "No calls on this edge have a classified outcome yet — health unknown, not necessarily fine."
+        : `Only ${classified} classified call${classified === 1 ? "" : "s"} so far — too few to judge health.`,
+      short: "",
+      classified, badCount,
+    };
+  }
+  const badFraction = badCount / classified;
+  if (badFraction >= 0.5) {
+    return {
+      key: "failing",
+      label: `Failing — ${badCount} of ${classified} classified calls errored or timed out.`,
+      short: `${badCount}/${classified} failed`,
+      classified, badCount,
+    };
+  }
+  if (badFraction > 0) {
+    return {
+      key: "degraded",
+      label: `Degraded — ${badCount} of ${classified} classified calls errored or timed out.`,
+      short: `${badCount}/${classified} failed`,
+      classified, badCount,
+    };
+  }
+  return {
+    key: "healthy",
+    label: `Healthy — all ${classified} classified calls succeeded.`,
+    short: "",
+    classified, badCount,
+  };
+}
+
+/** Edges with a drawn health verdict of degraded or failing — the actionable
+ *  set, surfaced the same way rarelyObserved's finding is: a banner, not
+ *  just a line colour, because "2 dependencies are failing" is worth
+ *  reading even before looking at the diagram. */
+export function unhealthyEdges(edges: FlowEdge[]): FlowEdge[] {
+  return edges.filter(e => e.kind !== "declared" && (edgeHealth(e).key === "failing" || edgeHealth(e).key === "degraded"));
+}
+
 const STALE_AFTER_MS = 15 * 60 * 1000; // matches TopologyPanel's threshold
 
 /** Which services the pod watch has gone quiet about *while still reporting
@@ -910,6 +982,7 @@ export function DependencyFlow({
               e.target_kind === "external" ||
               (!e.target_kind && meta?.get(e.to_service)?.kind === "external");
             const c = confidence(e);
+            const h = declared ? null : edgeHealth(e);
             const stale = !declared && isStale(e);
             const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? [], ports.get(e.id));
             return (
@@ -925,6 +998,8 @@ export function DependencyFlow({
                         : `Seen in ${e.evidence_count} of ~${c.scans} scans since it was first ` +
                           `observed (${Math.round((c.coverage ?? 0) * 100)}%) — ${c.label}.\n`) +
                       `This counts sightings in logs, not requests: confidence, not traffic volume.\n` +
+                      (e.port ? `Port ${e.port}.\n` : "Port not captured for this row (qualified-hostname mention).\n") +
+                      `${h?.label}\n` +
                       (e.target_kind === "external"
                         ? "WEAKER EVIDENCE: a public hostname, validated against nothing — no " +
                           "Service list exists for the internet, so this rests on hostname shape.\n"
@@ -939,7 +1014,9 @@ export function DependencyFlow({
                         "flow__line" +
                         (declared ? " flow__line--declared" : "") +
                         (weak ? " flow__line--weak" : "") +
-                        (stale ? " flow__line--stale" : "")
+                        (stale ? " flow__line--stale" : "") +
+                        (h?.key === "failing" ? " flow__line--failing" : "") +
+                        (h?.key === "degraded" ? " flow__line--degraded" : "")
                       }
                       strokeWidth={declared ? 2 : c.width}
                       markerEnd={`url(#${on ? "flow-arrow-on" : "flow-arrow"})`} />
@@ -949,6 +1026,18 @@ export function DependencyFlow({
                 {!declared && (
                   <text x={mid.x} y={mid.y - 6} textAnchor="middle" className="flow__count">
                     {e.evidence_count}
+                  </text>
+                )}
+                {/* Health word — deliberately absent when healthy or unknown,
+                    same "don't train the eye to skip it" principle as node
+                    troubleText: a word only appears when something is
+                    actually wrong (ROADMAP P27 phase 2, ADR 0031). */}
+                {h && h.short && (
+                  <text
+                    x={mid.x} y={mid.y + 12} textAnchor="middle"
+                    className={`flow__edge-health${h.key === "failing" ? " flow__edge-health--failing" : " flow__edge-health--degraded"}`}
+                  >
+                    {h.short}
                   </text>
                 )}
               </g>

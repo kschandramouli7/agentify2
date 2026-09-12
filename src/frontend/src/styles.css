@@ -3000,6 +3000,18 @@ code {
 /* An edge resting on hostname shape alone reads lighter than a validated one. */
 .flow__line--weak { opacity: 0.55; }
 
+/* Health (ROADMAP P27 phase 2, ADR 0031) — is this dependency WORKING, not
+   just does it exist. Same status tokens and idiom the node boxes already
+   use for flow__node--trouble/--silent, applied to edges: colour is never
+   the only signal (see flow__edge-health below), and a healthy or unknown
+   edge draws exactly as it always has — colour is spent only where
+   something is actually wrong. Kept ahead of the focus override below so a
+   failing/degraded edge stays legible even while in focus. */
+.flow__line--degraded { stroke: var(--warn); }
+.flow__line--failing  { stroke: var(--crit); }
+.flow__edge--on .flow__line--degraded { stroke: var(--warn); }
+.flow__edge--on .flow__line--failing  { stroke: var(--crit); }
+
 /* An entry point from outside the cluster. */
 .flow__node--ingress .flow__box { stroke: var(--ai, #8b7fd4); stroke-dasharray: none; }
 
@@ -3024,6 +3036,21 @@ code {
   stroke-linejoin: round;
 }
 .flow__edge--on .flow__count { fill: var(--text); }
+
+/* The health word (ROADMAP P27 phase 2) — same panel-coloured outline as
+   flow__count so it stays legible crossing the line, bold so it isn't
+   mistaken for another sighting count sharing the same numeric shape. */
+.flow__edge-health {
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--panel);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+.flow__edge-health--degraded { fill: var(--warn); }
+.flow__edge-health--failing  { fill: var(--crit); }
 
 .flow__node { cursor: pointer; }
 .flow__box {

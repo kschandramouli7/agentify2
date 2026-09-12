@@ -5,7 +5,7 @@ import {
   listServiceHealth,
   type ServiceDependency,
 } from "../api";
-import { DependencyFlow, confidence, rarelyObserved, silentServices, type FlowEdge, type NodeMeta } from "./DependencyFlow";
+import { DependencyFlow, confidence, edgeHealth, rarelyObserved, silentServices, unhealthyEdges, type FlowEdge, type NodeMeta } from "./DependencyFlow";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
 //
@@ -142,6 +142,24 @@ function Freshness({ lastSeen }: { lastSeen: string }) {
   return (
     <span className={`adm-badge adm-badge--${stale ? "warn" : "ok"}`} title={absTime(lastSeen)}>
       {stale ? "stale" : "fresh"} · {relTime(lastSeen)}
+    </span>
+  );
+}
+
+// ROADMAP P27 phase 2 (ADR 0031). The table is the text alternative — "for
+// accessibility and because sometimes you want the numbers, not the shape" —
+// so unlike the diagram (which stays silent on healthy/unknown edges to
+// avoid crying wolf, same as node troubleText), every row gets an explicit
+// word here: "healthy"/"N/M failed"/"—" for genuinely no classified evidence.
+function HealthCell({ edge }: { edge: ServiceDependency }) {
+  const h = edgeHealth(edge);
+  if (h.key === "unknown") {
+    return <span className="adm-muted" title={h.label}>—</span>;
+  }
+  const tone = h.key === "failing" ? "crit" : h.key === "degraded" ? "warn" : "ok";
+  return (
+    <span className={`adm-badge adm-badge--${tone}`} title={h.label}>
+      {h.key === "healthy" ? "healthy" : `${h.badCount}/${h.classified} failed`}
     </span>
   );
 }
@@ -416,6 +434,9 @@ export function TopologyPanel() {
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
   const rare = useMemo(() => rarelyObserved(graph.edges), [graph.edges]);
+  // ROADMAP P27 phase 2 (ADR 0031): edges with enough classified evidence to
+  // draw a health verdict of degraded or failing.
+  const unhealthy = useMemo(() => unhealthyEdges(graph.edges), [graph.edges]);
   const selected = focus && graph.services.includes(focus) ? focus : null;
 
   return (
@@ -541,6 +562,21 @@ export function TopologyPanel() {
             />
           </div>
 
+          {unhealthy.length > 0 && (
+            <p className="topo-gap">
+              <span className={`adm-badge adm-badge--${unhealthy.some(e => edgeHealth(e).key === "failing") ? "crit" : "warn"}`}>
+                unhealthy
+              </span>{" "}
+              {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
+              {unhealthy.map(e => {
+                const h = edgeHealth(e);
+                return `${e.from_service}→${e.to_service} (${h.badCount}/${h.classified} failed)`;
+              }).join(", ")}. Based only on calls with a classified outcome — most evidence has
+              none yet (outcome inference is deliberately conservative), so this is a lower bound
+              on how many dependencies are actually unhealthy, not the full picture.
+            </p>
+          )}
+
           {rare.length > 0 && (
             <p className="topo-gap">
               <span className="adm-badge adm-badge--warn">incomplete</span>{" "}
@@ -625,7 +661,7 @@ export function TopologyPanel() {
             <table className="adm-table">
               <thead>
                 <tr>
-                  <th>From</th><th></th><th>To</th><th>Seen in</th><th>Last seen</th><th>First seen</th>
+                  <th>From</th><th></th><th>To</th><th>Port</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
                 </tr>
               </thead>
               <tbody>
@@ -637,7 +673,9 @@ export function TopologyPanel() {
                       <td><button type="button" className="topo-link" onClick={() => setFocus(e.from_service)}>{e.from_service}</button></td>
                       <td className="adm-muted">→</td>
                       <td><button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button></td>
+                      <td className="adm-muted">{e.port ? e.port : "—"}</td>
                       <td><EvidenceBar edge={e} /></td>
+                      <td><HealthCell edge={e} /></td>
                       <td><Freshness lastSeen={e.last_seen} /></td>
                       <td className="adm-muted" title={absTime(e.first_seen)}>{relTime(e.first_seen)}</td>
                     </tr>

@@ -417,6 +417,20 @@ export type ServiceDependency = {
   last_seen: string;
   tenant_id: string;
   cluster_id?: string;
+  /** ROADMAP P27 phase 2 (ADR 0031). 0/absent means "never captured" — only
+   *  the bare host:port log form carries a port; a row is split by port, so
+   *  two ports for the same (from, to) pair are two distinct rows. Optional
+   *  here (rather than always-0) because synthetic DECLARED edges (from an
+   *  Ingress object, see DependencyFlow's FlowEdge) have no port at all —
+   *  same reasoning as target_kind/cluster_id above. */
+  port?: number;
+  /** Cumulative since first_seen. There is no separate "unknown" counter —
+   *  it is evidence_count minus the sum of these three. Optional for the
+   *  same reason port is; a real observed row always has a real (possibly
+   *  0) value from the API. */
+  outcome_success_count?: number;
+  outcome_failure_count?: number;
+  outcome_timeout_count?: number;
 };
 
 /** One entry point into the cluster from outside — an Ingress, Gateway
