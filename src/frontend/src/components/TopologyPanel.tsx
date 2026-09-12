@@ -471,6 +471,18 @@ export function TopologyPanel() {
           <button className="adm-btn adm-btn--ghost" type="button" onClick={() => refetch()}>
             {isFetching ? "Refreshing…" : "Refresh"}
           </button>
+          {/* Placeholder only — marks the entry point without committing to a
+            * design. What it should send (focus? whole graph? just the
+            * namespace?) and whether it opens chat in-place or navigates to
+            * the Chat tab are still open; see ROADMAP.md P22. */}
+          <button
+            className="adm-btn adm-btn--ghost"
+            type="button"
+            disabled
+            title="Coming soon — ask questions about this namespace's dependency graph without leaving the panel."
+          >
+            Ask about dependencies
+          </button>
         </div>
       </div>
 

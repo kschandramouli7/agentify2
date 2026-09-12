@@ -1966,6 +1966,28 @@ Hub-side generator reading Postgres directly (redaction does not apply there,
 by design — it is an *egress* control), or the allowlist must be extended,
 which revises ADR 0007 and is a decision rather than a patch.
 
+### Backlog idea, not designed yet: a chat entry point on the panel
+
+Raised 2026-09-12. The pitch is narrow: a question about the graph currently
+on screen shouldn't require switching to the Chat tab and re-stating the
+namespace (and focus, if one is selected) that's already selected here.
+Deliberately undesigned beyond that — open questions before this is built:
+
+- **What it sends.** The whole namespace's graph, just the focused service's
+  upstream/downstream, or nothing (plain navigation to Chat with the
+  namespace pre-filled as context)?
+- **Where the answer appears.** Opens chat in-place in this panel, or
+  navigates to the existing Chat tab?
+- **Whether it needs new plumbing at all.** `_chat_route`'s `dependencies`
+  intent (`docs/SERVICE_DEPENDENCIES.md` §1b) already answers pure dependency
+  questions deterministically (tier1, no model call) once it has a namespace
+  and a question — this button may only need to compose that question and
+  hand it to the existing chat flow, not add a new backend path.
+
+**Shipped 2026-09-12:** a disabled placeholder button, "Ask about
+dependencies," in `TopologyPanel.tsx`'s header (right of Refresh) — marks the
+intended entry point in the UI without committing to any of the above.
+
 ### Deliberately out of scope
 
 Anything requiring declared intent (Git manifests, Helm, Terraform). Comparing
