@@ -53,7 +53,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 2, 4, 5 not started — phase 2 is the one that unblocks P24. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file — **phases 1 and 3 shipped with no ADR.** One is owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 | **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
-| **P29** | **API/URL-scoped request traceability** — given a URL or path, show upstream/downstream microservices for that specific call as a filtered dependency diagram | Proposed (2026-09-12) — **splits into a path-filtered view of the mined graph (needs P27 phase 4, achievable) vs. genuine real-time per-request tracing (needs customer-side trace-ID instrumentation or a mesh/eBPF — a different architecture than this platform's log-mining approach)** | this file — ADR at implementation |
+| **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | Proposed (2026-09-12) — **two complementary halves: a path-filtered view of the mined graph (needs P27 phase 4, achievable), and an on-demand raw-log search keyed by trace ID/URL text (buildable on the existing Glue/Athena store; bounded by whether onboarded services already log a trace ID — not audited)** | this file — ADR at implementation |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
@@ -2005,10 +2005,10 @@ dependencies," in `TopologyPanel.tsx`'s header (right of Refresh) — marks the
 intended entry point in the UI without committing to any of the above.
 
 **Also raised 2026-09-12, as a specific shape this button should support:**
-scoping the question to one API/URL path rather than a whole namespace — see
-**P29** below, which splits that into an achievable path-filtered view and a
-materially harder real-time-tracing ask, and should not be answered as if it
-were only the easy half.
+scoping the question to one API/URL path, or to a trace ID an application
+already logs, rather than a whole namespace — see **P29** below, which
+covers both: a path-filtered view of the mined graph, and an on-demand raw-
+log search by trace ID for one specific call.
 
 ### Also raised 2026-09-12: chat should reflect real-time failure state, not just the mined graph
 
@@ -2580,49 +2580,78 @@ be answered as if they were one.**
    ships, this is largely a filter on data already being pushed, not new
    infrastructure.
 
-2. **A genuine real-time trace of one live invocation of that path.** A
-   fundamentally different capability from anything built today, and the
-   docs already say why in their opening line: "Every edge is evidence that
-   a caller logged a callee's hostname, not an observed network flow. There
-   is no sidecar, no eBPF, no service mesh here"
-   (`docs/SERVICE_DEPENDENCIES.md`). The mining architecture aggregates
-   hostname mentions across a scan cycle (60s live, 3600s Glue) — it has
-   never seen an individual request, only that a hostname appeared
-   somewhere in a log tail. P27's own "Not a phase of this item — a new
-   capture mode" section already named exactly this gap for a *mined
-   sequence diagram* and deliberately left it unbuilt, flagging that it
-   needs per-call timestamps, ordering across pods, and clock-skew handling
-   between them — none of which a 60-second or hourly aggregate cycle
-   provides. Real per-request tracing needs either **(a)** a correlation ID
-   (e.g. a W3C `traceparent`) that every service already propagates and
-   logs — an instrumentation requirement on the *customer's* application
-   code, not something a log-mining collector can retrofit after the fact —
-   or **(b)** network-level capture (eBPF/service mesh), which is precisely
-   what P22's "outbound-only collector, no mesh, day-one value" pitch is
-   built to avoid requiring.
+2. **An on-demand search of the raw log store, keyed by a trace ID or a
+   URL/path string — clarified 2026-09-12 to mean this, not network-level
+   capture.** "Real-time" meant mining the *existing* Glue/Athena log store
+   on demand, not literal live packet capture — materially more buildable
+   than the eBPF/mesh framing this item first carried, and it needs no new
+   instrumentation on the customer's services *if* they already log a
+   request/trace/correlation ID, which is a real precondition, not a new
+   ask placed on them.
 
-**Recommendation embedded here, not yet decided:** build (1) first, as an
-extension of P27 phase 4 plus a filter — real value, no new infrastructure,
-and an honest answer to "upstream/downstream for this API call" *as this
-architecture can actually answer it*: the paths this endpoint has been
-observed to participate in, not a live single-request trace. Reserve
-"real-time" language for (2), and be explicit in the UI about which one is
-on screen, so an operator mid-incident does not mistake an aggregate for a
-live trace — the same "lower bound, not a network flow" honesty the panel
-already applies everywhere else in `docs/SERVICE_DEPENDENCIES.md`.
+   - **Mechanism.** An on-demand Athena query against the raw `log`
+     column — `log LIKE '%<trace_id>%'`, or a URL/path pattern — run when
+     the question is asked, not on a fixed cycle. Same start/poll/fetch
+     shape `dependency_miner.py`'s `_run_query_sync` already implements,
+     with a different `WHERE` clause and, importantly, **no namespace
+     restriction**: a distributed request routinely crosses namespace
+     boundaries, which is the entire point of tracing it, so this must
+     search wider than any single scheduled miner cycle does today.
+   - **Attribution.** Each matching row already carries
+     `kubernetes.labels`/`pod_name`, attributed to a service via the same
+     `_service_for_labels` matching the miner uses — but against *every*
+     onboarded namespace's selector map at once, not one, which is a real
+     scope difference from how the continuous miner runs.
+   - **Ordering.** `_parse_cri_message` currently **discards** the CRI
+     line's own `<timestamp> <stream> <tag>` prefix, keeping only the
+     message text (confirmed in code, `dependency_miner.py`). This feature
+     needs that timestamp kept and parsed — reconstructing "who was called,
+     in what order" for one identified request is the entire value here.
+   - **The validation discipline the disabled `external` tier learned the
+     hard way still applies to the URL/path form.** A bare substring search
+     for a URL will match a `Referer` header or a quoted error body exactly
+     as it fabricated `www.nokia.com` and `dashboard.voyageai.com`
+     (`docs/SERVICE_DEPENDENCIES.md`) — matching must stay in a
+     hostname/call context (`//host`, `host:port`) and validate against the
+     Service list, not a bare `LIKE`. A **trace-ID** search carries no such
+     risk — an opaque ID is not a hostname-shaped string that prose can be
+     mistaken for.
+   - **Rendering.** The matched, attributed, ordered rows form a small
+     subgraph for one request — closer to a **sequence diagram** (who, in
+     what order) than the standing layered `DependencyFlow` view, since the
+     value is causal order for one call, not aggregate topology. This is
+     the tractable version of the "mined sequence diagram" P27 already
+     named and set aside ("Not a phase of this item — a new capture mode"):
+     P27 deferred it because *continuous* per-call capture has real cost
+     and ordering problems (log volume, clock skew across pods) — an
+     on-demand search triggered by one already-known identifier is one
+     targeted query, not a standing pipeline, and mostly sidesteps that
+     cost argument.
+   - **The genuine limit, stated plainly:** this only works for a
+     namespace/service whose logging already includes a request/trace ID.
+     Nothing here retrofits correlation into logs that don't carry one —
+     that remains a real gap, not something better mining fixes.
+
+**Recommendation embedded here, not yet decided:** (1) and (2) are
+complementary, not sequential — (1) reads the pre-aggregated
+`service_dependencies` table (needs P27 phase 4 first); (2) reads the raw
+log store directly, on demand, and needs no aggregate table at all. Being
+explicit in the UI about which one answered a given question still matters:
+(1) is "the paths this endpoint has historically participated in," (2) is
+"what actually happened for this one call, where a trace ID or URL made it
+findable" — different confidence, different shape, and both stronger than
+the "impossible without a mesh" framing this item first carried.
 
 **Delivery vehicle, per the request:** the chat entry point already
-placeholdered in P22 ("Ask about dependencies") — a question like "trace
-`POST /charge`" would resolve to a namespace + path filter and render the
-existing `DependencyFlow` diagram, scoped.
+placeholdered in P22 ("Ask about dependencies") — "trace `POST /charge`"
+resolves to (1); "trace `<trace-id>`" resolves to (2).
 
 **What it needs first:**
 - P27 phase 4 (path/operation-class capture) — hard prerequisite for (1),
   not started.
-- A decision on (2) if it's pursued at all — it is a product-shape question
-  (what instrumentation a customer's services must already do) more than a
-  feature to schedule, and deserves its own item rather than being folded
-  into this one on the strength of a shared UI.
+- For (2): confirming which onboarded services actually log a
+  request/trace ID today (unknown — not audited), since the feature's
+  value is bounded by that, not by anything this item can build.
 
 **Status: not started.** ADR at implementation.
 
