@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -135,6 +136,22 @@ func main() {
 	remediationCfg := api.RemediationConfig{
 		ProposalTTL: time.Duration(cfg.RemediationProposalTTLMinutes) * time.Minute,
 		AuthToken:   cfg.RemediationAuthToken,
+		Env:         cfg.Env,
+	}
+	// An unset token fails closed outside dev (ADR 0020 amendment, ROADMAP
+	// OPS-3) — mirrors the SetEvalAuthToken warning below so an operator sees
+	// the same class of misconfiguration the same way for both endpoints.
+	switch remediationEnv := strings.ToLower(strings.TrimSpace(cfg.Env)); {
+	case cfg.RemediationAuthToken != "":
+		// configured; nothing to say
+	case remediationEnv == "dev" || remediationEnv == "":
+		logger.Warn("REMEDIATION_AUTH_TOKEN not set — approve/reject is OPEN. " +
+			"Allowed because ENV is dev; anyone who can reach the backend can " +
+			"approve a proposed restart/scale/rollback")
+	default:
+		logger.Error("REMEDIATION_AUTH_TOKEN not set — approve/reject is DISABLED "+
+			"because ENV is not dev. Set REMEDIATION_AUTH_TOKEN before enabling "+
+			"AUTONOMOUS_REMEDIATION_ENABLED/DEPLOY_GUARDIAN_ENABLED", "env", cfg.Env)
 	}
 
 	// Build the API handler once; the router and the proactive investigation loop

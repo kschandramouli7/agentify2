@@ -19,7 +19,8 @@ import (
 // human approval — never auto-executed regardless of confidence.
 type RemediationConfig struct {
 	ProposalTTL time.Duration
-	AuthToken   string // constant-time bearer check on approve/reject; empty disables auth (dev only)
+	AuthToken   string // constant-time bearer check on approve/reject
+	Env         string // "dev" | "prod" (ROADMAP OPS-3 / ADR 0020 amendment 2026-09-12); an empty AuthToken is honoured only when this is "dev"
 }
 
 // checkRemediationAuth validates the bearer token on approve/reject. This is a
@@ -27,9 +28,22 @@ type RemediationConfig struct {
 // can be safely called by an authorized external service (Slack interactivity,
 // PagerDuty webhook) later without depending on how the console authenticates.
 // Mirrors the constant-time bearer-check pattern used for COLLECTOR_TOKEN.
+//
+// An unset token FAILS CLOSED outside dev (ADR 0020 amendment, 2026-09-12;
+// ROADMAP OPS-3). ADR 0020 originally made an empty token mean "open," for
+// consistency with COLLECTOR_TOKEN — approve/reject execute a real K8s write
+// (restart/scale/rollback), a materially larger exposure than an unset
+// collector credential, and remediation is one config change (flipping
+// AUTONOMOUS_REMEDIATION_ENABLED/DEPLOY_GUARDIAN_ENABLED) away from live at
+// any time. Mirrors checkEvalAuth's identical fix (eval_query.go), applied
+// here second because reversing this posture is a decision, not a patch —
+// see the ADR amendment for the tradeoff it was weighed against (a
+// misconfigured deploy now makes remediation silently unusable, 401 on every
+// approve/reject, rather than usable-but-insecure).
 func (h *Handler) checkRemediationAuth(r *http.Request) bool {
 	if h.remediationConfig.AuthToken == "" {
-		return true // unauthenticated (dev only) — same posture as an unset collector credential
+		env := strings.ToLower(strings.TrimSpace(h.remediationConfig.Env))
+		return env == "dev" || env == "" // open for local development only; disabled anywhere else
 	}
 	const prefix = "Bearer "
 	auth := r.Header.Get("Authorization")

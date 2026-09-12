@@ -73,6 +73,47 @@ any confidence level. Concretely:
    single-purpose, immediately-reversible action with its own existing
    guardrails; this ADR does not retrofit the approval-gate pattern onto it.
 
+## Amendment (2026-09-12) — an unset auth token now fails closed outside dev
+
+Point 2 above says approve/reject "is bearer-token-authenticated" but never
+decided what an **unset** token should mean. The implementation
+(`checkRemediationAuth`) picked "open" — the same posture as an unset
+`COLLECTOR_TOKEN` — without that being a reviewed decision, and it stayed
+that way through the deployed cluster running with `REMEDIATION_AUTH_TOKEN`
+unset and `ENV=prod` (flagged as ROADMAP OPS-3, 2026-09-01).
+
+**Why this needed a decision, not just a patch.** Unlike `COLLECTOR_TOKEN`
+(scopes which cluster's evidence a push belongs to) or the original
+`EVAL_AUTH_TOKEN` default this was modeled on, approve/reject **executes a
+real Kubernetes write** — restart, scale, or rollback — the instant it's
+called. An unset token here is a materially larger exposure than either of
+those, and it sits one config change away from live at any time: nothing
+prevents `AUTONOMOUS_REMEDIATION_ENABLED`/`DEPLOY_GUARDIAN_ENABLED` from being
+flipped to `"true"` without also setting the token, since the three are
+independent flags.
+
+**Decision: fail closed outside dev**, mirroring `EVAL_AUTH_TOKEN`'s own
+2026-09-01 amendment (ADR 0030) exactly — `checkRemediationAuth` now checks
+`ENV`, and an unset token disables approve/reject entirely when `ENV` is not
+`"dev"`/unset, rather than leaving them open.
+
+**The tradeoff, stated plainly, since the alternative has a real cost too.**
+Failing closed means a misconfigured deployment (both `ENABLED` flags on,
+token forgotten) makes remediation **silently unusable** — every approve/
+reject call 401s, with no proposals ever executable — rather than usable-but-
+insecure. On a feature whose entire purpose is being available *during an
+incident*, "silently broken" is its own failure mode. This was weighed and
+accepted anyway: an operator discovers "the button doesn't work" during
+setup/testing, before an incident, once, and fixes it by setting the token
+(`infra/kubernetes/backend.yaml` now sources it from
+`agentify-remediation-secret`, not a literal value) — whereas the insecure
+default is discovered, if ever, by someone exploiting it.
+
+**Point 7's rejected alternative is unaffected.** Confidence-gated
+auto-execution remains rejected for the reasons already stated; this
+amendment only changes what an *absent credential* does at the approval
+endpoint, not who is allowed to skip approval.
+
 ## Consequences
 
 - **Positive:** unlocks the two highest-value spec 011 use cases (closing the
@@ -89,6 +130,11 @@ any confidence level. Concretely:
   (replays the previous deploy event's recorded images), not a full K8s
   ReplicaSet-revision rollback — sufficient for image-bump deploys, not for
   every possible change shape.
+- **Negative / cost accepted (2026-09-12 amendment):** an unset
+  `REMEDIATION_AUTH_TOKEN` now disables approve/reject entirely outside dev,
+  rather than leaving them open — a misconfigured deployment discovers this
+  as "remediation doesn't work" (every decision 401s) instead of as a
+  security gap. Judged the better failure mode for a write-capable endpoint.
 - **Revisit if:** the team accumulates enough approved/executed history to
   trust a narrower, explicitly-scoped auto-execute path for a single very
   low-risk action (e.g. restart-only, single-replica, non-payments

@@ -78,9 +78,17 @@ spec:
           value: "false"   # opt-in; set to "true" and add INVESTIGATION_WEBHOOK_URL to enable
         # Phase-3 remediation (ADR 0020 / spec 011 Use Cases 1+2) — every write
         # action is proposed first and only executed after explicit human
-        # approval; both loops default off. REMEDIATION_AUTH_TOKEN should be
-        # sourced from a Secret (same secretKeyRef pattern as DB_PASSWORD
-        # above) once a paying deployment turns this on.
+        # approval; both loops default off.
+        #
+        # An unset REMEDIATION_AUTH_TOKEN now FAILS CLOSED outside dev (ADR
+        # 0020 amendment, ROADMAP OPS-3, 2026-09-12): approve/reject execute a
+        # real K8s write (restart/scale/rollback), and the two ENABLED flags
+        # below are one config change away from making that reachable, so an
+        # unset token disables the endpoints entirely here (ENV=prod) rather
+        # than leaving them open. Create the secret once before ever setting
+        # either ENABLED flag to "true":
+        #   kubectl create secret generic agentify-remediation-secret \
+        #     -n agentify --from-literal=auth-token="$(openssl rand -hex 32)"
         - name: AUTONOMOUS_REMEDIATION_ENABLED
           value: "false"
         - name: DEPLOY_GUARDIAN_ENABLED
@@ -88,17 +96,25 @@ spec:
         - name: REMEDIATION_PROPOSAL_TTL_MINUTES
           value: "30"
         - name: REMEDIATION_AUTH_TOKEN
-          value: ""
+          valueFrom:
+            secretKeyRef:
+              name: agentify-remediation-secret
+              key: auth-token
+              optional: true  # absent secret -> empty token -> fails closed outside dev, not a crash
         # Version-pinned prompt evaluation (ADR 0030 / P19 gap D1). Guards
         # POST /admin/eval/query, which can make the agent answer using an
         # arbitrary prompt version — a behaviour-substitution lever, hence its
         # own token rather than exposure on the unauthenticated /api/query.
         #
-        # Empty means the endpoint is OPEN, matching the posture of
-        # REMEDIATION_AUTH_TOKEN and COLLECTOR_TOKEN above. Set it from a Secret
-        # (same secretKeyRef pattern as DB_PASSWORD) before this cluster carries
-        # anything that matters, and set the same value as the EVAL_AUTH_TOKEN
-        # GitHub secret so 10-prompt-gate.yml can authenticate.
+        # An unset token FAILS CLOSED outside dev (ADR 0030 amendment,
+        # 2026-09-01) — this comment previously said empty means "OPEN,
+        # matching the posture of REMEDIATION_AUTH_TOKEN and COLLECTOR_TOKEN,"
+        # which stopped being true the day this endpoint was fixed and was
+        # left stale; REMEDIATION_AUTH_TOKEN now has the same fail-closed
+        # posture too (above). Set it from a Secret (same secretKeyRef pattern
+        # as DB_PASSWORD) before this cluster carries anything that matters,
+        # and set the same value as the EVAL_AUTH_TOKEN GitHub secret so
+        # 10-prompt-gate.yml can authenticate.
         - name: EVAL_AUTH_TOKEN
           value: ""
         livenessProbe:
