@@ -131,6 +131,28 @@ func (ing *Ingester) storeEvent(ctx context.Context, pod *models.Pod, event *mod
 		return fmt.Errorf("no backend for store type %q: %w", pod.StoreType, err)
 	}
 
+	// A watch DELETED event is normalised to an event_type ending "_deleted"
+	// (pod_deleted, service_deleted — discovery/normalize.py) meaning the
+	// underlying K8s object no longer exists. On the kv (current_state)
+	// backend that must remove the row, not upsert it with the object's
+	// last-known state: before this fix current_state never forgot a dead
+	// pod, so ten rollouts left ~10 rows per service and readiness ratios
+	// like "9/1 · 1 not ready" for a healthy 1-replica Deployment (ROADMAP
+	// OPS-12). The relational/vector event history is unaffected — it is
+	// append-only and correctly keeps this event like any other.
+	if pod.StoreType == "kv" && strings.HasSuffix(event.Type, "_deleted") && event.EntityKey != "" {
+		type kvDeleter interface {
+			Delete(ctx context.Context, tenantID, podID, entityKey string) error
+		}
+		if deleter, ok := backend.(kvDeleter); ok {
+			if err := deleter.Delete(ctx, tenantID, pod.ID, event.EntityKey); err != nil {
+				return err
+			}
+			ing.logger.Debug("current-state entity deleted", "event_id", event.ID, "pod_id", pod.ID, "entity_key", event.EntityKey)
+			return nil
+		}
+	}
+
 	recordID := event.ID
 	if pod.StoreType == "kv" && event.EntityKey != "" {
 		recordID = event.EntityKey
