@@ -40,7 +40,7 @@ jobs:
 
       - name: Ensure ECR repos exist
         run: |
-          for repo in agentify/backend agentify/agent agentify/frontend agentify/discovery; do
+          for repo in agentify/backend agentify/agent agentify/frontend agentify/discovery agentify/security-verifier; do
             aws ecr describe-repositories --repository-names "$repo" \
               --region ${{ secrets.AWS_REGION }} > /dev/null 2>&1 \
             || aws ecr create-repository --repository-name "$repo" \
@@ -93,6 +93,15 @@ jobs:
           tags: |
             ${{ secrets.ECR_REGISTRY }}/agentify/discovery:${{ steps.meta.outputs.tag }}
             ${{ secrets.ECR_REGISTRY }}/agentify/discovery:latest
+
+      - name: Build & push security-verifier
+        uses: docker/build-push-action@v5
+        with:
+          context: src/adapters/security_verifier
+          push: true
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/agentify/security-verifier:${{ steps.meta.outputs.tag }}
+            ${{ secrets.ECR_REGISTRY }}/agentify/security-verifier:latest
 
   deploy:
     name: Deploy to EKS
@@ -191,7 +200,7 @@ jobs:
           # ADR 0021's original no-NAT ECR-mirror workaround doesn't apply
           # here; see the images themselves for the full explanation).
           for f in infra/kubernetes/backend.yaml infra/kubernetes/agent.yaml \
-                   infra/kubernetes/discovery.yaml; do
+                   infra/kubernetes/discovery.yaml infra/kubernetes/security-verifier.yaml; do
             sed -i "s|ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com|${REGISTRY}|g" "$f"
           done
 
@@ -199,6 +208,7 @@ jobs:
           sed -i "s|${REGISTRY}/agentify/backend:latest|${REGISTRY}/agentify/backend:${TAG}|g" infra/kubernetes/backend.yaml
           sed -i "s|${REGISTRY}/agentify/agent:latest|${REGISTRY}/agentify/agent:${TAG}|g" infra/kubernetes/agent.yaml
           sed -i "s|${REGISTRY}/agentify/discovery:latest|${REGISTRY}/agentify/discovery:${TAG}|g" infra/kubernetes/discovery.yaml
+          sed -i "s|${REGISTRY}/agentify/security-verifier:latest|${REGISTRY}/agentify/security-verifier:${TAG}|g" infra/kubernetes/security-verifier.yaml
           sed -i "s|ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com|${REGISTRY}|g" infra/kubernetes/frontend.yaml
           sed -i "s|${REGISTRY}/agentify/frontend:latest|${REGISTRY}/agentify/frontend:${TAG}|g" infra/kubernetes/frontend.yaml
 
@@ -422,19 +432,34 @@ jobs:
           # harmless, but gating this deploy job on its rollout would make every
           # future deploy fail until that manual step happens.
           kubectl apply -f infra/kubernetes/discovery.yaml
+          kubectl apply -f infra/kubernetes/security-verifier.yaml
           kubectl apply -f infra/kubernetes/frontend.yaml
           kubectl apply -f infra/kubernetes/ingress.yaml
           kubectl apply -f infra/kubernetes/namespace-sync-cronjob.yaml
-          kubectl apply -f infra/kubernetes/vault/vault-ingress.yaml
           kubectl apply -f infra/kubernetes/payments-test/namespace.yaml
           kubectl apply -f infra/kubernetes/payments-test/serviceaccounts.yaml
           kubectl apply -f infra/kubernetes/payments-test/payment-service.yaml
           kubectl apply -f infra/kubernetes/payments-test/payment-api.yaml
           kubectl apply -f infra/kubernetes/payments-test/payment-worker.yaml
+          # ROADMAP OPS-14 (2026-09-14): the dev-mode Vault (root token) UI/API
+          # was reachable over plain HTTP on this same public, internet-facing
+          # ALB via infra/kubernetes/vault/vault-ingress.yaml — the sharpest
+          # finding in that day's deployment-security audit. Nothing actually
+          # needs that public path: CI (03-vault-bootstrap.yml) and
+          # scripts/vault-setup.sh both already reach Vault via
+          # `kubectl port-forward`, and agentify-agent talks to it over the
+          # in-cluster ClusterIP DNS name (infra/kubernetes/agent.yaml's
+          # VAULT_ADDR). The manifest is deleted; this delete is idempotent
+          # (--ignore-not-found) and kept permanently, not just for one run,
+          # so a stale branch that still applies the old manifest can't
+          # silently re-expose it without this step removing it again on the
+          # very next deploy.
+          kubectl delete ingress vault-ui -n vault --ignore-not-found
 
       - name: Wait for rollouts
         run: |
           kubectl rollout status deployment/agentify-backend  -n agentify --timeout=300s
+          kubectl rollout status deployment/agentify-security-verifier -n agentify --timeout=120s
 
           # Agent rollout: give K8s 60s to roll out normally, then repair any
           # zombie ReplicaSets from prior failed deploys.

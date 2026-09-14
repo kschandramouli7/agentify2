@@ -15,7 +15,11 @@
 #     -f infra/kubernetes/vault/vault-values.yaml
 #
 # After install the deploy pipeline calls vault-setup.sh automatically.
-# To access the UI: http://<agentify-alb>/ui/  token = "root"
+#
+# No public Ingress (ROADMAP OPS-14, 2026-09-14): a dev-mode Vault with a
+# published root token has no business on the internet-facing ALB. Reach
+# the UI via `kubectl port-forward -n vault svc/vault 8200:8200` and open
+# http://localhost:8200/ui/, token = "root".
 
 global:
   enabled: true

@@ -9,11 +9,14 @@ metadata:
   namespace: agentify
   annotations:
     kubernetes.io/ingress.class: alb
-    # IngressGroup — share this ALB with vault-ui (vault namespace, group.order: 5).
-    # The vault ingress failed previously due to invalid success-codes (501, 503 are
-    # outside ALB's 200-499 range). Fixed in vault-ingress.yaml.
+    # group.name/order kept even though nothing else shares this group today
+    # (ROADMAP OPS-14, 2026-09-14: the vault-ui Ingress that used to share
+    # this ALB — a dev-mode Vault with a published root token — was removed
+    # rather than fixed, since it had no legitimate reason to be public at
+    # all; see infra/kubernetes/vault/vault-values.yaml). Left in place only
+    # because removing it now would change the ALB's identity for no benefit.
     alb.ingress.kubernetes.io/group.name:  agentify
-    alb.ingress.kubernetes.io/group.order: "10"   # catch-all / evaluated after vault's /ui and /v1
+    alb.ingress.kubernetes.io/group.order: "10"
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/healthcheck-path: /health
