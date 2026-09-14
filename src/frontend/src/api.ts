@@ -431,6 +431,13 @@ export type ServiceDependency = {
   outcome_success_count?: number;
   outcome_failure_count?: number;
   outcome_timeout_count?: number;
+  /** ADR 0032. to_service's agentify.io/expected-failure Service annotation,
+   *  looked up server-side at read time — never stored on this row, so it's
+   *  always current with the Service's live annotation state. Non-empty
+   *  means "calls here are expected to fail by design": excludes the edge
+   *  from the unhealthy banner, but must NEVER change its rendered color or
+   *  counts — those still reflect the real evidence. */
+  expected_failure_reason?: string;
 };
 
 /** One entry point into the cluster from outside — an Ingress, Gateway
@@ -533,6 +540,87 @@ export async function listScanCoverage(namespace: string): Promise<ScanCoverage[
   const res = await fetch(`/api/scan-coverage?namespace=${encodeURIComponent(namespace)}`);
   if (!res.ok) return [];
   return (await res.json()) as ScanCoverage[];
+}
+
+/** One deployment-security check's result for one resource (ROADMAP P30
+ *  phase 1, ADR 0033). Findings are config-state, not accumulated evidence —
+ *  a namespace that passes every check pushes an empty set, which resolves
+ *  (not deletes) any prior finding that no longer reproduces, so `status`
+ *  can legitimately read "resolved" without the row disappearing.
+ *
+ *  `confidence`/`verified_by_engagement_id` are ADR 0033 Phase 2+ fields —
+ *  always "config-only"/absent in phase 1, since no active-verification
+ *  engagement exists yet to ever set them otherwise. */
+export type SecurityFinding = {
+  namespace: string;
+  check_id: string;
+  resource_kind: string;
+  resource_name: string;
+  severity: "critical" | "high" | "medium" | "low";
+  evidence: string;
+  /** ROADMAP P30 phase 2: the host an active-verification engagement would
+   *  check. Empty when check_id has no phase-2 technique mapped yet — the
+   *  panel only offers "Request verification" when this is non-empty. */
+  target_host?: string;
+  status: "open" | "acknowledged" | "resolved";
+  confidence: "config-only" | "confirmed-live" | "refuted";
+  verified_by_engagement_id?: string;
+  first_seen: string;
+  last_seen: string;
+  cluster_id?: string;
+};
+
+export async function listSecurityFindings(namespace: string): Promise<SecurityFinding[]> {
+  const res = await fetch(`/api/security-findings?namespace=${encodeURIComponent(namespace)}`);
+  if (!res.ok) return [];
+  return (await res.json()) as SecurityFinding[];
+}
+
+/** One propose->approve/reject->execute record authorizing exactly one
+ *  active-verification technique against exactly one existing
+ *  SecurityFinding (ROADMAP P30 phases 2-4, ADR 0033) — same approval-gate
+ *  shape as RemediationProposal, dispatched to the isolated
+ *  agentify-security-verifier service instead of the agent. */
+export type SecurityEngagement = {
+  id: string;
+  phase: number;
+  technique: string;
+  target_namespace: string;
+  target_check_id: string;
+  target_resource_kind: string;
+  target_resource_name: string;
+  status: "pending" | "approved" | "rejected" | "active" | "completed" | "failed" | "expired";
+  requested_by?: string;
+  approved_by?: string;
+  created_at: string;
+  expires_at: string;
+  decided_at?: string;
+  completed_at?: string;
+  result?: Record<string, unknown>;
+  error?: string;
+};
+
+export function createSecurityEngagement(finding: Pick<SecurityFinding, "namespace" | "check_id" | "resource_kind" | "resource_name">): Promise<SecurityEngagement> {
+  return postJSON<SecurityEngagement>("/admin/security-engagements", {
+    namespace: finding.namespace, check_id: finding.check_id,
+    resource_kind: finding.resource_kind, resource_name: finding.resource_name,
+  });
+}
+
+export async function listSecurityEngagements(status?: string): Promise<SecurityEngagement[]> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+  const res = await fetch(`/admin/security-engagements${qs}`);
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json() as Promise<SecurityEngagement[]>;
+}
+
+export function approveSecurityEngagement(id: string): Promise<SecurityEngagement> {
+  return postJSON<SecurityEngagement>(`/admin/security-engagements/${encodeURIComponent(id)}/approve`, {});
+}
+
+export function rejectSecurityEngagement(id: string): Promise<SecurityEngagement> {
+  return postJSON<SecurityEngagement>(`/admin/security-engagements/${encodeURIComponent(id)}/reject`, {});
 }
 
 export async function listServiceDependencies(namespace: string): Promise<ServiceDependency[]> {

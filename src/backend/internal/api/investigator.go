@@ -34,7 +34,7 @@ type reasoner interface {
 // satisfies it.
 type signalFetcher interface {
 	RouteToPods(ctx context.Context, intent, namespace, clusterID string) ([]*models.Pod, error)
-	FetchFromPod(ctx context.Context, pod *models.Pod, query map[string]interface{}) ([]map[string]interface{}, error)
+	FetchFromPod(ctx context.Context, tenantID string, pod *models.Pod, query map[string]interface{}) ([]map[string]interface{}, error)
 }
 
 // InvestigationConfig tunes the proactive loop (spec 009 / ADR 0016).
@@ -218,7 +218,12 @@ func (in *Investigator) gather(ctx context.Context) (map[string]nsAnomaly, error
 		switch {
 		case strings.HasPrefix(pod.ID, "k8fy.live-state."):
 			ns := strings.TrimPrefix(pod.ID, "k8fy.live-state.")
-			rows, err := in.queryExec.FetchFromPod(ctx, pod, nil)
+			// No inbound HTTP request to resolve a tenant from — a background
+			// sweep, not a per-request handler. DefaultTenantID matches every
+			// other unauthenticated call in this effectively-single-tenant
+			// deployment today (ROADMAP OPS-10 / ADR 0022 amendment); a real
+			// per-tenant investigation loop is a separate, larger feature.
+			rows, err := in.queryExec.FetchFromPod(ctx, pgstore.DefaultTenantID, pod, nil)
 			if err != nil {
 				in.logger.Warn("sweep fetch failed", "pod_id", pod.ID, "error", err)
 				continue
@@ -235,7 +240,12 @@ func (in *Investigator) gather(ctx context.Context) (map[string]nsAnomaly, error
 				}
 			}
 		case pod.ID == "k8fy.certificates":
-			rows, err := in.queryExec.FetchFromPod(ctx, pod, nil)
+			// No inbound HTTP request to resolve a tenant from — a background
+			// sweep, not a per-request handler. DefaultTenantID matches every
+			// other unauthenticated call in this effectively-single-tenant
+			// deployment today (ROADMAP OPS-10 / ADR 0022 amendment); a real
+			// per-tenant investigation loop is a separate, larger feature.
+			rows, err := in.queryExec.FetchFromPod(ctx, pgstore.DefaultTenantID, pod, nil)
 			if err != nil {
 				in.logger.Warn("sweep fetch failed", "pod_id", pod.ID, "error", err)
 				continue
@@ -267,7 +277,8 @@ func (in *Investigator) investigateAndNotify(ctx context.Context, ns string, an 
 	}
 	data := map[string]interface{}{}
 	for _, pod := range pods {
-		rows, err := in.queryExec.FetchFromPod(ctx, pod, nil)
+		// Background sweep, no inbound request — see gather()'s comment above.
+		rows, err := in.queryExec.FetchFromPod(ctx, pgstore.DefaultTenantID, pod, nil)
 		if err != nil {
 			continue
 		}

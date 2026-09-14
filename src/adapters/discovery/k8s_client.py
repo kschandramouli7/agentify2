@@ -14,6 +14,7 @@ with.
 import base64
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import quote
@@ -142,6 +143,12 @@ async def list_services(namespace: str) -> List[Dict[str, Any]]:
                 }
                 for pt in (spec.get("ports") or [])
             ],
+            # ADR 0032: an operator-set annotation meaning "calls to this
+            # service are expected to fail/be unreachable by design" — read
+            # from the same response, nothing new fetched. Empty when absent.
+            "expected_failure_reason": (item.get("metadata", {}).get("annotations") or {}).get(
+                "agentify.io/expected-failure", ""
+            ),
         })
     return services
 
@@ -186,6 +193,62 @@ async def list_pod_health(namespace: str) -> Dict[str, int]:
         if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
             ready += 1
     return {"total": total, "ready": ready}
+
+
+async def list_pod_security_contexts(namespace: str) -> List[Dict[str, Any]]:
+    """List each pod's effective container-level security settings in
+    `namespace` (ROADMAP P30 phase 1) as one entry per pod:
+    `{"name": ..., "containers": [{"name", "run_as_non_root",
+    "read_only_root_filesystem", "allow_privilege_escalation",
+    "drops_capabilities"}, ...]}`. Booleans are `None` when unset — a
+    genuinely different finding from "explicitly False" for
+    `build_pod_security_context_findings` to distinguish. `run_as_non_root`
+    falls back to the pod-level `securityContext` here (the one field of the
+    four with a real pod-level equivalent in the K8s API — the other three
+    only exist in the container-level `SecurityContext`); everything else is
+    container-only, no pod-level merge to do. Separate call from list_pods
+    (same endpoint, different extraction), same convention list_pod_health
+    already established right next to it for the identical reason."""
+    resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods")
+    if resp.status_code != 200:
+        logger.warning("list pod security contexts failed for namespace=%s (%s): %s", namespace, resp.status_code, resp.text[:200])
+        return []
+    items = resp.json().get("items", [])
+    result = []
+    for item in items:
+        name = item.get("metadata", {}).get("name", "")
+        if not name:
+            continue
+        spec = item.get("spec", {}) or {}
+        pod_sc = spec.get("securityContext") or {}
+        containers = []
+        for c in spec.get("containers", []) or []:
+            csc = c.get("securityContext") or {}
+            containers.append({
+                "name": c.get("name", ""),
+                "run_as_non_root": csc.get("runAsNonRoot", pod_sc.get("runAsNonRoot")),
+                "read_only_root_filesystem": csc.get("readOnlyRootFilesystem"),
+                "allow_privilege_escalation": csc.get("allowPrivilegeEscalation"),
+                "drops_capabilities": bool((csc.get("capabilities") or {}).get("drop")),
+            })
+        result.append({"name": name, "containers": containers})
+    return result
+
+
+async def list_network_policy_count(namespace: str) -> int:
+    """Count NetworkPolicy objects in `namespace` (ROADMAP P30 phase 1). A
+    count, not the full objects — Phase 1's one NetworkPolicy check only
+    needs "does this namespace have at least one," same "don't fetch more
+    than today's check needs" discipline as list_pod_health's aggregate-only
+    shape. Requires the networkpolicies list/get grant added to
+    agentify-discovery's ClusterRole alongside this function — the one new
+    RBAC grant this phase needs (pod security context and Ingress TLS both
+    reuse access already held)."""
+    resp = await _k8s_get(f"/apis/networking.k8s.io/v1/namespaces/{quote(namespace)}/networkpolicies")
+    if resp.status_code != 200:
+        logger.warning("list network policies failed for namespace=%s (%s): %s", namespace, resp.status_code, resp.text[:200])
+        return 0
+    return len(resp.json().get("items", []))
 
 
 async def list_tls_secrets(namespace: str) -> List[Dict[str, str]]:
@@ -321,11 +384,34 @@ async def list_daemonsets(namespace: str) -> List[str]:
     return await _list_apps_v1_names(namespace, "daemonsets")
 
 
-async def get_pod_logs(namespace: str, pod: str, tail_lines: int = 200) -> str:
+# The K8s API's own 400 body for an ambiguous multi-container pod names the
+# valid choices, e.g. "a container name must be specified for pod payment-api-x,
+# choose one of: [app istio-proxy]" — parsing this costs nothing extra (no
+# second round-trip to discover containers) and needs no RBAC beyond what
+# get_pod_logs already has.
+_CHOOSE_ONE_OF_RE = re.compile(r"choose one of:\s*\[([^\]]*)\]")
+
+
+async def get_pod_logs(namespace: str, pod: str, tail_lines: int = 200, container: Optional[str] = None) -> str:
     """Fetch a bounded, unredacted tail of a pod's current logs. Callers
-    must redact before this text leaves the cluster (see log_redaction.py)."""
+    must redact before this text leaves the cluster (see log_redaction.py).
+
+    `container` is optional; when omitted and the pod turns out to have more
+    than one container, this retries once with the first container K8s itself
+    names in its 400 response (ROADMAP OPS-9) rather than giving up — before
+    this fix, every multi-container pod silently returned "" here, which in a
+    service-mesh cluster (a sidecar in every pod) meant this collector never
+    read a single log line from anywhere."""
     params = {"tailLines": str(max(1, min(tail_lines, 1000)))}
+    if container:
+        params["container"] = container
     resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}/log", params)
+    if resp.status_code == 400 and not container:
+        m = _CHOOSE_ONE_OF_RE.search(resp.text)
+        names = m.group(1).split() if m else []
+        if names:
+            params["container"] = names[0]
+            resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}/log", params)
     if resp.status_code != 200:
         logger.warning("get pod logs failed for %s/%s (%s): %s", namespace, pod, resp.status_code, resp.text[:200])
         return ""
@@ -343,10 +429,14 @@ async def get_pod_logs(namespace: str, pod: str, tail_lines: int = 200) -> str:
 
 async def list_ingresses(namespace: str) -> List[Dict[str, Any]]:
     """List Ingresses in `namespace` as
-    `{"name", "hosts": [...], "backend_services": [...]}` — one flattened
-    entry per Ingress object, not per host/backend pair (ingress.py does
-    that flattening); `hosts`/`backend_services` are deduplicated, order-
-    preserving lists gathered across every rule."""
+    `{"name", "hosts": [...], "backend_services": [...], "has_tls": bool}` —
+    one flattened entry per Ingress object, not per host/backend pair
+    (ingress.py does that flattening); `hosts`/`backend_services` are
+    deduplicated, order-preserving lists gathered across every rule.
+    `has_tls` (ROADMAP P30 phase 1) is a new field on the existing shape
+    rather than a separate call — same object already fetched, no new RBAC,
+    and an extra dict key doesn't break `ingress.py`'s existing consumers,
+    which only read the two keys above."""
     resp = await _k8s_get(f"/apis/networking.k8s.io/v1/namespaces/{quote(namespace)}/ingresses")
     if resp.status_code != 200:
         logger.warning("list ingresses failed for namespace=%s (%s): %s", namespace, resp.status_code, resp.text[:200])
@@ -371,7 +461,10 @@ async def list_ingresses(namespace: str) -> List[Dict[str, Any]]:
         default_svc = spec.get("defaultBackend", {}).get("service", {}).get("name", "")
         if default_svc and default_svc not in backends:
             backends.append(default_svc)
-        result.append({"name": name, "hosts": hosts, "backend_services": backends})
+        result.append({
+            "name": name, "hosts": hosts, "backend_services": backends,
+            "has_tls": bool(spec.get("tls")),
+        })
     return result
 
 

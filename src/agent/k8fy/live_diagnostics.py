@@ -25,6 +25,7 @@ Role "agent-live-diagnostics" — get/list pods, get pods/log, get/list events.
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -95,6 +96,13 @@ async def live_list_pods(namespace: str) -> Dict[str, Any]:
     return {"namespace": namespace, "pods": pods}
 
 
+# Same K8s-400-names-the-choices trick as discovery/k8s_client.get_pod_logs
+# (ROADMAP OPS-9) — Claude could recover from an ambiguous-container error by
+# calling live_describe_pod first and retrying with a container set, but
+# resolving it here means a first try succeeds without that extra round trip.
+_CHOOSE_ONE_OF_RE = re.compile(r"choose one of:\s*\[([^\]]*)\]")
+
+
 async def live_get_pod_logs(
     namespace: str,
     pod: str,
@@ -115,6 +123,16 @@ async def live_get_pod_logs(
         resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}/log", params)
     except RuntimeError as e:
         return {"error": str(e)}
+    if resp.status_code == 400 and not container:
+        m = _CHOOSE_ONE_OF_RE.search(resp.text)
+        names = m.group(1).split() if m else []
+        if names:
+            container = names[0]
+            params["container"] = container
+            try:
+                resp = await _k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}/log", params)
+            except RuntimeError as e:
+                return {"error": str(e)}
     if resp.status_code != 200:
         return {"error": f"log fetch failed ({resp.status_code}): {resp.text[:300]}"}
 

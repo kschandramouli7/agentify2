@@ -1,0 +1,103 @@
+# TEMPLATE — DO NOT `kubectl apply -f` THIS FILE DIRECTLY.
+# The image tag/registry (ACCOUNT_ID.dkr.ecr...) below is a placeholder that
+# 02-deploy.yml sed's into a real value on every deploy — the checked-in copy
+# always keeps it literally. Applying this file as-is pushes that literal
+# placeholder into the live Deployment spec, rolling the running container
+# image back to an unpullable string (caught live 2026-09-13, ROADMAP OPS-2,
+# on a sibling manifest with the same pattern). For a one-off live change,
+# patch the specific field — `kubectl set env` / `kubectl patch` (see
+# scripts/safe-kubectl-apply.sh, which refuses to apply any file still
+# containing this placeholder). To actually deploy a manifest change, push
+# it through 02-deploy.yml.
+#
+# agentify-security-verifier (ROADMAP P30 phases 2-4, ADR 0033) — the
+# network-isolated executor for approved active-verification engagements.
+# The FIRST such isolated service in this repo (ROADMAP P14a's remediation
+# executor was agreed but never actually split out of agentify-agent — see
+# ADR 0033's Phase 2 amendment). Deliberately minimal: no ServiceAccount
+# RBAC at all — Phase 2's one technique (a plaintext outbound HTTP GET)
+# needs no K8s API access, so nothing is granted. A ClusterRole gets added
+# only when a future technique actually needs one, never speculatively.
+# Reachable only in-cluster (ClusterIP, no Ingress) — the Go backend is the
+# only caller, and agentify-agent has no network path here at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentify-security-verifier
+  namespace: agentify
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentify-security-verifier
+  template:
+    metadata:
+      labels:
+        app: agentify-security-verifier
+      annotations: {}
+    spec:
+      serviceAccountName: agentify-security-verifier
+      containers:
+      - name: security-verifier
+        image: ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/agentify/security-verifier:latest
+        ports:
+        - name: http
+          containerPort: 8400
+          protocol: TCP
+        env:
+        - name: PORT
+          value: "8400"
+        # Shared secret with the backend's SECURITY_VERIFIER_TOKEN — defense
+        # in depth on top of network isolation (ClusterIP, no Ingress), not
+        # the primary boundary. optional:true so an absent secret fails
+        # closed (every /verify call 401s) rather than crashing the pod,
+        # same pattern REMEDIATION_AUTH_TOKEN/EVAL_AUTH_TOKEN already use.
+        - name: SECURITY_VERIFIER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: agentify-security-verifier-secret
+              key: token
+              optional: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8400
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8400
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "25m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentify-security-verifier
+  namespace: agentify
+# No RBAC rules bound to this ServiceAccount — see the Deployment comment
+# above. It exists only because a Pod must specify some ServiceAccount;
+# this one has been granted nothing.
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentify-security-verifier
+  namespace: agentify
+spec:
+  selector:
+    app: agentify-security-verifier
+  ports:
+  - port: 8400
+    targetPort: 8400
+  type: ClusterIP

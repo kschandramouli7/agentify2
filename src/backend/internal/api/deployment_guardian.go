@@ -115,7 +115,10 @@ func (dg *DeploymentGuardian) fetchDeployEvents(ctx context.Context) ([]deployEv
 
 	var out []deployEvent
 	for _, pod := range pods {
-		rows, err := dg.queryExec.FetchFromPod(ctx, pod, map[string]interface{}{
+		// Background sweep, no inbound request to resolve a tenant from;
+		// also the events (relational) backend, which doesn't enforce
+		// tenantID yet anyway (ROADMAP OPS-10 / ADR 0022 amendment).
+		rows, err := dg.queryExec.FetchFromPod(ctx, pgstore.DefaultTenantID, pod, map[string]interface{}{
 			"since": cutoff, "order": "desc", "limit": 200,
 		})
 		if err != nil {
@@ -219,7 +222,7 @@ func (dg *DeploymentGuardian) metricsSnapshot(ctx context.Context, namespace, de
 		query["until"] = until
 	}
 	for _, pod := range pods {
-		rows, err := dg.queryExec.FetchFromPod(ctx, pod, query)
+		rows, err := dg.queryExec.FetchFromPod(ctx, pgstore.DefaultTenantID, pod, query)
 		if err != nil || len(rows) == 0 {
 			continue
 		}

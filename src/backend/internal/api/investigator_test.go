@@ -73,7 +73,7 @@ type stubFetcher struct{}
 func (stubFetcher) RouteToPods(ctx context.Context, intent, ns, clusterID string) ([]*models.Pod, error) {
 	return []*models.Pod{{ID: "k8fy.live-state." + ns, Kind: "leaf"}}, nil
 }
-func (stubFetcher) FetchFromPod(ctx context.Context, pod *models.Pod, q map[string]interface{}) ([]map[string]interface{}, error) {
+func (stubFetcher) FetchFromPod(ctx context.Context, tenantID string, pod *models.Pod, q map[string]interface{}) ([]map[string]interface{}, error) {
 	return []map[string]interface{}{{
 		"event_namespace": "k8fy.live-state",
 		"type":            "pod_modified",

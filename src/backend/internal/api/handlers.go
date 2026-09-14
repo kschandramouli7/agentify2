@@ -44,6 +44,10 @@ type Handler struct {
 	clusterServiceStore      ClusterServiceStore    // service->cluster registry (ROADMAP P16 / ADR 0023); nil when postgres is not provisioned
 	clusterIngressStore      ClusterIngressStore    // entry-point-mapping registry (ROADMAP P18 use case #3); nil when postgres is not provisioned
 	clusterHealthStore       ClusterHealthStore     // fleet-wide health/version snapshot (ROADMAP P18 use case #5); nil when postgres is not provisioned
+	securityFindingsStore    SecurityFindingsStore  // deployment security posture (ROADMAP P30 phase 1); nil when postgres is not provisioned
+	securityEngagementStore  SecurityEngagementStore // active-verification approval gate (ROADMAP P30 phases 2-4); nil when postgres is not provisioned
+	securityEngagementConfig SecurityEngagementConfig
+	securityVerifier         *SecurityVerifierClient // nil when SECURITY_VERIFIER_URL is unset — dispatch fails closed to "failed", never silently skipped
 	secretsManager           secrets.Manager        // Integration.Token storage (ADR 0025); nil = plaintext mode (today's default)
 	integrationSecretsPrefix string                 // secret-name prefix; only meaningful when secretsManager != nil
 	logger                   *slog.Logger
@@ -57,7 +61,7 @@ func (h *Handler) integrationSecretName(id string) string {
 }
 
 // NewHandler creates a new handler.
-func NewHandler(orch *orchestrator.Router, agentServiceURL string, redactor *governance.Redactor, integrations IntegrationStore, traces TraceStore, pricing PricingStore, chat ChatStore, remediation RemediationStore, remediationCfg RemediationConfig, serviceDeps ServiceDependencyStore, clusterServices ClusterServiceStore, clusterIngress ClusterIngressStore, clusterHealth ClusterHealthStore, secretsManager secrets.Manager, integrationSecretsPrefix string, logger *slog.Logger) *Handler {
+func NewHandler(orch *orchestrator.Router, agentServiceURL string, redactor *governance.Redactor, integrations IntegrationStore, traces TraceStore, pricing PricingStore, chat ChatStore, remediation RemediationStore, remediationCfg RemediationConfig, serviceDeps ServiceDependencyStore, clusterServices ClusterServiceStore, clusterIngress ClusterIngressStore, clusterHealth ClusterHealthStore, securityFindings SecurityFindingsStore, securityEngagements SecurityEngagementStore, securityEngagementCfg SecurityEngagementConfig, securityVerifier *SecurityVerifierClient, secretsManager secrets.Manager, integrationSecretsPrefix string, logger *slog.Logger) *Handler {
 	ingester := ingestion.NewIngester(orch.GetPodRegistry(), orch.GetBackendFactory(), logger)
 	queryExec := orchestrator.NewQueryExecutor(orch.GetPodRegistry(), orch.GetBackendFactory(), logger)
 
@@ -78,6 +82,10 @@ func NewHandler(orch *orchestrator.Router, agentServiceURL string, redactor *gov
 		clusterServiceStore:      clusterServices,
 		clusterIngressStore:      clusterIngress,
 		clusterHealthStore:       clusterHealth,
+		securityFindingsStore:    securityFindings,
+		securityEngagementStore:  securityEngagements,
+		securityEngagementConfig: securityEngagementCfg,
+		securityVerifier:         securityVerifier,
 		secretsManager:           secretsManager,
 		integrationSecretsPrefix: integrationSecretsPrefix,
 		logger:                   logger,
@@ -212,6 +220,22 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ROADMAP OPS-10 / ADR 0022 amendment (2026-09-13): resolved so the kv
+	// (current_state) backend can set its RLS session variable — this used
+	// to be entirely unresolved here (no Authorization header required, same
+	// as before; only a garbage bearer token is now rejected, matching every
+	// other resolveTenantContext-using handler).
+	tenantID, _, terr := h.resolveTenantContext(r)
+	if errors.Is(terr, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if terr != nil {
+		h.logger.Warn("tenant resolution failed", "error", terr)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	// Route to pods and fetch data. Not cluster-scoped: this is the initial
 	// /api/query routing (ADR 0024 scopes the agent's per-tool
 	// /api/agent/fetch path, not this one — see HandleAgentFetch).
@@ -249,7 +273,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	// Fetch from pods
 	podData := make(map[string]interface{})
 	for _, pod := range pods {
-		data, err := h.queryExec.FetchFromPod(r.Context(), pod, podQuery)
+		data, err := h.queryExec.FetchFromPod(r.Context(), tenantID, pod, podQuery)
 		if err != nil {
 			h.logger.Warn("failed to fetch from pod", "pod_id", pod.ID, "error", err)
 			continue
@@ -377,6 +401,13 @@ func (h *Handler) HandleAgentFetch(w http.ResponseWriter, r *http.Request) {
 	// before this ADR.
 	clusterID := stringArg(req.Args, "cluster_id")
 
+	// ROADMAP OPS-10 / ADR 0022 amendment (2026-09-13): the agent presents no
+	// bearer credential (see above), so this resolves to DefaultTenantID —
+	// same as today's implicit behavior — while letting the kv (current_state)
+	// backend set its RLS session variable. No error path needed: an absent
+	// credential is the expected, always-valid case for this endpoint.
+	tenantID, _, _ := h.resolveTenantContext(r)
+
 	pods, err := h.queryExec.RouteToPods(r.Context(), intent, namespace, clusterID)
 	if err != nil {
 		h.logger.Warn("agent fetch routing failed", "tool", req.Tool, "error", err)
@@ -410,7 +441,7 @@ func (h *Handler) HandleAgentFetch(w http.ResponseWriter, r *http.Request) {
 
 	data := make(map[string]interface{})
 	for _, pod := range pods {
-		rows, err := h.queryExec.FetchFromPod(r.Context(), pod, query)
+		rows, err := h.queryExec.FetchFromPod(r.Context(), tenantID, pod, query)
 		if err != nil {
 			h.logger.Warn("agent fetch from pod failed", "pod_id", pod.ID, "error", err)
 			continue
@@ -992,6 +1023,14 @@ func (h *Handler) embedAndStoreIncident(rowID, traceID, namespace, service strin
 	if summary == "" {
 		return
 	}
+	// ROADMAP OPS-13 (2026-09-14): this summary is built from the model's own
+	// prose and persisted permanently in incident_embeddings — the identical
+	// shape investigator.go's Alert.Summary/Cause already redact before their
+	// own egress (RedactText, "defense-in-depth on prose egress"). This path
+	// posted it to /embed and stored it unredacted, violating
+	// policies/data-governance.md's "never persist unredacted log-derived
+	// content" rule.
+	summary = h.redactor.RedactText(summary)
 
 	// service comes from the request context, not from the sources list.
 	//
@@ -1332,7 +1371,7 @@ func (h *Handler) HandleSyncNamespaces(w http.ResponseWriter, r *http.Request) {
 
 // trackedEntitiesProvider is satisfied by *postgres.CurrentState.
 type trackedEntitiesProvider interface {
-	TrackedEntities(ctx context.Context) ([]string, error)
+	TrackedEntities(ctx context.Context, tenantID string) ([]string, error)
 }
 
 // syncSeeder is satisfied by *postgres.CurrentState — it lets HandleSyncNamespaces
@@ -1357,6 +1396,21 @@ func (h *Handler) HandleTrackedEntities(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// ROADMAP OPS-10 / ADR 0022 amendment (2026-09-13): this handler had NO
+	// tenant resolution at all before — not even the DefaultTenantID literal
+	// the fallback branch below used to hardcode. Resolved the same way every
+	// other read-only admin handler does; no Authorization header required.
+	tenantID, _, terr := h.resolveTenantContext(r)
+	if errors.Is(terr, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if terr != nil {
+		h.logger.Warn("tenant resolution failed", "error", terr)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
 	// The kv backend wraps *postgres.CurrentState which implements TrackedEntities.
 	kv, err := h.orch.GetBackendFactory().GetBackend("kv")
 	if err != nil {
@@ -1369,7 +1423,7 @@ func (h *Handler) HandleTrackedEntities(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	entities, err := provider.TrackedEntities(r.Context())
+	entities, err := provider.TrackedEntities(r.Context(), tenantID)
 	if err != nil {
 		h.logger.Warn("failed to list tracked entities", "error", err)
 		writeJSON(w, http.StatusOK, []string{})
@@ -1380,10 +1434,10 @@ func (h *Handler) HandleTrackedEntities(w http.ResponseWriter, r *http.Request) 
 	// Discovery's own push schedule) so the first request after a scale-up
 	// returns real data without the user having to wait.
 	if len(entities) == 0 && h.clusterServiceStore != nil {
-		byNamespace, cerr := h.clusterServiceStore.ListClusterServices(r.Context(), pgstore.DefaultTenantID)
+		byNamespace, cerr := h.clusterServiceStore.ListClusterServices(r.Context(), tenantID)
 		if cerr == nil && len(byNamespace) > 0 {
 			h.seedNamespaceCache(r.Context(), byNamespace)
-			entities, _ = provider.TrackedEntities(r.Context())
+			entities, _ = provider.TrackedEntities(r.Context(), tenantID)
 			h.logger.Info("tracked entities: live-seeded from cluster_services", "count", len(entities))
 		}
 	}
@@ -2055,6 +2109,117 @@ func (h *Handler) HandleScanCoverageList(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, cov)
 }
 
+// securityFindingUpsertEntry is one check's result for one resource, as
+// pushed by Discovery's scan cycle.
+type securityFindingUpsertEntry struct {
+	CheckID      string `json:"check_id"`
+	ResourceKind string `json:"resource_kind"`
+	ResourceName string `json:"resource_name"`
+	Severity     string `json:"severity"`
+	Evidence     string `json:"evidence"`
+}
+
+// securityFindingsUpsertRequest is one scan cycle's complete finding set for
+// one namespace (ROADMAP P30 phase 1). Batched per namespace, same rationale
+// as scanCoverageUpsertRequest: a scan produces one report per namespace, not
+// one per finding. cluster_id is honored only as a fallback, exactly as
+// scanCoverageUpsertRequest's is.
+type securityFindingsUpsertRequest struct {
+	Namespace string                       `json:"namespace"`
+	ClusterID string                       `json:"cluster_id,omitempty"`
+	Findings  []securityFindingUpsertEntry `json:"findings"`
+}
+
+// HandleSecurityFindingsUpsert records this scan cycle's complete
+// deployment-security finding set for a namespace (ROADMAP P30 phase 1,
+// ADR 0033). The empty-Findings case is meaningful, not a no-op: it means
+// this namespace passed every check this cycle, so UpsertSecurityFindings
+// must still run to resolve any findings from a previous cycle that no
+// longer reproduce.
+func (h *Handler) HandleSecurityFindingsUpsert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.securityFindingsStore == nil {
+		http.Error(w, "security findings store not available", http.StatusServiceUnavailable)
+		return
+	}
+	tenantID, clusterID, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	var req securityFindingsUpsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if clusterID == "" && req.ClusterID != "" {
+		clusterID = req.ClusterID
+	}
+
+	findings := make([]pgstore.SecurityFinding, 0, len(req.Findings))
+	for _, f := range req.Findings {
+		if f.CheckID == "" || f.ResourceKind == "" || f.ResourceName == "" {
+			continue
+		}
+		findings = append(findings, pgstore.SecurityFinding{
+			CheckID: f.CheckID, ResourceKind: f.ResourceKind, ResourceName: f.ResourceName,
+			Severity: f.Severity, Evidence: f.Evidence,
+		})
+	}
+	if err := h.securityFindingsStore.UpsertSecurityFindings(r.Context(), tenantID, clusterID, req.Namespace, findings); err != nil {
+		h.logger.Warn("failed to upsert security findings", "namespace", req.Namespace, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"written": len(findings)})
+}
+
+// HandleSecurityFindingsList returns every deployment-security finding for
+// one namespace (ROADMAP P30 phase 1).
+func (h *Handler) HandleSecurityFindingsList(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if h.securityFindingsStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.SecurityFinding{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	findings, err := h.securityFindingsStore.ListSecurityFindings(r.Context(), tenantID, namespace)
+	if err != nil {
+		h.logger.Warn("failed to list security findings", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.SecurityFinding{})
+		return
+	}
+	if findings == nil {
+		findings = []pgstore.SecurityFinding{}
+	}
+	writeJSON(w, http.StatusOK, findings)
+}
+
 func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2129,6 +2294,10 @@ type serviceInventoryEntry struct {
 	ReplicasReady   *int               `json:"replicas_ready,omitempty"`
 	Image           string             `json:"image,omitempty"`
 	Schedule        string             `json:"schedule,omitempty"` // CronJob only
+
+	// ADR 0032: this Service's agentify.io/expected-failure annotation value,
+	// if Discovery's live K8s read found one. Empty means no annotation.
+	ExpectedFailureReason string `json:"expected_failure_reason,omitempty"`
 }
 
 type servicePortEntry struct {
@@ -2215,6 +2384,7 @@ func (h *Handler) HandleClusterInventoryUpsert(w http.ResponseWriter, r *http.Re
 				ServiceType: svc.ServiceType, Ports: ports, WorkloadKind: svc.WorkloadKind,
 				ReplicasDesired: svc.ReplicasDesired, ReplicasReady: svc.ReplicasReady,
 				Image: svc.Image, Schedule: svc.Schedule,
+				ExpectedFailureReason: svc.ExpectedFailureReason,
 			})
 		}
 		byNamespace[ns.Name] = entries

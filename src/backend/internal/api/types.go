@@ -187,6 +187,33 @@ type ClusterHealthStore interface {
 	ListServiceHealth(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceHealth, error)
 }
 
+// SecurityFindingsStore is the deployment-security-posture registry (ROADMAP
+// P30 phase 1, ADR 0033) — its own interface rather than riding
+// ServiceDependencyStore the way scan_coverage does, since findings have no
+// interpretive coupling to dependency-edge evidence the way a denominator
+// does; this is a genuinely separate domain, same reasoning ClusterHealthStore/
+// ClusterServiceStore/ClusterIngressStore already each got their own.
+type SecurityFindingsStore interface {
+	UpsertSecurityFindings(ctx context.Context, tenantID, clusterID, namespace string, findings []pgstore.SecurityFinding) error
+	ListSecurityFindings(ctx context.Context, tenantID, namespace string) ([]pgstore.SecurityFinding, error)
+	// GetSecurityFinding is a point lookup by natural key (ROADMAP P30 phase
+	// 2) — validates a finding exists, and reads its target_host, before an
+	// engagement is created against it.
+	GetSecurityFinding(ctx context.Context, tenantID, namespace, checkID, resourceKind, resourceName string) (*pgstore.SecurityFinding, error)
+}
+
+// SecurityEngagementStore is the active-verification approval-gate registry
+// (ROADMAP P30 phases 2-4, ADR 0033) — modeled on RemediationStore, with
+// every method tenant-scoped (RLS-backed from this table's first migration,
+// unlike remediation_proposals) rather than global by ID.
+type SecurityEngagementStore interface {
+	CreateSecurityEngagement(ctx context.Context, e *pgstore.SecurityEngagement) error
+	GetSecurityEngagement(ctx context.Context, tenantID, id string) (*pgstore.SecurityEngagement, error)
+	ListSecurityEngagements(ctx context.Context, tenantID, status string, limit int) ([]pgstore.SecurityEngagement, error)
+	DecideSecurityEngagement(ctx context.Context, tenantID, id, status, approvedBy string) (bool, error)
+	CompleteSecurityEngagement(ctx context.Context, tenantID, id, status string, result map[string]interface{}, errMsg string, confirmed *bool) error
+}
+
 // IntegrationStore is the integration CRUD interface implemented by the Postgres
 // client. Using an interface keeps the handler decoupled from the storage package
 // and makes the nil-safe "not configured" path cheap.

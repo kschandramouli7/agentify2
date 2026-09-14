@@ -70,6 +70,30 @@ async def test_live_get_pod_logs_redacts(sa_token, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_get_pod_logs_retries_with_first_container_on_ambiguous_400(sa_token, monkeypatch):
+    """ROADMAP OPS-9 — same fix as k8s_client.get_pod_logs, so an LLM-driven
+    diagnose turn succeeds on its first try against a multi-container pod
+    instead of needing to call live_describe_pod first to discover a
+    container name and retry."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "container=" not in str(request.url):
+            return httpx.Response(400, text="a container name must be specified, choose one of: [app istio-proxy]")
+        assert "container=app" in str(request.url)
+        return httpx.Response(200, text="app container logs")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await live_tools.live_get_pod_logs("payments", "payment-api-x")
+
+    assert result["logs"] == "app container logs"
+    assert result["container"] == "app"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_live_get_events_sorts_and_caps(sa_token, monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"items": [

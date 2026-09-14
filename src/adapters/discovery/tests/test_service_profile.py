@@ -105,6 +105,35 @@ async def test_headless_is_reported_as_its_own_exposure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_expected_failure_reason_is_carried_through_when_present(monkeypatch):
+    """ADR 0032: k8s_client.list_services() already reads the
+    agentify.io/expected-failure annotation into each service dict;
+    _service_profiles must not drop it on the way to the pushed profile."""
+    out = await _profiles(
+        monkeypatch,
+        [{"name": "legacy-stub", "selector": {"app": "legacy-stub"},
+          "expected_failure_reason": "legacy stub, decommission ticket JIRA-123"}],
+        [{"kind": "Deployment", "name": "legacy-stub", "template_labels": {"app": "legacy-stub"},
+          "replicas_desired": 1, "replicas_ready": 1, "images": ["x"]}],
+    )
+    assert out["legacy-stub"]["expected_failure_reason"] == "legacy stub, decommission ticket JIRA-123"
+
+
+@pytest.mark.asyncio
+async def test_expected_failure_reason_defaults_to_empty_string_not_missing(monkeypatch):
+    """A service with no annotation must still carry the key (empty), not
+    omit it — the Hub's JSON field is omitempty, but a KeyError here would
+    break every other profile's construction too."""
+    out = await _profiles(
+        monkeypatch,
+        [{"name": "normal-svc", "selector": {"app": "normal-svc"}}],
+        [{"kind": "Deployment", "name": "normal-svc", "template_labels": {"app": "normal-svc"},
+          "replicas_desired": 1, "replicas_ready": 1, "images": ["x"]}],
+    )
+    assert out["normal-svc"]["expected_failure_reason"] == ""
+
+
+@pytest.mark.asyncio
 async def test_cronjob_carries_its_schedule(monkeypatch):
     out = await _profiles(
         monkeypatch,

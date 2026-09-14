@@ -100,6 +100,8 @@ func main() {
 	var clusterServiceStore api.ClusterServiceStore
 	var clusterIngressStore api.ClusterIngressStore
 	var clusterHealthStore api.ClusterHealthStore
+	var securityFindingsStore api.SecurityFindingsStore
+	var securityEngagementStore api.SecurityEngagementStore
 	if relational, err := orch.GetBackendFactory().GetBackend("relational"); err == nil {
 		if store, ok := relational.(api.IntegrationStore); ok {
 			integrationStore = store
@@ -128,6 +130,12 @@ func main() {
 		if store, ok := relational.(api.ClusterHealthStore); ok {
 			clusterHealthStore = store
 		}
+		if store, ok := relational.(api.SecurityFindingsStore); ok {
+			securityFindingsStore = store
+		}
+		if store, ok := relational.(api.SecurityEngagementStore); ok {
+			securityEngagementStore = store
+		}
 	}
 
 	// Phase-3 remediation config (ADR 0020 / spec 011 Use Cases 1+2). Every
@@ -154,9 +162,36 @@ func main() {
 			"AUTONOMOUS_REMEDIATION_ENABLED/DEPLOY_GUARDIAN_ENABLED", "env", cfg.Env)
 	}
 
+	// Active-verification engagement config (ROADMAP P30 phases 2-4, ADR
+	// 0033) — same fail-closed-outside-dev posture as remediation above,
+	// applied from day one rather than needing an amendment later.
+	securityEngagementCfg := api.SecurityEngagementConfig{
+		ProposalTTL: time.Duration(cfg.SecurityEngagementProposalTTLMinutes) * time.Minute,
+		AuthToken:   cfg.SecurityEngagementAuthToken,
+		Env:         cfg.Env,
+	}
+	switch securityEngagementEnv := strings.ToLower(strings.TrimSpace(cfg.Env)); {
+	case cfg.SecurityEngagementAuthToken != "":
+		// configured; nothing to say
+	case securityEngagementEnv == "dev" || securityEngagementEnv == "":
+		logger.Warn("SECURITY_ENGAGEMENT_AUTH_TOKEN not set — approve/reject is OPEN. " +
+			"Allowed because ENV is dev; anyone who can reach the backend can " +
+			"approve an active-verification engagement")
+	default:
+		logger.Error("SECURITY_ENGAGEMENT_AUTH_TOKEN not set — approve/reject is DISABLED " +
+			"because ENV is not dev. Set SECURITY_ENGAGEMENT_AUTH_TOKEN before requesting engagements", "env", cfg.Env)
+	}
+	// nil when SECURITY_VERIFIER_URL is unset — dispatchSecurityEngagement
+	// fails an approved engagement closed to "failed" rather than silently
+	// skipping it (see security_engagements.go).
+	var securityVerifier *api.SecurityVerifierClient
+	if cfg.SecurityVerifierURL != "" {
+		securityVerifier = api.NewSecurityVerifierClient(cfg.SecurityVerifierURL, cfg.SecurityVerifierToken)
+	}
+
 	// Build the API handler once; the router and the proactive investigation loop
 	// (ADR 0016) share it.
-	handler := api.NewHandler(orch, cfg.AgentServiceURL, redactor, integrationStore, traceStore, pricingStore, chatStore, remediationStore, remediationCfg, serviceDepsStore, clusterServiceStore, clusterIngressStore, clusterHealthStore, secretsMgr, cfg.IntegrationSecretsPrefix, logger)
+	handler := api.NewHandler(orch, cfg.AgentServiceURL, redactor, integrationStore, traceStore, pricingStore, chatStore, remediationStore, remediationCfg, serviceDepsStore, clusterServiceStore, clusterIngressStore, clusterHealthStore, securityFindingsStore, securityEngagementStore, securityEngagementCfg, securityVerifier, secretsMgr, cfg.IntegrationSecretsPrefix, logger)
 	// Version-pinned evaluation endpoint (ADR 0030). Set after construction
 	// because NewHandler already takes sixteen parameters.
 	handler.SetEvalAuthToken(cfg.EvalAuthToken, cfg.Env)

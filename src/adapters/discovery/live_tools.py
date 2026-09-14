@@ -18,6 +18,7 @@ cluster rather than the agent's own.
 import base64
 import binascii
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -75,6 +76,13 @@ async def live_list_pods(namespace: str) -> Dict[str, Any]:
     return {"namespace": namespace, "pods": pods}
 
 
+# Same K8s-400-names-the-choices trick as k8s_client.get_pod_logs (ROADMAP
+# OPS-9) — an LLM caller can recover from an ambiguous-container error by
+# calling live_describe_pod first and retrying with a container set, but
+# resolving it here means a first try succeeds without that extra round trip.
+_CHOOSE_ONE_OF_RE = re.compile(r"choose one of:\s*\[([^\]]*)\]")
+
+
 async def live_get_pod_logs(
     namespace: str,
     pod: str,
@@ -92,6 +100,13 @@ async def live_get_pod_logs(
         params["previous"] = "true"
 
     resp = await k8s_client._k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}/log", params)
+    if resp.status_code == 400 and not container:
+        m = _CHOOSE_ONE_OF_RE.search(resp.text)
+        names = m.group(1).split() if m else []
+        if names:
+            container = names[0]
+            params["container"] = container
+            resp = await k8s_client._k8s_get(f"/api/v1/namespaces/{quote(namespace)}/pods/{quote(pod)}/log", params)
     if resp.status_code != 200:
         return {"error": f"log fetch failed ({resp.status_code}): {resp.text[:300]}"}
 

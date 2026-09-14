@@ -125,6 +125,29 @@ async def test_live_get_pod_logs_caps_tail_lines(sa_token, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_get_pod_logs_retries_with_first_container_on_ambiguous_400(sa_token, monkeypatch):
+    """ROADMAP OPS-9 — Claude's first attempt against a multi-container pod
+    must succeed rather than needing a live_describe_pod round trip first to
+    discover a container name."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if "container=" not in str(request.url):
+            return httpx.Response(400, text="a container name must be specified, choose one of: [app istio-proxy]")
+        assert "container=app" in str(request.url)
+        return httpx.Response(200, text="app container logs")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await ld.live_get_pod_logs("payments", "payment-api-x")
+
+    assert result["logs"] == "app container logs"
+    assert result["container"] == "app"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_live_get_events_filters_by_pod(sa_token, monkeypatch):
     captured = {}
 

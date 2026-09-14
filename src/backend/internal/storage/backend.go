@@ -11,8 +11,13 @@ type Backend interface {
 	// Store saves event data in the backend.
 	Store(ctx context.Context, podID string, data map[string]interface{}) (string, error)
 
-	// Query retrieves data matching the criteria.
-	Query(ctx context.Context, podID string, query map[string]interface{}) ([]map[string]interface{}, error)
+	// Query retrieves data matching the criteria. tenantID is server-resolved
+	// (never taken from the client-supplied query map — see ROADMAP OPS-10 /
+	// ADR 0022 amendment) and, on the kv (current_state) backend, sets the
+	// RLS session variable a caller cannot spoof its way around. The
+	// relational (events) backend accepts it for interface compliance but
+	// does not yet enforce it — events has no RLS policy, a separate item.
+	Query(ctx context.Context, tenantID, podID string, query map[string]interface{}) ([]map[string]interface{}, error)
 
 	// HealthCheck verifies the backend is accessible.
 	HealthCheck(ctx context.Context) error

@@ -126,6 +126,48 @@ func TestHandleClusterInventoryUpsert(t *testing.T) {
 		}
 	})
 
+	t.Run("ADR 0032: expected_failure_reason round-trips into the ServiceEntry passed to the store", func(t *testing.T) {
+		integStore := &fakeIntegrationStore{
+			byToken: map[string]*pgstore.Integration{
+				"real-token": {ID: "cluster-42", TenantID: "tenant-a"},
+			},
+		}
+		csStore := &fakeClusterServiceStore{}
+		h := &Handler{integrationStore: integStore, clusterServiceStore: csStore}
+		body := `{"namespaces":[{"name":"payments","services":[
+			{"name":"annotated-svc","expected_failure_reason":"legacy stub, decommission ticket JIRA-123"},
+			{"name":"plain-svc"}
+		]}]}`
+		req := httptest.NewRequest(http.MethodPost, "/api/cluster-inventory", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer real-token")
+		w := httptest.NewRecorder()
+
+		h.HandleClusterInventoryUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		entries := csStore.lastUpsert["payments"]
+		if len(entries) != 2 {
+			t.Fatalf("want 2 service entries, got %d: %+v", len(entries), entries)
+		}
+		var gotAnnotated, gotPlain string
+		for _, e := range entries {
+			if e.Name == "annotated-svc" {
+				gotAnnotated = e.ExpectedFailureReason
+			}
+			if e.Name == "plain-svc" {
+				gotPlain = e.ExpectedFailureReason
+			}
+		}
+		if want := "legacy stub, decommission ticket JIRA-123"; gotAnnotated != want {
+			t.Errorf("annotated-svc.ExpectedFailureReason = %q, want %q", gotAnnotated, want)
+		}
+		if gotPlain != "" {
+			t.Errorf("plain-svc (no annotation) ExpectedFailureReason = %q, want empty", gotPlain)
+		}
+	})
+
 	t.Run("malformed JSON is rejected", func(t *testing.T) {
 		h := &Handler{integrationStore: &fakeIntegrationStore{
 			byToken: map[string]*pgstore.Integration{

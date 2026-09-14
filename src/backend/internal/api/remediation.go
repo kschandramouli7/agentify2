@@ -66,7 +66,10 @@ func (h *Handler) fetchNamespaceData(ctx context.Context, namespace string) map[
 	}
 	data := map[string]interface{}{}
 	for _, pod := range pods {
-		rows, ferr := h.queryExec.FetchFromPod(ctx, pod, nil)
+		// Internal helper, not wired to a specific incoming request's
+		// resolved tenant — DefaultTenantID matches today's effectively-
+		// single-tenant deployment (ROADMAP OPS-10 / ADR 0022 amendment).
+		rows, ferr := h.queryExec.FetchFromPod(ctx, pgstore.DefaultTenantID, pod, nil)
 		if ferr != nil {
 			continue
 		}

@@ -160,6 +160,10 @@ function HealthCell({ edge }: { edge: ServiceDependency }) {
   return (
     <span className={`adm-badge adm-badge--${tone}`} title={h.label}>
       {h.key === "healthy" ? "healthy" : `${h.badCount}/${h.classified} failed`}
+      {/* ADR 0032: the reason is never hidden — it's in h.label already — this
+          just flags at a glance that the operator marked this one expected,
+          which is why it's absent from the unhealthy banner above the table. */}
+      {edge.expected_failure_reason && " (known issue)"}
     </span>
   );
 }

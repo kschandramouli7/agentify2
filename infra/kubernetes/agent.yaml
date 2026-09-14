@@ -1,3 +1,14 @@
+# TEMPLATE — DO NOT `kubectl apply -f` THIS FILE DIRECTLY.
+# The image tag/registry (ACCOUNT_ID.dkr.ecr...) and the IRSA role-arn
+# annotation (REPLACE_WITH_TERRAFORM_OUTPUT_*) below are placeholders that
+# 02-deploy.yml sed's into a real value on every deploy — the checked-in copy
+# always keeps them literally. Applying this file as-is pushes those literal
+# placeholders into the live Deployment spec, including rolling the running
+# container image back to an unpullable string (caught live 2026-09-13,
+# ROADMAP OPS-2). For a one-off live change, patch the specific field —
+# `kubectl set env` / `kubectl patch` (see scripts/safe-kubectl-apply.sh,
+# which refuses to apply any file still containing these placeholders). To
+# actually deploy a manifest change, push it through 02-deploy.yml.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

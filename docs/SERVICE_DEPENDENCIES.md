@@ -228,6 +228,33 @@ A banner above the diagram lists every degraded/failing edge by name when any
 exist, and says outright that this is a **lower bound** — most evidence is
 still unclassified, so the true unhealthy count is likely higher, not lower.
 
+**Expected-failure annotation — added 2026-09-13 (ADR 0032), suppressing the
+banner without touching the evidence.** Some destinations are unreachable *by
+design* — a decommissioned stub kept around on purpose, a Service that only
+ever receives probes, a fixture built to fail. Annotate that Service:
+
+```bash
+kubectl annotate service <name> -n <namespace> \
+  agentify.io/expected-failure="<why this is expected — a ticket, a reason>"
+```
+
+Discovery's live scan reads the annotation on its next cycle (same lag as
+every other inventory fact — see §6) and every edge targeting that service
+drops out of the unhealthy banner. **Nothing else changes**: the edge still
+renders failing/degraded in its real colour, the table's Health column still
+shows the real `N/M failed` count plus a `(known issue)` marker, and both
+tooltips print the reason. This only suppresses the *alert*; the underlying
+evidence is never hidden. Removing the annotation reverses it on the next
+scan cycle. The annotation is per-Service, not per-edge — it marks a
+destination as expected-to-fail for *every* caller, not one specific
+caller→callee pair (see ADR 0032 for why, and the accepted scope limit that
+comes with it).
+
+`payment-worker` (§5, "Generating traffic on purpose" below) is the case that
+motivated this and is **deliberately not annotated** — its whole purpose is
+to demonstrate this exact detection working, so silencing it would defeat
+the fixture.
+
 Click a node (or a chip below) to focus it. Focus draws the **transitive**
 closure with hop distance, not one hop, and states the blast radius in prose:
 *"if payment-api fails, 2 services upstream are affected: payment-batch
@@ -628,6 +655,12 @@ single-container Deployment that bursts calls every 30s and logs each target
 hostname whether or not the call succeeds. Its header explains why it is a
 Deployment and not a CronJob (a CronJob pod exits before the live miner can read
 its logs) and why it has its own Service (so its calls are attributable).
+One of those targets, `payment-worker`, never listens on any port at all —
+every call to it genuinely fails, which is exactly the point: it gives the
+health-weighted graph (§2) a guaranteed real failing edge to detect. It is
+**deliberately not marked** with the §2 expected-failure annotation (ADR
+0032) — annotating it away would silence the one edge this fixture exists to
+keep unhealthy.
 
 ## 6. Known limits, stated plainly
 

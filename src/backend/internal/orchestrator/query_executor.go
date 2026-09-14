@@ -8,6 +8,7 @@ import (
 
 	"github.com/chan/agentify/backend/internal/models"
 	"github.com/chan/agentify/backend/internal/storage"
+	"github.com/chan/agentify/backend/internal/storage/postgres"
 	"github.com/chan/agentify/backend/internal/storage/registry"
 )
 
@@ -28,6 +29,10 @@ func NewQueryExecutor(reg registry.PodStore, bf *storage.BackendFactory, logger 
 }
 
 // Execute routes a query to pod(s), fetches results, and correlates them.
+// Confirmed dead code (ROADMAP OPS-10 audit, 2026-09-13) — no caller anywhere
+// in the backend; HandleQuery uses RouteToPods/FetchFromPod directly. Kept
+// compiling with DefaultTenantID rather than deleted, since removing unused-
+// but-plausibly-reachable exported methods is its own separate call.
 func (qe *QueryExecutor) Execute(ctx context.Context, intent string, query map[string]interface{}, namespace string) (map[string]interface{}, error) {
 	// Step 1: Parse intent and determine target pods
 	pods, err := qe.RouteToPods(ctx, intent, namespace, "")
@@ -42,7 +47,7 @@ func (qe *QueryExecutor) Execute(ctx context.Context, intent string, query map[s
 	// Step 2: Fetch from pod(s)
 	results := make(map[string]interface{})
 	for _, pod := range pods {
-		data, err := qe.FetchFromPod(ctx, pod, query)
+		data, err := qe.FetchFromPod(ctx, postgres.DefaultTenantID, pod, query)
 		if err != nil {
 			qe.logger.Warn("failed to fetch from pod", "pod_id", pod.ID, "error", err)
 			continue
@@ -171,14 +176,17 @@ func leavesOnly(pods []*models.Pod) []*models.Pod {
 	return leaves
 }
 
-// FetchFromPod retrieves data from a single pod.
-func (qe *QueryExecutor) FetchFromPod(ctx context.Context, pod *models.Pod, query map[string]interface{}) ([]map[string]interface{}, error) {
+// FetchFromPod retrieves data from a single pod. tenantID is server-resolved
+// by the caller (ROADMAP OPS-10 / ADR 0022 amendment) and passed straight
+// through to the backend, which sets the RLS session variable on the kv
+// (current_state) store.
+func (qe *QueryExecutor) FetchFromPod(ctx context.Context, tenantID string, pod *models.Pod, query map[string]interface{}) ([]map[string]interface{}, error) {
 	backend, err := qe.backendFactory.GetBackend(pod.StoreType)
 	if err != nil {
 		return nil, err
 	}
 
-	results, err := backend.Query(ctx, pod.ID, query)
+	results, err := backend.Query(ctx, tenantID, pod.ID, query)
 	if err != nil {
 		return nil, err
 	}

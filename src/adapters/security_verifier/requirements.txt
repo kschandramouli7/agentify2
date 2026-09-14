@@ -1,0 +1,5 @@
+# No third-party dependencies. Phase 2's one technique (a plaintext HTTP GET)
+# and the /verify dispatch server are both stdlib (urllib.request,
+# http.server) — same "a single/few internal routes does not justify pulling
+# in a framework" reasoning as discovery/health.py, applied to the whole
+# service here since it genuinely needs nothing else.

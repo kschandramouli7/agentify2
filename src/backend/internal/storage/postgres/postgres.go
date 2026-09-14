@@ -534,6 +534,16 @@ func (c *Client) initSchema(ctx context.Context) error {
 	-- cluster access) replicate the same selector-to-pod-label matching
 	-- against stored data instead of a live K8s read.
 	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS selector JSONB NOT NULL DEFAULT '{}'::jsonb;
+	-- ADR 0032: an operator-set K8s annotation (agentify.io/expected-failure)
+	-- on the Service, read by discovery's existing list_services scan and
+	-- carried through this same push — no new pipe. Non-empty means "calls to
+	-- this service are expected to fail/be unreachable by design"; joined
+	-- into ListServiceDependencies by (tenant_id, cluster_id, namespace,
+	-- service = to_service) so it suppresses only the health-alert banner,
+	-- never the underlying color/counts. Empty on the next push clears it
+	-- (same full-replace-per-cycle semantics as every other column here) —
+	-- removing the annotation un-suppresses the edge on the next scan.
+	ALTER TABLE IF EXISTS cluster_services ADD COLUMN IF NOT EXISTS expected_failure_reason TEXT NOT NULL DEFAULT '';
 
 	ALTER TABLE IF EXISTS cluster_services ENABLE ROW LEVEL SECURITY;
 	ALTER TABLE IF EXISTS cluster_services FORCE ROW LEVEL SECURITY;
@@ -654,6 +664,133 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- ROADMAP OPS-10 (ADR 0022 amendment, 2026-09-13): current_state was
+	-- listed in ADR 0022's own Decision #2 as a table that should get
+	-- tenant_id + RLS, but the RLS half was deferred as "a query-retrofit-
+	-- phase decision" and never completed. Closing it required first
+	-- threading tenant resolution through every current_state reader/writer
+	-- (CurrentState.Store/Query/TrackedEntities, Client.ListServiceHealth,
+	-- and the /api/query and /api/agent/fetch handlers above them) — see the
+	-- amendment for why this was a bigger retrofit than the one-line policy
+	-- below suggests.
+	ALTER TABLE IF EXISTS current_state ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS current_state FORCE ROW LEVEL SECURITY;
+
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'current_state' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON current_state
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
+	-- Deployment security posture (ROADMAP P30 phase 1, ADR 0033). One row
+	-- per (check, resource) — config-state, not accumulated evidence, so
+	-- this follows cluster_services' "full replace reflects live truth"
+	-- family: UpsertSecurityFindings upserts everything a scan cycle found
+	-- and flips anything NOT in that push from 'open' to 'resolved' (never
+	-- deletes, so history survives a fixed issue). confidence and
+	-- verified_by_engagement_id are ADR 0033 Phase 2+ columns, inert here
+	-- (always 'config-only'/NULL) — shipped now so Phase 2 is an additive
+	-- migration, not an OPS-10-shaped retrofit onto a schema that never
+	-- anticipated verification.
+	CREATE TABLE IF NOT EXISTS security_findings (
+		tenant_id     TEXT NOT NULL,
+		cluster_id    TEXT NOT NULL DEFAULT '',
+		namespace     TEXT NOT NULL,
+		check_id      TEXT NOT NULL,
+		resource_kind TEXT NOT NULL,
+		resource_name TEXT NOT NULL,
+		severity      TEXT NOT NULL,
+		evidence      TEXT NOT NULL DEFAULT '',
+		status        TEXT NOT NULL DEFAULT 'open',
+		confidence    TEXT NOT NULL DEFAULT 'config-only',
+		verified_by_engagement_id TEXT,
+		first_seen    TIMESTAMP DEFAULT NOW(),
+		last_seen     TIMESTAMP DEFAULT NOW(),
+		PRIMARY KEY (tenant_id, cluster_id, namespace, check_id, resource_kind, resource_name)
+	);
+	CREATE INDEX IF NOT EXISTS idx_security_findings_lookup ON security_findings(tenant_id, namespace);
+	-- ROADMAP P30 phase 2 (ADR 0033): the concrete thing an active-verification
+	-- engagement actually checks. Added via ALTER since the table already
+	-- shipped in phase 1 — same "extend an already-live table" idiom P27
+	-- phase 2 used for service_dependencies' port/outcome columns. A plain
+	-- TEXT column, not JSONB: phase 2's one technique needs exactly one
+	-- string (a host to GET); a richer shape can be a future migration if a
+	-- later technique actually needs one, not guessed at now.
+	ALTER TABLE IF EXISTS security_findings ADD COLUMN IF NOT EXISTS target_host TEXT NOT NULL DEFAULT '';
+
+	ALTER TABLE IF EXISTS security_findings ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS security_findings FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'security_findings' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON security_findings
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
+	-- Active-verification engagements (ROADMAP P30 phases 2-4, ADR 0033) —
+	-- the approval gate before anything network-active runs, modeled on
+	-- remediation_proposals (ADR 0020) with one deliberate correction:
+	-- remediation_proposals has NO row-level security at all (tenant_id/
+	-- cluster_id were bolted on later via ALTER TABLE, never backed by a
+	-- policy — the exact retrofit ADR 0033 warns against). RLS is enabled
+	-- here from this table's FIRST migration instead, same as
+	-- security_findings above.
+	--
+	-- Sized for phases 2-4 (phase, technique, scope) even though only phase
+	-- 2 is wired up: one engagement authorizes exactly one technique against
+	-- exactly one already-existing finding — never an untargeted "general
+	-- verification" grant — mirroring remediation_proposals' own "one
+	-- proposal, one action" simplicity rather than a multi-technique list
+	-- phases 3/4 haven't earned a real design for yet.
+	CREATE TABLE IF NOT EXISTS security_engagements (
+		id                    TEXT PRIMARY KEY,
+		tenant_id             TEXT NOT NULL,
+		cluster_id            TEXT NOT NULL DEFAULT '',
+		phase                 INT NOT NULL,             -- 2 | 3 | 4
+		technique             TEXT NOT NULL,            -- e.g. confirm-http-reachable (phase 2)
+		target_namespace      TEXT NOT NULL,
+		target_check_id       TEXT NOT NULL,
+		target_resource_kind  TEXT NOT NULL,
+		target_resource_name  TEXT NOT NULL,
+		scope                 JSONB NOT NULL DEFAULT '{}', -- room for phase 3/4's richer constraints
+		status                TEXT NOT NULL DEFAULT 'pending', -- pending|approved|rejected|active|completed|failed|expired
+		requested_by          TEXT NOT NULL DEFAULT '',
+		approved_by           TEXT NOT NULL DEFAULT '',
+		created_at            TIMESTAMP DEFAULT NOW(),
+		expires_at            TIMESTAMP NOT NULL,
+		decided_at            TIMESTAMP,
+		started_at            TIMESTAMP,
+		completed_at          TIMESTAMP,
+		result                JSONB NOT NULL DEFAULT '{}',
+		error                 TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_security_engagements_status  ON security_engagements(status);
+	CREATE INDEX IF NOT EXISTS idx_security_engagements_created ON security_engagements(created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_security_engagements_target
+		ON security_engagements(tenant_id, cluster_id, target_namespace, target_check_id, target_resource_kind, target_resource_name);
+
+	ALTER TABLE IF EXISTS security_engagements ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS security_engagements FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'security_engagements' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON security_engagements
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
 	-- Add the vector column + IVFFlat index only when pgvector is installed.
 	-- Silently skipped on embedded-postgres (CI tests) which don't ship pgvector.
 	DO $$
@@ -741,7 +878,13 @@ func (c *Client) Store(ctx context.Context, podID string, data map[string]interf
 //   - type          : event_type filter
 //   - order         : "asc" (chronological, for trend reading) | "desc" (default)
 //   - limit         : default 100, capped at 1000
-func (c *Client) Query(ctx context.Context, podID string, queryParams map[string]interface{}) ([]map[string]interface{}, error) {
+//
+// tenantID is accepted for storage.Backend interface compliance (ROADMAP
+// OPS-10 / ADR 0022 amendment) but not yet enforced here: events has the
+// same missing-RLS gap current_state had, and closing it is a separate,
+// not-yet-decided item — left alone rather than silently fixed as a
+// side effect of the current_state retrofit.
+func (c *Client) Query(ctx context.Context, tenantID, podID string, queryParams map[string]interface{}) ([]map[string]interface{}, error) {
 	q := `SELECT id, pod_id, event_namespace, event_type, timestamp, payload
 	FROM events WHERE pod_id = $1`
 	args := []interface{}{podID}
@@ -1203,9 +1346,10 @@ type CurrentState struct {
 
 // Store upserts the latest state for an entity (latest-wins). tenant_id/
 // cluster_id (ADR 0024) come from data["tenant_id"]/data["cluster_id"] —
-// same server-side-resolved convention as Client.Store; isolation is
-// actually provided by pod_id (ADR 0024's PodID helper), these columns are
-// written for observability, not filtered on for correctness.
+// same server-side-resolved convention as Client.Store. Isolation used to
+// rest entirely on pod_id (ADR 0024's PodID helper); ROADMAP OPS-10 (ADR
+// 0022 amendment) adds a real RLS backstop on top by setting the session's
+// tenant context from this same already-trusted value before the write.
 func (s *CurrentState) Store(ctx context.Context, podID string, data map[string]interface{}) (string, error) {
 	entityKey, _ := data["entity_key"].(string)
 	if entityKey == "" {
@@ -1227,6 +1371,16 @@ func (s *CurrentState) Store(ctx context.Context, podID string, data map[string]
 		return "", err
 	}
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return "", fmt.Errorf("set tenant context: %w", err)
+	}
+
 	const q = `
 	INSERT INTO current_state (pod_id, entity_key, event_namespace, event_type, source, payload, tenant_id, cluster_id, updated_at)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
@@ -1238,11 +1392,40 @@ func (s *CurrentState) Store(ctx context.Context, podID string, data map[string]
 		tenant_id       = EXCLUDED.tenant_id,
 		cluster_id      = EXCLUDED.cluster_id,
 		updated_at      = NOW()`
-	if _, err := s.db.ExecContext(ctx, q, podID, entityKey, namespace, eventType, source, payloadJSON, tenantID, clusterID); err != nil {
+	if _, err := tx.ExecContext(ctx, q, podID, entityKey, namespace, eventType, source, payloadJSON, tenantID, clusterID); err != nil {
 		s.logger.Error("failed to upsert current_state", "error", err)
 		return "", err
 	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("%s:%s", podID, entityKey), nil
+}
+
+// Delete removes one entity's row entirely — the delete path ROADMAP OPS-12
+// found missing: a K8s watch DELETED event used to be normalised to
+// event_type "pod_deleted" and then UPSERTED like any other event (Store,
+// above), so the row survived forever holding the dead pod's last-known
+// state. ing.storeEvent (ingester.go) now calls this instead of Store when
+// it sees that event type. Deleting zero rows (the entity was never stored,
+// or a retry after an already-successful delete) is not an error — same
+// idempotent-delete convention as the rest of this codebase.
+func (s *CurrentState) Delete(ctx context.Context, tenantID, podID, entityKey string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM current_state WHERE pod_id = $1 AND entity_key = $2`, podID, entityKey); err != nil {
+		s.logger.Error("failed to delete current_state row", "error", err)
+		return err
+	}
+	return tx.Commit()
 }
 
 // Query does a point lookup when given "key", a prefix scan when given "service",
@@ -1253,22 +1436,34 @@ func (s *CurrentState) Store(ctx context.Context, podID string, data map[string]
 //
 //	entity_key starts with "{service}-" (covers Deployment-only
 //	workloads that have no K8s Service object)
-func (s *CurrentState) Query(ctx context.Context, podID string, queryParams map[string]interface{}) ([]map[string]interface{}, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
+//
+// tenantID is server-resolved by the caller (ROADMAP OPS-10 / ADR 0022
+// amendment) — never taken from queryParams, which on the /api/query path
+// is built directly from client-supplied request context and so cannot be
+// trusted to carry a tenant claim.
+func (s *CurrentState) Query(ctx context.Context, tenantID, podID string, queryParams map[string]interface{}) ([]map[string]interface{}, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+
+	var rows *sql.Rows
 	if key, ok := queryParams["key"].(string); ok && key != "" {
-		rows, err = s.db.QueryContext(ctx,
+		rows, err = tx.QueryContext(ctx,
 			`SELECT entity_key, event_namespace, event_type, source, payload, updated_at
 			 FROM current_state WHERE pod_id = $1 AND entity_key = $2`, podID, key)
 	} else if svc, ok := queryParams["service"].(string); ok && svc != "" {
-		rows, err = s.db.QueryContext(ctx,
+		rows, err = tx.QueryContext(ctx,
 			`SELECT entity_key, event_namespace, event_type, source, payload, updated_at
 			 FROM current_state WHERE pod_id = $1 AND (entity_key = $2 OR entity_key LIKE $3)`,
 			podID, svc, svc+"-%")
 	} else {
-		rows, err = s.db.QueryContext(ctx,
+		rows, err = tx.QueryContext(ctx,
 			`SELECT entity_key, event_namespace, event_type, source, payload, updated_at
 			 FROM current_state WHERE pod_id = $1`, podID)
 	}
@@ -1295,7 +1490,14 @@ func (s *CurrentState) Query(ctx context.Context, podID string, queryParams map[
 			"payload":         decodePayload(payload),
 		})
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // TrackedEntities returns active namespace/service pairs from the live-state
@@ -1307,15 +1509,32 @@ func (s *CurrentState) Query(ctx context.Context, podID string, queryParams map[
 // pod_* rows by stripping the two trailing K8s hash segments
 // ({rs-hash}-{pod-hash}), recovering the deployment name. Results are
 // deduplicated so each namespace/name pair appears only once.
-func (s *CurrentState) TrackedEntities(ctx context.Context) ([]string, error) {
+//
+// tenantID (ROADMAP OPS-10 / ADR 0022 amendment): this had NO tenant
+// filtering at all before — not even the manual-WHERE-clause pattern
+// ListServiceHealth already used — despite being the one read here with the
+// widest blast radius (whole-table, unkeyed by any single pod_id). Filtered
+// explicitly here, belt-and-suspenders alongside the RLS backstop.
+func (s *CurrentState) TrackedEntities(ctx context.Context, tenantID string) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+
 	const q = `
 	SELECT pod_id, entity_key, event_type
 	FROM current_state
-	WHERE pod_id LIKE 'k8fy.live-state.%'
+	WHERE tenant_id = $1
+	  AND pod_id LIKE 'k8fy.live-state.%'
 	  AND (event_type LIKE 'service_%' OR event_type LIKE 'pod_%')
 	ORDER BY pod_id, entity_key`
 
-	rows, err := s.db.QueryContext(ctx, q)
+	rows, err := tx.QueryContext(ctx, q, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -1355,7 +1574,14 @@ func (s *CurrentState) TrackedEntities(ctx context.Context) ([]string, error) {
 			result = append(result, key)
 		}
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // HealthCheck verifies the connection.
@@ -1928,6 +2154,12 @@ type ServiceDependency struct {
 	OutcomeSuccessCount  int `json:"outcome_success_count"`
 	OutcomeFailureCount  int `json:"outcome_failure_count"`
 	OutcomeTimeoutCount  int `json:"outcome_timeout_count"`
+	// ADR 0032: to_service's agentify.io/expected-failure annotation value,
+	// looked up from cluster_services at read time (never stored on this row)
+	// so it's always current with the Service's live annotation state and has
+	// exactly one writer. Empty means no annotation — the edge is a normal
+	// candidate for the unhealthy banner.
+	ExpectedFailureReason string `json:"expected_failure_reason,omitempty"`
 }
 
 // UpsertServiceDependency records one piece of evidence for a from->to edge —
@@ -2101,11 +2333,21 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	if err := setTenantContext(ctx, tx, tenantID); err != nil {
 		return nil, fmt.Errorf("set tenant context: %w", err)
 	}
+	// LEFT JOIN cluster_services (ADR 0032): to_service's expected-failure
+	// reason, if the collector's live scan found the annotation on that
+	// Service. Joined on cluster_id too (not just namespace+service) so the
+	// same service name in two different clusters for this tenant can't
+	// fan out this query into duplicate rows.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, namespace, from_service, to_service, evidence_count, first_seen, last_seen,
-		       tenant_id, COALESCE(cluster_id, ''), COALESCE(target_kind, 'service'),
-		       port, outcome_success_count, outcome_failure_count, outcome_timeout_count
-		FROM service_dependencies WHERE namespace = $1 ORDER BY evidence_count DESC`, namespace)
+		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
+		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
+		       sd.port, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
+		       COALESCE(cs.expected_failure_reason, '')
+		FROM service_dependencies sd
+		LEFT JOIN cluster_services cs
+		  ON cs.tenant_id = sd.tenant_id AND cs.cluster_id = sd.cluster_id
+		 AND cs.namespace = sd.namespace AND cs.service = sd.to_service
+		WHERE sd.namespace = $1 ORDER BY sd.evidence_count DESC`, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -2116,7 +2358,8 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		var d ServiceDependency
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
 			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind,
-			&d.Port, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount); err != nil {
+			&d.Port, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
+			&d.ExpectedFailureReason); err != nil {
 			return nil, err
 		}
 		result = append(result, d)
@@ -2146,6 +2389,11 @@ type ServiceEntry struct {
 	ReplicasReady   *int
 	Image           string
 	Schedule        string
+
+	// ADR 0032: agentify.io/expected-failure annotation value, if the
+	// collector's live K8s read found one on this Service. Empty means
+	// either no annotation or an older collector that predates this field.
+	ExpectedFailureReason string
 }
 
 type ServicePort struct {
@@ -2214,11 +2462,13 @@ func (c *Client) UpsertClusterServices(ctx context.Context, tenantID, clusterID 
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO cluster_services (tenant_id, cluster_id, namespace, service, selector,
 				                               service_type, ports, workload_kind,
-				                               replicas_desired, replicas_ready, image, schedule, updated_at)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())`,
+				                               replicas_desired, replicas_ready, image, schedule,
+				                               expected_failure_reason, updated_at)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`,
 				tenantID, clusterID, namespace, service.Name, selectorJSON,
 				service.ServiceType, portsJSON, service.WorkloadKind,
-				service.ReplicasDesired, service.ReplicasReady, service.Image, service.Schedule); err != nil {
+				service.ReplicasDesired, service.ReplicasReady, service.Image, service.Schedule,
+				service.ExpectedFailureReason); err != nil {
 				return fmt.Errorf("insert cluster service %s/%s: %w", namespace, service.Name, err)
 			}
 		}
@@ -2515,18 +2765,28 @@ type ServiceHealth struct {
 
 // ListServiceHealth aggregates live pod state per service for one namespace.
 //
-// TENANT SCOPING IS EXPLICIT HERE, unlike every other read in this file.
-// current_state carries tenant_id but has NO row-level-security policy — ADR
-// 0022 deferred that as "a query-retrofit-phase decision", and the retrofit
-// has not happened. So this query filters tenant_id in its own WHERE clause
-// and must keep doing so: dropping that predicate would leak one tenant's
-// service inventory to another, with no RLS backstop to catch it.
+// TENANT SCOPING WAS EXPLICIT-ONLY HERE until ROADMAP OPS-10 (ADR 0022
+// amendment), unlike every other RLS-backed read in this file.
+// current_state now has a real `tenant_isolation` policy — this query's own
+// `WHERE tenant_id = $1` predicate is kept anyway, belt-and-suspenders, but
+// it is no longer the only thing standing between one tenant's service
+// inventory and another's.
 //
 // Attribution comes from payload->>'service', written at push time by the
 // collector (service_index). Pods with no attributable Service are counted
 // separately by the caller rather than silently folded in.
 func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace string) ([]ServiceHealth, error) {
-	rows, err := c.db.QueryContext(ctx, `
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT payload->>'service'                                        AS service,
 		       count(*)                                                   AS pods,
 		       count(*) FILTER (WHERE payload->>'ready' = 'true')         AS ready,
@@ -2546,21 +2806,20 @@ func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace stri
 		   AND event_namespace = 'k8fy.live-state'
 		   AND payload->>'namespace' = $2
 		   AND COALESCE(payload->>'service', '') <> ''
-		   -- Exclude pods the watch saw deleted.
+		   -- Exclude pods the watch saw deleted — belt-and-suspenders, kept
+		   -- even now that ingester.go's storeEvent actually DELETEs the row
+		   -- for a "_deleted" event (ROADMAP OPS-12, CurrentState.Delete)
+		   -- rather than upserting a tombstone. Two reasons this predicate
+		   -- still earns its place instead of being removed as redundant:
 		   --
-		   -- current_state NEVER FORGETS A POD: a DELETED watch event is
-		   -- normalised to event_type 'pod_deleted' and UPSERTED like any
-		   -- other, so the row survives holding the dead pod's final state,
-		   -- and nothing in this codebase deletes from current_state. Without
-		   -- this predicate the counts below are "every pod that has ever
-		   -- existed", which after ten rollouts reported a 1-replica
-		   -- Deployment as 9 ready of 10 pods.
-		   --
-		   -- This is necessary but NOT sufficient: a pod that vanishes while
-		   -- the watch is reconnecting never produces a DELETED event and its
-		   -- row persists indefinitely. That is why the ready/desired RATIO
-		   -- shown in the UI comes from the Deployment status instead of from
-		   -- these counts — see OPS-12.
+		   --   1. Rows written before that fix shipped still had their
+		   --      tombstone upserted, not deleted, and nothing backfills them.
+		   --   2. The fix is necessary but NOT sufficient going forward: a pod
+		   --      that vanishes while the watch is reconnecting never produces
+		   --      a DELETED event at all, so no delete call ever fires and its
+		   --      row persists indefinitely. That residual gap is why the
+		   --      ready/desired RATIO shown in the UI comes from the
+		   --      Deployment status instead of from these counts.
 		   AND COALESCE(event_type, '') <> 'pod_deleted'
 		 GROUP BY 1
 		 ORDER BY 1`, tenantID, namespace)
@@ -2607,7 +2866,414 @@ func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace stri
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	rows.Close()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// SecurityFinding is one deployment-security check's result for one resource
+// (ROADMAP P30 phase 1, ADR 0033). Confidence and VerifiedByEngagementID are
+// Phase 2+ columns, inert in phase 1 (always "config-only"/empty).
+type SecurityFinding struct {
+	Namespace              string    `json:"namespace"`
+	CheckID                string    `json:"check_id"`
+	ResourceKind           string    `json:"resource_kind"`
+	ResourceName           string    `json:"resource_name"`
+	Severity               string    `json:"severity"`
+	Evidence               string    `json:"evidence"`
+	// TargetHost (ROADMAP P30 phase 2): the concrete host an active-
+	// verification engagement checks. Empty when the check that produced
+	// this finding has no phase-2 technique mapped to it yet.
+	TargetHost             string    `json:"target_host,omitempty"`
+	Status                 string    `json:"status"`
+	Confidence             string    `json:"confidence"`
+	VerifiedByEngagementID string    `json:"verified_by_engagement_id,omitempty"`
+	FirstSeen              time.Time `json:"first_seen"`
+	LastSeen               time.Time `json:"last_seen"`
+	TenantID               string    `json:"tenant_id"`
+	ClusterID              string    `json:"cluster_id,omitempty"`
+}
+
+// UpsertSecurityFindings records this scan cycle's complete finding set for
+// one (tenant, cluster, namespace) — findings are config-state, not
+// accumulated evidence, so this follows cluster_services' "full replace
+// reflects live truth" family rather than scan_coverage's accumulate-forever
+// counters, with one addition for auditability: a finding no longer present
+// is marked status='resolved', never deleted, so history survives a fixed
+// issue. A finding already 'resolved' that reappears flips back to 'open'
+// (a regression); one already 'open' or 'acknowledged' is left as-is, so
+// acknowledging a still-present issue doesn't get silently undone by the
+// very next scan cycle finding it again.
+func (c *Client) UpsertSecurityFindings(ctx context.Context, tenantID, clusterID, namespace string, findings []SecurityFinding) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+
+	for _, f := range findings {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO security_findings (tenant_id, cluster_id, namespace, check_id, resource_kind,
+			                                resource_name, severity, evidence, target_host, status, confidence,
+			                                first_seen, last_seen)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', 'config-only', NOW(), NOW())
+			ON CONFLICT (tenant_id, cluster_id, namespace, check_id, resource_kind, resource_name) DO UPDATE SET
+			  severity    = EXCLUDED.severity,
+			  evidence    = EXCLUDED.evidence,
+			  target_host = EXCLUDED.target_host,
+			  last_seen   = NOW(),
+			  status      = CASE WHEN security_findings.status = 'resolved' THEN 'open' ELSE security_findings.status END`,
+			tenantID, clusterID, namespace, f.CheckID, f.ResourceKind, f.ResourceName, f.Severity, f.Evidence, f.TargetHost); err != nil {
+			return fmt.Errorf("upsert finding %s/%s/%s: %w", f.CheckID, f.ResourceKind, f.ResourceName, err)
+		}
+	}
+
+	// Anything still 'open'/'acknowledged' for this namespace that wasn't in
+	// this push no longer reproduces — resolve it. Built as a dynamic VALUES
+	// list (same dynamic-SQL convention Client.Query already uses for events'
+	// optional filters) rather than a Go-side array type, matching this
+	// file's existing avoidance of pq's array marshaling elsewhere.
+	if len(findings) == 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE security_findings SET status = 'resolved'
+			WHERE tenant_id = $1 AND cluster_id = $2 AND namespace = $3 AND status != 'resolved'`,
+			tenantID, clusterID, namespace); err != nil {
+			return fmt.Errorf("resolve stale findings: %w", err)
+		}
+	} else {
+		var b strings.Builder
+		args := []interface{}{tenantID, clusterID, namespace}
+		b.WriteString(`
+			UPDATE security_findings SET status = 'resolved'
+			WHERE tenant_id = $1 AND cluster_id = $2 AND namespace = $3 AND status != 'resolved'
+			  AND NOT EXISTS (SELECT 1 FROM (VALUES `)
+		for i, f := range findings {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			args = append(args, f.CheckID, f.ResourceKind, f.ResourceName)
+			n := len(args)
+			fmt.Fprintf(&b, "($%d, $%d, $%d)", n-2, n-1, n)
+		}
+		b.WriteString(`) AS pushed(check_id, resource_kind, resource_name)
+			  WHERE pushed.check_id = security_findings.check_id
+			    AND pushed.resource_kind = security_findings.resource_kind
+			    AND pushed.resource_name = security_findings.resource_name)`)
+		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+			return fmt.Errorf("resolve stale findings: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// ListSecurityFindings returns every finding for one namespace across every
+// cluster belonging to tenantID, same scoping rationale as
+// ListServiceDependencies. RLS enforces the tenant boundary.
+func (c *Client) ListSecurityFindings(ctx context.Context, tenantID, namespace string) ([]SecurityFinding, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT namespace, check_id, resource_kind, resource_name, severity, evidence, target_host, status,
+		       confidence, COALESCE(verified_by_engagement_id, ''), first_seen, last_seen,
+		       tenant_id, COALESCE(cluster_id, '')
+		FROM security_findings WHERE namespace = $1
+		ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, check_id`,
+		namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []SecurityFinding
+	for rows.Next() {
+		var f SecurityFinding
+		if err := rows.Scan(&f.Namespace, &f.CheckID, &f.ResourceKind, &f.ResourceName, &f.Severity,
+			&f.Evidence, &f.TargetHost, &f.Status, &f.Confidence, &f.VerifiedByEngagementID, &f.FirstSeen, &f.LastSeen,
+			&f.TenantID, &f.ClusterID); err != nil {
+			return nil, err
+		}
+		result = append(result, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetSecurityFinding is a point lookup by natural key (ROADMAP P30 phase 2)
+// — validates a finding exists (and reads its target_host) before an
+// engagement is created against it, so an engagement can never be requested
+// for a finding that isn't real.
+func (c *Client) GetSecurityFinding(ctx context.Context, tenantID, namespace, checkID, resourceKind, resourceName string) (*SecurityFinding, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	row := tx.QueryRowContext(ctx, `
+		SELECT namespace, check_id, resource_kind, resource_name, severity, evidence, target_host, status,
+		       confidence, COALESCE(verified_by_engagement_id, ''), first_seen, last_seen,
+		       tenant_id, COALESCE(cluster_id, '')
+		FROM security_findings
+		WHERE namespace = $1 AND check_id = $2 AND resource_kind = $3 AND resource_name = $4`,
+		namespace, checkID, resourceKind, resourceName)
+	var f SecurityFinding
+	if err := row.Scan(&f.Namespace, &f.CheckID, &f.ResourceKind, &f.ResourceName, &f.Severity,
+		&f.Evidence, &f.TargetHost, &f.Status, &f.Confidence, &f.VerifiedByEngagementID, &f.FirstSeen, &f.LastSeen,
+		&f.TenantID, &f.ClusterID); err != nil {
+		return nil, err
+	}
+	return &f, tx.Commit()
+}
+
+// ── Security engagements (ROADMAP P30 phases 2-4, ADR 0033) ─────────────────
+
+// SecurityEngagement is one propose→approve/reject→execute record
+// authorizing exactly one active-verification technique against exactly one
+// existing SecurityFinding. Producing one makes no network calls; only an
+// approved engagement is dispatched. Unlike RemediationProposal (no RLS at
+// all — see the migration's comment), every method here runs inside a
+// tenant-scoped transaction, so a tenantID is required even for a
+// point-lookup by ID.
+type SecurityEngagement struct {
+	ID                 string
+	TenantID           string
+	ClusterID          string
+	Phase              int
+	Technique          string
+	TargetNamespace    string
+	TargetCheckID      string
+	TargetResourceKind string
+	TargetResourceName string
+	Scope              map[string]interface{}
+	Status             string // pending | approved | rejected | active | completed | failed | expired
+	RequestedBy        string
+	ApprovedBy         string
+	CreatedAt          time.Time
+	ExpiresAt          time.Time
+	DecidedAt          *time.Time
+	StartedAt          *time.Time
+	CompletedAt        *time.Time
+	Result             map[string]interface{}
+	Error              string
+}
+
+// CreateSecurityEngagement inserts a new pending engagement. e.ID and
+// e.TenantID must be set by the caller.
+func (c *Client) CreateSecurityEngagement(ctx context.Context, e *SecurityEngagement) error {
+	scopeJSON, err := json.Marshal(e.Scope)
+	if err != nil {
+		return fmt.Errorf("marshal scope: %w", err)
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, e.TenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO security_engagements
+		  (id, tenant_id, cluster_id, phase, technique, target_namespace,
+		   target_check_id, target_resource_kind, target_resource_name,
+		   scope, status, requested_by, created_at, expires_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,NOW(),$12)`,
+		e.ID, e.TenantID, e.ClusterID, e.Phase, e.Technique, e.TargetNamespace,
+		e.TargetCheckID, e.TargetResourceKind, e.TargetResourceName,
+		scopeJSON, e.RequestedBy, e.ExpiresAt); err != nil {
+		return fmt.Errorf("insert security engagement: %w", err)
+	}
+	return tx.Commit()
+}
+
+const securityEngagementSelectCols = `
+	SELECT id, tenant_id, COALESCE(cluster_id, ''), phase, technique, target_namespace,
+	       target_check_id, target_resource_kind, target_resource_name, scope,
+	       status, requested_by, approved_by, created_at, expires_at,
+	       decided_at, started_at, completed_at, result, error
+	FROM security_engagements`
+
+func scanSecurityEngagement(row interface{ Scan(...any) error }) (*SecurityEngagement, error) {
+	var e SecurityEngagement
+	var scopeJSON, resultJSON []byte
+	if err := row.Scan(
+		&e.ID, &e.TenantID, &e.ClusterID, &e.Phase, &e.Technique, &e.TargetNamespace,
+		&e.TargetCheckID, &e.TargetResourceKind, &e.TargetResourceName, &scopeJSON,
+		&e.Status, &e.RequestedBy, &e.ApprovedBy, &e.CreatedAt, &e.ExpiresAt,
+		&e.DecidedAt, &e.StartedAt, &e.CompletedAt, &resultJSON, &e.Error,
+	); err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(scopeJSON, &e.Scope)
+	_ = json.Unmarshal(resultJSON, &e.Result)
+	return &e, nil
+}
+
+// GetSecurityEngagement returns one engagement by ID, scoped to tenantID —
+// RLS also enforces this, but the WHERE clause keeps the query correct even
+// if a future caller forgets to set tenant context.
+func (c *Client) GetSecurityEngagement(ctx context.Context, tenantID, id string) (*SecurityEngagement, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	row := tx.QueryRowContext(ctx, securityEngagementSelectCols+` WHERE id = $1 AND tenant_id = $2`, id, tenantID)
+	e, err := scanSecurityEngagement(row)
+	if err != nil {
+		return nil, err
+	}
+	return e, tx.Commit()
+}
+
+// ListSecurityEngagements returns engagements newest-first for tenantID,
+// optionally filtered by status. An empty status returns all.
+func (c *Client) ListSecurityEngagements(ctx context.Context, tenantID, status string, limit int) ([]SecurityEngagement, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	var rows *sql.Rows
+	if status != "" {
+		rows, err = tx.QueryContext(ctx,
+			securityEngagementSelectCols+` WHERE status = $1 ORDER BY created_at DESC LIMIT $2`, status, limit)
+	} else {
+		rows, err = tx.QueryContext(ctx,
+			securityEngagementSelectCols+` ORDER BY created_at DESC LIMIT $1`, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list security engagements: %w", err)
+	}
+	defer rows.Close()
+
+	var result []SecurityEngagement
+	for rows.Next() {
+		e, err := scanSecurityEngagement(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan security engagement: %w", err)
+		}
+		result = append(result, *e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, tx.Commit()
+}
+
+// DecideSecurityEngagement transitions an engagement from pending to
+// approved/rejected. The WHERE status='pending' guard makes this idempotent,
+// same reasoning as DecideRemediationProposal: a duplicate click or retry
+// after the first decision affects zero rows (ok==false), which the caller
+// must treat as "already decided," never as a reason to re-dispatch.
+func (c *Client) DecideSecurityEngagement(ctx context.Context, tenantID, id, status, approvedBy string) (bool, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return false, fmt.Errorf("set tenant context: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE security_engagements
+		SET status = $1, decided_at = NOW(), approved_by = $2
+		WHERE id = $3 AND status = 'pending'`,
+		status, approvedBy, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, tx.Commit()
+	}
+	return true, tx.Commit()
+}
+
+// CompleteSecurityEngagement records the outcome of dispatching an approved
+// engagement, and — only when confirmed is non-nil, i.e. the verifier
+// reached a definitive answer — updates the TARGET finding's confidence in
+// the same transaction: true means the finding is confirmed-live, false
+// means the check refuted it. A nil confirmed (the dispatch itself failed,
+// inconclusive) leaves the finding's confidence at config-only; an
+// inconclusive check must never masquerade as a verified one.
+func (c *Client) CompleteSecurityEngagement(ctx context.Context, tenantID, id, status string, result map[string]interface{}, errMsg string, confirmed *bool) error {
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal result: %w", err)
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	row := tx.QueryRowContext(ctx, securityEngagementSelectCols+` WHERE id = $1`, id)
+	eng, err := scanSecurityEngagement(row)
+	if err != nil {
+		return fmt.Errorf("get engagement for completion: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE security_engagements
+		SET status = $1, completed_at = NOW(), result = $2, error = $3
+		WHERE id = $4`,
+		status, resultJSON, errMsg, id); err != nil {
+		return fmt.Errorf("update security engagement: %w", err)
+	}
+
+	if confirmed != nil {
+		confidence := "refuted"
+		if *confirmed {
+			confidence = "confirmed-live"
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE security_findings
+			SET confidence = $1, verified_by_engagement_id = $2
+			WHERE tenant_id = $3 AND cluster_id = $4 AND namespace = $5
+			  AND check_id = $6 AND resource_kind = $7 AND resource_name = $8`,
+			confidence, id, tenantID, eng.ClusterID, eng.TargetNamespace,
+			eng.TargetCheckID, eng.TargetResourceKind, eng.TargetResourceName); err != nil {
+			return fmt.Errorf("update target finding confidence: %w", err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // UpsertClusterHealthSnapshot replaces one cluster's current snapshot —

@@ -111,9 +111,10 @@ async def test_a_service_with_no_pods_at_all_is_reported(monkeypatch, captured):
 
 @pytest.mark.asyncio
 async def test_unreadable_logs_count_as_sampled_but_not_readable(monkeypatch, captured):
-    """OPS-9 makes get_pod_logs return "" for every multi-container pod. That
-    is a platform problem and must be distinguishable from "read the logs and
-    found no mentions", which is a real observation."""
+    """A genuinely unreadable log (get_pod_logs returning "" after exhausting
+    its own retry — see test_k8s_client.py's OPS-9 coverage for that retry
+    itself) is a platform problem and must be distinguishable from "read the
+    logs and found no mentions", which is a real observation."""
     services = [{"name": "api", "selector": {"app": "api"}}]
     pods = [_pod("api-1", "api"), _pod("api-2", "api")]
     await _run(monkeypatch, services, pods, {"api-1": "some log line\n"})  # api-2 returns ""

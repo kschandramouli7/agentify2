@@ -268,6 +268,75 @@ drill-down (ROADMAP P18 use case #9, `agentify-discovery`'s
   me pods for `payment-api`" and have that resolve to the right cluster on
   its own.
 
+## Amendment (2026-09-13) — closing the current_state RLS gap, and what it actually took
+
+Decision #2 above lists `current_state` among the tables that should get
+`tenant_id` + RLS. It got the column; the RLS half was left as a "query-
+retrofit-phase decision" and was never finished (flagged live as ROADMAP
+OPS-10, filed as a routine chore alongside two unrelated one-line fixes).
+
+**Why this needed its own amendment, not just a migration.** Postgres RLS
+with `FORCE` applies per-role to *every* query against a table, regardless
+of which Go method issues it — there is no way to enable it "partially."
+Four code paths touched `current_state`, and none of them set the
+`app.current_tenant_id` session variable the policy checks: `CurrentState
+.Store` (had the tenant on hand, just never used it), `Client
+.ListServiceHealth` (already filtered by tenant manually, but not via RLS),
+`CurrentState.TrackedEntities` (no tenant filtering at all, not even the
+manual-WHERE-clause kind), and — the one that changed the scope of this fix
+— `CurrentState.Query`, reached from **`HandleQuery` (`POST /api/query`, the
+primary chat/ask endpoint)**, whose own code comment said outright it was
+"not cluster-scoped." Turning on `FORCE ROW LEVEL SECURITY` without fixing
+that path first would have made every pod/service-state answer through the
+main query path start silently returning empty results — the core product
+feature breaking, not just a security posture improving.
+
+**Decision: do the full retrofit, including `/api/query`.** Confirmed
+explicitly rather than assumed, given the size difference from what OPS-10
+implied.
+
+- `storage.Backend.Query` (`internal/storage/backend.go`) gained a
+  `tenantID string` parameter, server-resolved and passed explicitly — never
+  read from the query body, since (unlike `Store`, whose `data` map is
+  populated server-side by the ingester) `Query`'s `podQuery` is built
+  directly from client-supplied `req.Context`, and putting `tenant_id`
+  there would let a caller spoof it. `Store`'s signature was untouched for
+  exactly this reason — it already carried a trusted value.
+- `HandleQuery` and `HandleAgentFetch` now call the existing
+  `resolveTenantContext(r)` helper every other handler already used — no
+  `Authorization` header required (unchanged), only a garbage bearer token
+  is newly rejected. Since no real multi-tenant frontend auth exists yet,
+  every unauthenticated call already resolves to the same `DefaultTenantID`
+  today, so this is **behaviorally a no-op for the current deployment**,
+  not a functional change.
+- `CurrentState.TrackedEntities` (`/admin/tracked`) gained both a
+  `tenantID` parameter and an explicit `tenant_id = $1` predicate — it had
+  neither before, despite aggregating the whole table with no `pod_id` key
+  at all, the widest blast radius of any current_state reader.
+- Background sweeps with no inbound request to resolve a tenant from
+  (`DeploymentGuardian`, `Investigator`, remediation's post-execution
+  verification) now pass `pgstore.DefaultTenantID` explicitly, matching
+  today's effectively-single-tenant reality rather than inventing a
+  per-tenant background-sweep design this pass didn't need.
+- `Client.Query` (events) accepts the same new parameter for interface
+  compliance but does not enforce it — events has the identical missing-RLS
+  gap current_state just had, but closing it is a separate, not-yet-decided
+  item, not a side effect of this one.
+
+**A real finding from testing this, not just implementing it:**
+`current_state`'s `PRIMARY KEY (pod_id, entity_key)` does not include
+`tenant_id`. Two different tenants writing the exact same `(pod_id,
+entity_key)` pair collide at the schema level — the second write hits
+`ON CONFLICT DO UPDATE` against a row RLS won't let it see, and errors
+rather than coexisting. This is not fixed here: ADR 0024's `PodID` helper
+already embeds `cluster_id` into every `pod_id`, and two different tenants
+never share a `cluster_id` by construction, so this collision cannot occur
+in practice — pod_id-based scoping was always current_state's real
+isolation mechanism (see Store's own comment); RLS adds a backstop for the
+aggregate reads (`ListServiceHealth`, `TrackedEntities`) that key off
+namespace *names*, which genuinely can collide across two tenants'
+clusters, rather than off pod_id, which cannot.
+
 ## Consequences
 
 - **Positive:** unlocks the actual target architecture (one shared Hub, many
@@ -296,6 +365,13 @@ drill-down (ROADMAP P18 use case #9, `agentify-discovery`'s
   isolation stronger than row-level (e.g. a contractual demand for physical
   separation) — schema-per-tenant or a dedicated deployment becomes an
   exception path for that one tenant, not a change to the default.
+- **Negative / cost accepted (2026-09-13 amendment):** `events` (`Client
+  .Query`/`Store`) has the same missing-RLS gap `current_state` just had —
+  deliberately not closed as a side effect of this fix, so it remains open
+  until its own decision is made. `current_state`'s primary key still has
+  no `tenant_id` component (see the amendment) — accepted because pod_id
+  already makes the collision it would guard against impossible today, not
+  because the schema is airtight on its own.
 
 ## Coupled decisions (supersedes ADR 0009's own list)
 

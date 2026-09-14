@@ -38,6 +38,69 @@ tool loop.
    Default off because it degrades operator-facing answers (`id_3f9a…` vs
    `payment-svc`); turn on when a customer review requires it.
 
+## Amendment (2026-09-14) — the operator's question is now in scope, PII coverage widens, and a real enforcement gap was found
+
+A 2026-09-14 audit (prompted by a request to screen "any data... from chat,
+logs, or anywhere" before it reaches an LLM) re-examined this ADR's own
+non-goals against what's actually shipped. Two findings changed the
+decision; a third is a bug against the *existing* policy, not a new one.
+
+**1. The operator's free-text question is no longer exempt.** Point 4's
+non-goal ("a determined operator can still put a secret in the prompt") was
+an accepted risk in 2026-06 when Tier-2 was new and low-volume. It no longer
+holds: the question flows unredacted into the Claude prompt (`agent.py`'s
+five call sites — `reason`, `reason_chat`, the executor/advisor and
+Pattern-A paths — none apply redaction) **and** into Langfuse tracing
+(`agent.yaml`'s tracing config ships the full question and chat history to a
+third-party, US-region service). **Decision: the question is now redacted
+the same way K8s log text already is** — the existing denylist
+(`log_redaction.py`, both copies) applied to the question string before it
+reaches *any* egress point (LLM prompt, Langfuse trace, and any future
+persistence), not just before storage. This is denylist-based like log
+redaction, not allowlist-based like structured data — free text can't be
+allowlisted, only screened for known-dangerous shapes — so the residual risk
+(a novel secret format the denylist doesn't recognize) is the same accepted
+tradeoff `policies/data-governance.md` already documents for log text.
+
+**2. PII coverage widens beyond email.** The only PII class either
+`RedactText` or `log_redaction.py` currently recognizes is email. Add phone
+numbers, credit-card numbers (Luhn-checked, not just digit-shape, to keep
+the false-positive rate sane), and IPv4/IPv6 addresses. Also add key shapes
+beyond AWS/JWT: GitHub (`ghp_`, `github_pat_`), Slack (`xox[baprs]-`), Google
+(`AIza`), Stripe (`sk_live_`/`sk_test_`), and a generic `sk-` prefix (covers
+OpenAI-shaped and several others). No entropy-based catch-all for now — a
+generic high-entropy detector has a real false-positive cost against
+legitimate hashes/IDs already flowing through this system (pod hashes,
+trace UUIDs), and this ADR's own Decision #1 principle (fail toward
+minimizing, not toward guessing) argues for named patterns over a heuristic
+that would need its own tuning pass.
+
+**3. Found live, not decided here: `incident_embeddings.summary` is written
+unredacted — a bug against this ADR's existing policy, not a new gap.**
+`HandleQuery`'s diagnose path builds a summary from the model's own prose
+and posts it to `/embed` for permanent storage in the pgvector index
+(`handlers.go`, around the `/embed` call) with no `RedactText` call — while
+`investigator.go`'s webhook path applies `RedactText` to the *identically-
+shaped* field before sending it out. `policies/data-governance.md` already
+says persistent stores must not receive unredacted log-derived content; this
+is that rule being violated by an oversight, not a case this ADR needs to
+re-decide. Tracked as ROADMAP OPS-13 — a bug fix, not a design question.
+
+**4. Enforcement moves from "every call site remembers" to a backstop at
+the model client itself.** All four points above are still applied
+upstream, at the point where data is assembled — that stays, since it's
+cheaper (redacting a small assembled payload beats redacting everything a
+tool could return) and keeps the allowlist's minimization benefit. But
+nothing currently stops a *new* call site from forgetting, the way
+`incident_embeddings` did. **Decision: add a defense-in-depth pass in
+`claude_client.py` itself**, redacting the outbound prompt text (denylist
+patterns only — the allowlist step already ran further upstream and can't
+be redone generically at this layer) immediately before the API call. This
+does not replace the upstream allowlist/denylist calls; it catches what they
+miss, the same "defense in depth, not the primary control" framing
+`investigator.go`'s existing double-redaction already established for the
+webhook path.
+
 ## Consequences
 
 - **Positive:** removes the raw-egress finding; minimizes tokens sent to the
@@ -53,5 +116,13 @@ tool loop.
   [ADR 0008](0008-multi-provider-model-routing.md) — supersedes the
   `ANTHROPIC_BASE_URL`-only step), or multi-tenancy (ROADMAP P3a) requires
   per-tenant classification.
+- **Negative / cost accepted (2026-09-14 amendment):** denylist-redacting the
+  operator's own question means a legitimate question that happens to match a
+  secret-shaped pattern (e.g. quoting a real error message containing a
+  connection string) gets truncated — the same false-positive tradeoff
+  `policies/data-governance.md` already accepts for log text, now also paid
+  on the question path. The `claude_client.py` backstop only catches
+  denylist-shaped leaks, not a genuinely novel secret format — it raises the
+  floor, it does not close the residual risk Decision #1 already accepted.
 
 See [policies/data-governance.md](../policies/data-governance.md) for the living rules.

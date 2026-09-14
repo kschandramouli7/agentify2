@@ -1,3 +1,14 @@
+# TEMPLATE — DO NOT `kubectl apply -f` THIS FILE DIRECTLY.
+# The image tag/registry (ACCOUNT_ID.dkr.ecr...) and the IRSA role-arn
+# annotation (REPLACE_WITH_TERRAFORM_OUTPUT_*) below are placeholders that
+# 02-deploy.yml sed's into a real value on every deploy — the checked-in copy
+# always keeps them literally. Applying this file as-is pushes those literal
+# placeholders into the live Deployment spec, including rolling the running
+# container image back to an unpullable string (caught live 2026-09-13,
+# ROADMAP OPS-2). For a one-off live change, patch the specific field —
+# `kubectl set env` / `kubectl patch` (see scripts/safe-kubectl-apply.sh,
+# which refuses to apply any file still containing these placeholders). To
+# actually deploy a manifest change, push it through 02-deploy.yml.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -111,12 +122,50 @@ spec:
         # matching the posture of REMEDIATION_AUTH_TOKEN and COLLECTOR_TOKEN,"
         # which stopped being true the day this endpoint was fixed and was
         # left stale; REMEDIATION_AUTH_TOKEN now has the same fail-closed
-        # posture too (above). Set it from a Secret (same secretKeyRef pattern
-        # as DB_PASSWORD) before this cluster carries anything that matters,
-        # and set the same value as the EVAL_AUTH_TOKEN GitHub secret so
-        # 10-prompt-gate.yml can authenticate.
+        # posture too (above).
+        #
+        # ROADMAP OPS-2 (2026-09-13): sourced from a Secret, same
+        # secretKeyRef/optional pattern as REMEDIATION_AUTH_TOKEN above —
+        # create it once, using the SAME value as the EVAL_AUTH_TOKEN GitHub
+        # Actions secret so 10-prompt-gate.yml can authenticate:
+        #   kubectl create secret generic agentify-eval-secret \
+        #     -n agentify --from-literal=auth-token="<same value as the GH secret>"
         - name: EVAL_AUTH_TOKEN
-          value: ""
+          valueFrom:
+            secretKeyRef:
+              name: agentify-eval-secret
+              key: auth-token
+              optional: true  # absent secret -> empty token -> fails closed outside dev, not a crash
+        # Active-verification engagements (ROADMAP P30 phases 2-4, ADR 0033).
+        # Same propose/approve-gate shape as remediation above — an unset
+        # SECURITY_ENGAGEMENT_AUTH_TOKEN fails closed outside dev from day
+        # one (not an amendment needed later, unlike REMEDIATION_AUTH_TOKEN/
+        # EVAL_AUTH_TOKEN's own history — ROADMAP OPS-2/OPS-3).
+        #   kubectl create secret generic agentify-security-engagement-secret \
+        #     -n agentify --from-literal=auth-token="$(openssl rand -hex 32)"
+        - name: SECURITY_ENGAGEMENT_PROPOSAL_TTL_MINUTES
+          value: "30"
+        - name: SECURITY_ENGAGEMENT_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: agentify-security-engagement-secret
+              key: auth-token
+              optional: true  # absent secret -> empty token -> fails closed outside dev, not a crash
+        # Where the isolated executor lives (infra/kubernetes/security-verifier.yaml)
+        # — agentify-agent has no route here at all, only this backend does.
+        - name: SECURITY_VERIFIER_URL
+          value: "http://agentify-security-verifier:8400"
+        # Shared secret with security-verifier's own SECURITY_VERIFIER_TOKEN
+        # — defense in depth on top of network isolation, not the primary
+        # boundary (that Service has no Ingress).
+        #   kubectl create secret generic agentify-security-verifier-secret \
+        #     -n agentify --from-literal=token="$(openssl rand -hex 32)"
+        - name: SECURITY_VERIFIER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: agentify-security-verifier-secret
+              key: token
+              optional: true
         livenessProbe:
           httpGet:
             path: /health

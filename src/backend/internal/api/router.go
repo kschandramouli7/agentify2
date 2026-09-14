@@ -77,6 +77,8 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	// a collector's CollectorToken derives (tenant, cluster).
 	mux.HandleFunc("POST /api/scan-coverage", h.HandleScanCoverageUpsert)
 	mux.HandleFunc("GET /api/scan-coverage", h.HandleScanCoverageList)
+	mux.HandleFunc("POST /api/security-findings", h.HandleSecurityFindingsUpsert)
+	mux.HandleFunc("GET /api/security-findings", h.HandleSecurityFindingsList)
 
 	// Fleet collector's namespace/service/deployment inventory push (ADR 0022 /
 	// ROADMAP P18 use case #1) — auto-populates Integration.Namespaces.
@@ -128,6 +130,15 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /admin/remediation/{id}", h.HandleRemediationGet)
 	mux.HandleFunc("POST /admin/remediation/{id}/approve", h.HandleRemediationApprove)
 	mux.HandleFunc("POST /admin/remediation/{id}/reject", h.HandleRemediationReject)
+
+	// Active-verification engagements (ROADMAP P30 phases 2-4, ADR 0033) —
+	// same propose/approve-reject shape as remediation above, dispatching to
+	// the isolated agentify-security-verifier service instead of the agent.
+	mux.HandleFunc("POST /admin/security-engagements", h.HandleSecurityEngagementCreate)
+	mux.HandleFunc("GET /admin/security-engagements", h.HandleSecurityEngagementList)
+	mux.HandleFunc("GET /admin/security-engagements/{id}", h.HandleSecurityEngagementGet)
+	mux.HandleFunc("POST /admin/security-engagements/{id}/approve", h.HandleSecurityEngagementApprove)
+	mux.HandleFunc("POST /admin/security-engagements/{id}/reject", h.HandleSecurityEngagementReject)
 
 	// TODO: add WebSocket handler for chat
 	// mux.HandleFunc("/ws/chat", h.HandleChatWebSocket)

@@ -329,11 +329,16 @@ export function edgeHealth(e: FlowEdge): EdgeHealth {
       classified, badCount,
     };
   }
+  // ADR 0032: an operator-annotated reason never changes the color or counts
+  // below — only unhealthyEdges()'s banner membership. Appended to the
+  // tooltip so a reader inspecting this specific edge isn't left wondering
+  // why it's drawn failing/degraded but missing from the banner.
+  const knownIssueSuffix = e.expected_failure_reason ? ` — known issue: ${e.expected_failure_reason}` : "";
   const badFraction = badCount / classified;
   if (badFraction >= 0.5) {
     return {
       key: "failing",
-      label: `Failing — ${badCount} of ${classified} classified calls errored or timed out.`,
+      label: `Failing — ${badCount} of ${classified} classified calls errored or timed out.${knownIssueSuffix}`,
       short: `${badCount}/${classified} failed`,
       classified, badCount,
     };
@@ -341,7 +346,7 @@ export function edgeHealth(e: FlowEdge): EdgeHealth {
   if (badFraction > 0) {
     return {
       key: "degraded",
-      label: `Degraded — ${badCount} of ${classified} classified calls errored or timed out.`,
+      label: `Degraded — ${badCount} of ${classified} classified calls errored or timed out.${knownIssueSuffix}`,
       short: `${badCount}/${classified} failed`,
       classified, badCount,
     };
@@ -357,9 +362,20 @@ export function edgeHealth(e: FlowEdge): EdgeHealth {
 /** Edges with a drawn health verdict of degraded or failing — the actionable
  *  set, surfaced the same way rarelyObserved's finding is: a banner, not
  *  just a line colour, because "2 dependencies are failing" is worth
- *  reading even before looking at the diagram. */
+ *  reading even before looking at the diagram.
+ *
+ *  ADR 0032: an edge whose destination carries an agentify.io/expected-failure
+ *  annotation is excluded from this banner-worthy set — the operator has
+ *  already said this failure is by design. This ONLY suppresses the alert:
+ *  edgeHealth() above still classifies and colors the edge failing/degraded,
+ *  and the real counts still render everywhere else. Never hide the data,
+ *  only the "you should look at this" nudge. */
 export function unhealthyEdges(edges: FlowEdge[]): FlowEdge[] {
-  return edges.filter(e => e.kind !== "declared" && (edgeHealth(e).key === "failing" || edgeHealth(e).key === "degraded"));
+  return edges.filter(e =>
+    e.kind !== "declared" &&
+    !e.expected_failure_reason &&
+    (edgeHealth(e).key === "failing" || edgeHealth(e).key === "degraded")
+  );
 }
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // matches TopologyPanel's threshold

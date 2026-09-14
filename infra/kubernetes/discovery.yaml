@@ -1,3 +1,14 @@
+# TEMPLATE — DO NOT `kubectl apply -f` THIS FILE DIRECTLY.
+# The image tag/registry (ACCOUNT_ID.dkr.ecr...) below is a placeholder that
+# 02-deploy.yml sed's into a real value on every deploy — the checked-in copy
+# always keeps it literally. Applying this file as-is pushes that literal
+# placeholder into the live Deployment spec, rolling the running container
+# image back to an unpullable string (caught live 2026-09-13, ROADMAP OPS-2,
+# on a sibling manifest with the same pattern). For a one-off live change,
+# patch the specific field — `kubectl set env` / `kubectl patch` (see
+# scripts/safe-kubectl-apply.sh, which refuses to apply any file still
+# containing this placeholder). To actually deploy a manifest change, push
+# it through 02-deploy.yml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -141,6 +152,14 @@ rules:
 # to even call these APIs).
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingresses"]
+  verbs: ["list", "get"]
+# ROADMAP P30 phase 1 (ADR 0033) / OPS-14's own finding, taken as a lesson:
+# the whole point of the namespace-has-networkpolicy check is to report an
+# absence, so this grant is deliberately the narrowest verb set that check
+# needs — list/get, never watch/create/update/delete — and read-only,
+# matching every other rule in this ClusterRole.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
   verbs: ["list", "get"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways", "httproutes"]

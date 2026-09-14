@@ -57,6 +57,13 @@ type Config struct {
 	RemediationAuthToken              string
 	EvalAuthToken                     string
 
+	// Active-verification engagements (ROADMAP P30 phases 2-4, ADR 0033) —
+	// same propose/approve-gate shape as remediation above.
+	SecurityEngagementProposalTTLMinutes int
+	SecurityEngagementAuthToken          string
+	SecurityVerifierURL                  string // empty = dispatch fails closed to "failed", never silently skipped
+	SecurityVerifierToken                string
+
 	// Integration.Token Secrets Manager mode (ADR 0025). Empty (default)
 	// keeps every existing deployment's plaintext-token behavior unchanged;
 	// setting this to e.g. "agentify/dev/integrations" stores new/updated
@@ -108,6 +115,11 @@ func LoadFromEnv() (*Config, error) {
 		RemediationProposalTTLMinutes:     getEnvInt("REMEDIATION_PROPOSAL_TTL_MINUTES", 30),
 		RemediationAuthToken:              getEnv("REMEDIATION_AUTH_TOKEN", ""),
 		EvalAuthToken:                     getEnv("EVAL_AUTH_TOKEN", ""),
+
+		SecurityEngagementProposalTTLMinutes: getEnvInt("SECURITY_ENGAGEMENT_PROPOSAL_TTL_MINUTES", 30),
+		SecurityEngagementAuthToken:          getEnv("SECURITY_ENGAGEMENT_AUTH_TOKEN", ""),
+		SecurityVerifierURL:                  getEnv("SECURITY_VERIFIER_URL", ""),
+		SecurityVerifierToken:                getEnv("SECURITY_VERIFIER_TOKEN", ""),
 
 		IntegrationSecretsPrefix: getEnv("INTEGRATION_SECRETS_PREFIX", ""),
 	}

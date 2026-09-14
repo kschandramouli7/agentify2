@@ -30,6 +30,12 @@ from .health_snapshot import push_health
 from .ingress import build_ingress_entries, build_route_entries, correlate_gateway_routes, push_ingress
 from .inventory import push_inventory
 from .log_redaction import redact_log_text
+from .security_posture import (
+    build_ingress_tls_findings,
+    build_networkpolicy_findings,
+    build_pod_security_context_findings,
+    push_security_findings,
+)
 from .service_topology import (
     extract_external_mentions,
     extract_service_calls,
@@ -101,7 +107,9 @@ async def _scan_namespace(
         if not raw_logs:
             # Counted as sampled-but-unreadable, deliberately distinct from
             # "read it and found no mentions": an unreadable log is a platform
-            # problem (OPS-9 returns "" for every multi-container pod), while an
+            # problem (get_pod_logs already retried the ambiguous-container
+            # case itself — ROADMAP OPS-9 — so a still-empty result here means
+            # a real fetch failure, not a multi-container pod), while an
             # empty extraction is a real observation.
             continue
         coverage[from_service]["logs_readable"] += 1
@@ -189,6 +197,8 @@ async def _service_profiles(ns: str, services: List[Dict[str, Any]]) -> List[Dic
             "replicas_ready": (match or {}).get("replicas_ready"),
             "image": ((match or {}).get("images") or [None])[0],
             "schedule": (match or {}).get("schedule") or "",
+            # ADR 0032 — also already on hand via this same list_services call.
+            "expected_failure_reason": svc.get("expected_failure_reason") or "",
         })
     return profiles
 
@@ -272,6 +282,35 @@ async def _scan_ingress(namespaces: List[str], cfg: Config, caps: Optional[Dict[
         await push_ingress(entries, cfg.backend_url, cfg.collector_token)
 
 
+async def _scan_security_posture(namespaces: List[str], cfg: Config) -> None:
+    """Deployment security posture (ROADMAP P30 phase 1, ADR 0033). Pushed
+    per namespace, not batched across all of them like _scan_ingress —
+    matches the Hub's per-namespace-batch endpoint shape
+    (POST /api/security-findings takes one namespace per call, same as
+    scan-coverage's).
+
+    UpsertSecurityFindings treats each push as this namespace's *complete*
+    truth for the cycle and resolves anything missing from it — so if one
+    check errors partway through, the resulting (incomplete) findings list
+    would look like "these issues no longer exist" to the Hub, silently
+    resolving findings from a check that simply never ran. The whole
+    namespace's push is therefore skipped, not partially sent, on any check
+    failure — same "no edges rather than unvalidated ones" discipline
+    _scan_inventory already uses for cross-namespace mining. One namespace
+    failing still leaves every other namespace's push independent.
+    """
+    for ns in namespaces:
+        findings: List[Dict[str, str]] = []
+        try:
+            findings.extend(build_networkpolicy_findings(ns, await k8s_client.list_network_policy_count(ns)))
+            findings.extend(build_pod_security_context_findings(ns, await k8s_client.list_pod_security_contexts(ns)))
+            findings.extend(build_ingress_tls_findings(ns, await k8s_client.list_ingresses(ns)))
+        except Exception:  # noqa: BLE001
+            logger.exception("security posture scan failed for namespace=%s — skipping this cycle's push", ns)
+            continue
+        await push_security_findings(ns, findings, cfg.backend_url, cfg.collector_token)
+
+
 async def _scan_health(namespaces: List[str], cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
     """Fleet-wide health/version snapshot (ROADMAP P18 use case #5). Sums
     pod readiness across every namespace and pairs it with the K8s server
@@ -348,6 +387,10 @@ async def _scan_once(cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
         await _scan_certificates(namespaces, cfg)
     except Exception:
         logger.exception("certificate scan failed")
+    try:
+        await _scan_security_posture(namespaces, cfg)
+    except Exception:
+        logger.exception("security posture scan failed")
     # Every namespace's REAL Service names, so a "<service>.<namespace>"
     # mention is validated on BOTH segments. Validating only the namespace let
     # a trace UUID through as a service name on 2026-09-05 — the same class of

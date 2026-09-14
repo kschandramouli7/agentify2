@@ -1,3 +1,15 @@
+# TEMPLATE — DO NOT `kubectl apply -f` THIS FILE DIRECTLY.
+# The image tag/registry (ACCOUNT_ID.dkr.ecr...) below is a placeholder that
+# 02-deploy.yml sed's into a real value on every deploy — the checked-in copy
+# always keeps it literally. Applying this file as-is pushes that literal
+# placeholder into the live Deployment spec, rolling the running container
+# image back to an unpullable string (caught live 2026-09-13, ROADMAP OPS-2,
+# on a sibling manifest with the same pattern). For a one-off live change,
+# patch the specific field — `kubectl set env` / `kubectl patch` (see
+# scripts/safe-kubectl-apply.sh, which refuses to apply any file still
+# containing this placeholder). To actually deploy a manifest change, push
+# it through 02-deploy.yml.
+#
 # ServiceAccount so the Vault Agent Injector can authenticate this pod to Vault.
 apiVersion: v1
 kind: ServiceAccount

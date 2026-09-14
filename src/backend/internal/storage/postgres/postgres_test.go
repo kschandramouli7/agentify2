@@ -61,7 +61,7 @@ func TestPostgresStores(t *testing.T) {
 		mustStore(t, cs, pod, "pod-b", map[string]interface{}{"pod_id": "pod-b", "ready": true, "restarts": float64(0)})
 
 		// scan: 2 distinct entities (pod-a deduped by upsert).
-		rows, err := cs.Query(ctx, pod, map[string]interface{}{})
+		rows, err := cs.Query(ctx, DefaultTenantID, pod, map[string]interface{}{})
 		if err != nil {
 			t.Fatalf("scan: %v", err)
 		}
@@ -70,7 +70,7 @@ func TestPostgresStores(t *testing.T) {
 		}
 
 		// point lookup pod-a: payload must be a map and reflect the latest write.
-		one, err := cs.Query(ctx, pod, map[string]interface{}{"key": "pod-a"})
+		one, err := cs.Query(ctx, DefaultTenantID, pod, map[string]interface{}{"key": "pod-a"})
 		if err != nil || len(one) != 1 {
 			t.Fatalf("point lookup: err=%v rows=%d", err, len(one))
 		}
@@ -97,7 +97,7 @@ func TestPostgresStores(t *testing.T) {
 				t.Fatalf("event store: %v", err)
 			}
 		}
-		rows, err := client.Query(ctx, pod, nil)
+		rows, err := client.Query(ctx, DefaultTenantID, pod, nil)
 		if err != nil || len(rows) != 2 {
 			t.Fatalf("event query: err=%v rows=%d", err, len(rows))
 		}
@@ -290,7 +290,7 @@ func TestPostgresStores(t *testing.T) {
 			"pod_id": "order-worker-def456-ab1c3", "ready": true,
 		})
 
-		entities, err := cs.TrackedEntities(ctx)
+		entities, err := cs.TrackedEntities(ctx, DefaultTenantID)
 		if err != nil {
 			t.Fatalf("TrackedEntities: %v", err)
 		}
@@ -806,6 +806,168 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ADR 0032: expected_failure_reason joins in from cluster_services and reconciles on re-push", func(t *testing.T) {
+		// The reason lives on cluster_services (one row per Service, written
+		// only by Discovery's live scan), never on service_dependencies
+		// itself — ListServiceDependencies looks it up by (tenant_id,
+		// cluster_id, namespace, service = to_service) at read time. This
+		// pins three things: (1) an edge with no matching cluster_services
+		// row at all still returns normally, with an empty reason (the LEFT
+		// JOIN must never drop a row); (2) once the destination Service is
+		// upserted with a reason, every edge targeting it picks the reason up
+		// without any change to service_dependencies; (3) a later
+		// UpsertClusterServices push that omits the reason clears it on the
+		// next read — same full-replace-per-cycle semantics as every other
+		// cluster_services column, proving this isn't stuck "sticky" once set.
+		tenantID := uuid.New().String()
+
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "annot-caller", "annot-target", "service", 443, "failure"); err != nil {
+			t.Fatalf("upsert edge: %v", err)
+		}
+
+		findEdge := func() ServiceDependency {
+			t.Helper()
+			deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+			if err != nil {
+				t.Fatalf("list dependencies: %v", err)
+			}
+			for _, d := range deps {
+				if d.FromService == "annot-caller" && d.ToService == "annot-target" {
+					return d
+				}
+			}
+			t.Fatalf("edge annot-caller->annot-target not found in %+v", deps)
+			return ServiceDependency{}
+		}
+
+		if got := findEdge().ExpectedFailureReason; got != "" {
+			t.Fatalf("before any cluster_services push, want empty reason, got %q", got)
+		}
+
+		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]ServiceEntry{
+			"payments": {{
+				Name: "annot-target", Selector: map[string]string{"app": "annot-target"},
+				ExpectedFailureReason: "test fixture, no listener by design",
+			}},
+		}); err != nil {
+			t.Fatalf("upsert cluster_services with reason: %v", err)
+		}
+		if got, want := findEdge().ExpectedFailureReason, "test fixture, no listener by design"; got != want {
+			t.Errorf("after annotating the destination service, reason = %q, want %q", got, want)
+		}
+
+		// Re-push without the reason (annotation removed on the Service) —
+		// UpsertClusterServices deletes-then-reinserts per cluster, so this
+		// must clear it, not leave the old value stuck.
+		if err := client.UpsertClusterServices(ctx, tenantID, "cluster-a", map[string][]ServiceEntry{
+			"payments": {{Name: "annot-target", Selector: map[string]string{"app": "annot-target"}}},
+		}); err != nil {
+			t.Fatalf("re-upsert cluster_services without reason: %v", err)
+		}
+		if got := findEdge().ExpectedFailureReason; got != "" {
+			t.Errorf("after removing the annotation, reason = %q, want empty (reconciled)", got)
+		}
+	})
+
+	t.Run("ROADMAP P30 phase 1 (ADR 0033): security findings upsert, and resolve-on-disappear semantics", func(t *testing.T) {
+		tenantID := uuid.New().String()
+		ns := "security-test-payments"
+
+		findByKey := func(deps []SecurityFinding, checkID, resourceName string) (SecurityFinding, bool) {
+			for _, f := range deps {
+				if f.CheckID == checkID && f.ResourceName == resourceName {
+					return f, true
+				}
+			}
+			return SecurityFinding{}, false
+		}
+
+		// Cycle 1: two findings.
+		if err := client.UpsertSecurityFindings(ctx, tenantID, "cluster-a", ns, []SecurityFinding{
+			{CheckID: "namespace-has-networkpolicy", ResourceKind: "Namespace", ResourceName: ns, Severity: "high", Evidence: "0 NetworkPolicy objects"},
+			{CheckID: "ingress-missing-tls", ResourceKind: "Ingress", ResourceName: "shop-ingress", Severity: "critical", Evidence: "no tls block"},
+		}); err != nil {
+			t.Fatalf("cycle 1 upsert: %v", err)
+		}
+		list, err := client.ListSecurityFindings(ctx, tenantID, ns)
+		if err != nil {
+			t.Fatalf("list after cycle 1: %v", err)
+		}
+		if len(list) != 2 {
+			t.Fatalf("want 2 findings after cycle 1, got %d: %+v", len(list), list)
+		}
+		npFinding, ok := findByKey(list, "namespace-has-networkpolicy", ns)
+		if !ok || npFinding.Status != "open" || npFinding.Confidence != "config-only" {
+			t.Fatalf("networkpolicy finding after cycle 1: %+v (ok=%v)", npFinding, ok)
+		}
+		firstSeenCycle1 := npFinding.FirstSeen
+
+		// Cycle 2: NetworkPolicy issue persists (re-pushed), Ingress TLS issue
+		// fixed (not re-pushed) — must resolve without deleting, and must not
+		// reset first_seen for the still-open finding.
+		if err := client.UpsertSecurityFindings(ctx, tenantID, "cluster-a", ns, []SecurityFinding{
+			{CheckID: "namespace-has-networkpolicy", ResourceKind: "Namespace", ResourceName: ns, Severity: "high", Evidence: "0 NetworkPolicy objects"},
+		}); err != nil {
+			t.Fatalf("cycle 2 upsert: %v", err)
+		}
+		list, err = client.ListSecurityFindings(ctx, tenantID, ns)
+		if err != nil {
+			t.Fatalf("list after cycle 2: %v", err)
+		}
+		if len(list) != 2 {
+			t.Fatalf("want 2 rows after cycle 2 (resolved, not deleted), got %d: %+v", len(list), list)
+		}
+		tlsFinding, ok := findByKey(list, "ingress-missing-tls", "shop-ingress")
+		if !ok {
+			t.Fatalf("ingress finding disappeared entirely (should be resolved, not deleted): %+v", list)
+		}
+		if tlsFinding.Status != "resolved" {
+			t.Errorf("ingress finding status = %q, want resolved", tlsFinding.Status)
+		}
+		npFinding, ok = findByKey(list, "namespace-has-networkpolicy", ns)
+		if !ok || npFinding.Status != "open" {
+			t.Fatalf("networkpolicy finding after cycle 2: %+v (ok=%v), want still open", npFinding, ok)
+		}
+		if !npFinding.FirstSeen.Equal(firstSeenCycle1) {
+			t.Errorf("first_seen changed across cycles: %v -> %v, want unchanged", firstSeenCycle1, npFinding.FirstSeen)
+		}
+
+		// Cycle 3: the Ingress TLS issue regresses (re-pushed after being
+		// resolved) — must flip back to open, not stay stuck resolved.
+		if err := client.UpsertSecurityFindings(ctx, tenantID, "cluster-a", ns, []SecurityFinding{
+			{CheckID: "namespace-has-networkpolicy", ResourceKind: "Namespace", ResourceName: ns, Severity: "high", Evidence: "0 NetworkPolicy objects"},
+			{CheckID: "ingress-missing-tls", ResourceKind: "Ingress", ResourceName: "shop-ingress", Severity: "critical", Evidence: "tls block removed again"},
+		}); err != nil {
+			t.Fatalf("cycle 3 upsert: %v", err)
+		}
+		list, err = client.ListSecurityFindings(ctx, tenantID, ns)
+		if err != nil {
+			t.Fatalf("list after cycle 3: %v", err)
+		}
+		tlsFinding, ok = findByKey(list, "ingress-missing-tls", "shop-ingress")
+		if !ok || tlsFinding.Status != "open" {
+			t.Fatalf("ingress finding after regression: %+v (ok=%v), want open again", tlsFinding, ok)
+		}
+
+		// Cycle 4: empty push (namespace passed every check) — everything
+		// still open must resolve.
+		if err := client.UpsertSecurityFindings(ctx, tenantID, "cluster-a", ns, nil); err != nil {
+			t.Fatalf("cycle 4 (empty) upsert: %v", err)
+		}
+		list, err = client.ListSecurityFindings(ctx, tenantID, ns)
+		if err != nil {
+			t.Fatalf("list after cycle 4: %v", err)
+		}
+		if len(list) != 2 {
+			t.Fatalf("want 2 rows after cycle 4 (both resolved, not deleted), got %d: %+v", len(list), list)
+		}
+		for _, f := range list {
+			if f.Status != "resolved" {
+				t.Errorf("finding %s/%s status = %q after empty push, want resolved", f.CheckID, f.ResourceName, f.Status)
+			}
+		}
+	})
+
 	t.Run("ROADMAP P18 use case #5: cluster_health_snapshots overwrites in place, fleet-wide listing surfaces every cluster", func(t *testing.T) {
 		tenantID := uuid.New().String()
 
@@ -883,8 +1045,14 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	// Grants are explicit per table, so a new RLS-enabled table needs one here
 	// AND in whatever provisions the production role — an omitted grant fails
 	// closed (permission denied) rather than open, which is the right way round.
+	// cluster_services is SELECT-only here (ADR 0032): ListServiceDependencies
+	// now LEFT JOINs it to look up expected_failure_reason, so this restricted
+	// role needs read access to it even though this test never writes to it.
 	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON service_dependencies, scan_coverage TO rls_test_app`); err != nil {
 		t.Fatalf("grant restricted test role: %v", err)
+	}
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT ON cluster_services TO rls_test_app`); err != nil {
+		t.Fatalf("grant restricted test role read access to cluster_services: %v", err)
 	}
 	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
 	if err != nil {
@@ -981,6 +1149,469 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	}
 }
 
+// TestCurrentStateTenantIsolation proves ROADMAP OPS-10's fix (ADR 0022
+// amendment) actually isolates tenants, not just that it compiles — same
+// restricted-role method as TestServiceDependencyTenantIsolation above (the
+// embedded-postgres bootstrap connection is a superuser and always bypasses
+// RLS, so testing through it would prove nothing). Exercises all three
+// current_state readers/writer: CurrentState.Store, CurrentState.Query,
+// CurrentState.TrackedEntities, and Client.ListServiceHealth.
+func TestCurrentStateTenantIsolation(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+
+	if _, err := client.db.ExecContext(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rls_test_app') THEN
+				CREATE ROLE rls_test_app LOGIN PASSWORD 'rls_test_app' NOSUPERUSER;
+			END IF;
+		END $$;
+	`); err != nil {
+		t.Fatalf("create restricted test role: %v", err)
+	}
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON current_state TO rls_test_app`); err != nil {
+		t.Fatalf("grant restricted test role: %v", err)
+	}
+	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
+	if err != nil {
+		t.Fatalf("open restricted-role connection: %v", err)
+	}
+	defer appDB.Close()
+	appClient := &Client{db: appDB, logger: client.logger}
+	cs := &CurrentState{db: appDB, logger: client.logger}
+
+	tenantA := uuid.New().String()
+	tenantB := uuid.New().String()
+	// Different pod_ids, deliberately — current_state's PRIMARY KEY is
+	// (pod_id, entity_key) with no tenant_id in it, and ADR 0024's PodID
+	// helper embeds cluster_id into pod_id, so two different tenants (who by
+	// construction never share a cluster_id) can never collide on pod_id in
+	// practice. What genuinely CAN collide across tenants is the NAMESPACE
+	// NAME inside the shard — "payments" is a good example, and reused here
+	// on purpose — which is exactly the case ListServiceHealth/TrackedEntities
+	// below actually need the RLS backstop for, since they aggregate by
+	// namespace/whole-table rather than by a single pod_id.
+	podA := "k8fy.live-state.cluster-a.payments"
+	podB := "k8fy.live-state.cluster-b.payments"
+
+	storeFor := func(tenantID, pod, entityKey, service string, ready bool) {
+		if _, err := cs.Store(ctx, pod, map[string]interface{}{
+			"entity_key":      entityKey,
+			"event_namespace": "k8fy.live-state",
+			"type":            "pod_modified",
+			"source":          "kubernetes-api",
+			"tenant_id":       tenantID,
+			"payload": map[string]interface{}{
+				"pod_id": entityKey, "service": service, "namespace": "payments",
+				"ready": ready, "restarts": float64(0), "phase": "Running",
+			},
+		}); err != nil {
+			t.Fatalf("store for tenant %s: %v", tenantID, err)
+		}
+	}
+	storeFor(tenantA, podA, "worker-abc123", "a-only-service", true)
+	storeFor(tenantB, podB, "worker-def456", "b-only-service", false)
+
+	// CurrentState.Query: a wildcard scan of tenant A's own pod_id. Not a
+	// cross-tenant proof by itself (podA/podB already differ), but confirms
+	// the RLS-wrapped read path still returns a caller's own data correctly.
+	rowsA, err := cs.Query(ctx, tenantA, podA, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("tenant A query: %v", err)
+	}
+	if len(rowsA) != 1 {
+		t.Fatalf("tenant A: want 1 row, got %d: %+v", len(rowsA), rowsA)
+	}
+	payloadA, _ := rowsA[0]["payload"].(map[string]interface{})
+	if payloadA["service"] != "a-only-service" {
+		t.Errorf("tenant A query returned wrong row: %+v", payloadA)
+	}
+
+	// Tenant B querying tenant A's pod_id directly (e.g. a guessed or leaked
+	// shard name) must see nothing — THIS is the real cross-tenant proof.
+	rowsCross, err := cs.Query(ctx, tenantB, podA, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("tenant B querying tenant A's pod_id: %v", err)
+	}
+	if len(rowsCross) != 0 {
+		t.Fatalf("tenant B saw tenant A's row via its pod_id: %+v", rowsCross)
+	}
+
+	// TrackedEntities: the widest-blast-radius reader (whole-table, no
+	// pod_id key at all) — the one that had NO tenant filtering whatsoever
+	// before this fix.
+	entitiesA, err := cs.TrackedEntities(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("tenant A TrackedEntities: %v", err)
+	}
+	for _, e := range entitiesA {
+		if e == "payments/b-only-service" {
+			t.Fatalf("tenant A's TrackedEntities leaked tenant B's entity: %v", entitiesA)
+		}
+	}
+
+	// ListServiceHealth: already had its own manual WHERE clause pre-fix;
+	// this proves the added setTenantContext didn't turn that into a
+	// silent always-empty result (the exact failure mode FORCE RLS would
+	// cause if a caller ever forgot to set the session variable).
+	healthA, err := appClient.ListServiceHealth(ctx, tenantA, "payments")
+	if err != nil {
+		t.Fatalf("tenant A ListServiceHealth: %v", err)
+	}
+	if len(healthA) != 1 || healthA[0].Service != "a-only-service" {
+		t.Fatalf("tenant A ListServiceHealth: want only a-only-service, got %+v", healthA)
+	}
+	healthB, err := appClient.ListServiceHealth(ctx, tenantB, "payments")
+	if err != nil {
+		t.Fatalf("tenant B ListServiceHealth: %v", err)
+	}
+	if len(healthB) != 1 || healthB[0].Service != "b-only-service" {
+		t.Fatalf("tenant B ListServiceHealth: want only b-only-service, got %+v", healthB)
+	}
+}
+
+// TestCurrentStateDelete is ROADMAP OPS-12's regression test for
+// CurrentState.Delete: a watch DELETED event must actually remove the row
+// (not merely stop being counted by a WHERE clause elsewhere), and the
+// delete itself must respect RLS — one tenant must not be able to delete
+// another tenant's row even by guessing its exact pod_id/entity_key.
+func TestCurrentStateDelete(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+
+	if _, err := client.db.ExecContext(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rls_test_app') THEN
+				CREATE ROLE rls_test_app LOGIN PASSWORD 'rls_test_app' NOSUPERUSER;
+			END IF;
+		END $$;
+	`); err != nil {
+		t.Fatalf("create restricted test role: %v", err)
+	}
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE, DELETE ON current_state TO rls_test_app`); err != nil {
+		t.Fatalf("grant restricted test role: %v", err)
+	}
+	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
+	if err != nil {
+		t.Fatalf("open restricted-role connection: %v", err)
+	}
+	defer appDB.Close()
+	cs := &CurrentState{db: appDB, logger: client.logger}
+
+	tenantA := uuid.New().String()
+	tenantB := uuid.New().String()
+	pod := "k8fy.live-state.payments"
+
+	if _, err := cs.Store(ctx, pod, map[string]interface{}{
+		"entity_key": "payment-api-abc", "event_namespace": "k8fy.live-state",
+		"type": "pod_modified", "source": "kubernetes-api", "tenant_id": tenantA,
+		"payload": map[string]interface{}{"pod_id": "payment-api-abc", "namespace": "payments", "ready": true},
+	}); err != nil {
+		t.Fatalf("seed tenant A row: %v", err)
+	}
+
+	// Tenant B deleting tenant A's exact (pod_id, entity_key) — RLS must make
+	// this affect zero rows, not actually delete it.
+	if err := cs.Delete(ctx, tenantB, pod, "payment-api-abc"); err != nil {
+		t.Fatalf("tenant B delete: %v", err)
+	}
+	stillThere, err := cs.Query(ctx, tenantA, pod, map[string]interface{}{"key": "payment-api-abc"})
+	if err != nil {
+		t.Fatalf("query after cross-tenant delete attempt: %v", err)
+	}
+	if len(stillThere) != 1 {
+		t.Fatalf("tenant B's delete must not have removed tenant A's row, got %d rows", len(stillThere))
+	}
+
+	// Tenant A deleting its own row must actually remove it.
+	if err := cs.Delete(ctx, tenantA, pod, "payment-api-abc"); err != nil {
+		t.Fatalf("tenant A delete: %v", err)
+	}
+	gone, err := cs.Query(ctx, tenantA, pod, map[string]interface{}{"key": "payment-api-abc"})
+	if err != nil {
+		t.Fatalf("query after tenant A's own delete: %v", err)
+	}
+	if len(gone) != 0 {
+		t.Fatalf("row should be gone after tenant A's own delete, got %+v", gone)
+	}
+
+	// Deleting an entity that was never stored (or already deleted) is not
+	// an error — idempotent delete, same convention as the rest of this
+	// codebase.
+	if err := cs.Delete(ctx, tenantA, pod, "never-existed"); err != nil {
+		t.Fatalf("delete of a nonexistent row should not error: %v", err)
+	}
+}
+
+// TestSecurityFindingsTenantIsolation proves ROADMAP P30 phase 1's
+// security_findings RLS actually isolates tenants (ADR 0033) — same
+// restricted-role method as TestServiceDependencyTenantIsolation/
+// TestCurrentStateTenantIsolation above, for the same reason: the embedded-
+// postgres bootstrap connection is a superuser and always bypasses RLS.
+func TestSecurityFindingsTenantIsolation(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+
+	if _, err := client.db.ExecContext(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rls_test_app') THEN
+				CREATE ROLE rls_test_app LOGIN PASSWORD 'rls_test_app' NOSUPERUSER;
+			END IF;
+		END $$;
+	`); err != nil {
+		t.Fatalf("create restricted test role: %v", err)
+	}
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON security_findings TO rls_test_app`); err != nil {
+		t.Fatalf("grant restricted test role: %v", err)
+	}
+	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
+	if err != nil {
+		t.Fatalf("open restricted-role connection: %v", err)
+	}
+	defer appDB.Close()
+	appClient := &Client{db: appDB, logger: client.logger}
+
+	tenantA := uuid.New().String()
+	tenantB := uuid.New().String()
+	// Same namespace name on purpose — like ListServiceHealth's threat model,
+	// a namespace name is not globally unique, and RLS is what stops that
+	// collision from leaking findings across tenants.
+	ns := "payments"
+
+	if err := appClient.UpsertSecurityFindings(ctx, tenantA, "cluster-a", ns, []SecurityFinding{
+		{CheckID: "namespace-has-networkpolicy", ResourceKind: "Namespace", ResourceName: ns, Severity: "high", Evidence: "tenant A finding"},
+	}); err != nil {
+		t.Fatalf("tenant A upsert: %v", err)
+	}
+	if err := appClient.UpsertSecurityFindings(ctx, tenantB, "cluster-b", ns, []SecurityFinding{
+		{CheckID: "ingress-missing-tls", ResourceKind: "Ingress", ResourceName: "b-ingress", Severity: "critical", Evidence: "tenant B finding"},
+	}); err != nil {
+		t.Fatalf("tenant B upsert: %v", err)
+	}
+
+	listA, err := appClient.ListSecurityFindings(ctx, tenantA, ns)
+	if err != nil {
+		t.Fatalf("tenant A list: %v", err)
+	}
+	if len(listA) != 1 || listA[0].CheckID != "namespace-has-networkpolicy" {
+		t.Fatalf("tenant A: want only its own finding (RLS should hide tenant B's), got %+v", listA)
+	}
+	listB, err := appClient.ListSecurityFindings(ctx, tenantB, ns)
+	if err != nil {
+		t.Fatalf("tenant B list: %v", err)
+	}
+	if len(listB) != 1 || listB[0].CheckID != "ingress-missing-tls" {
+		t.Fatalf("tenant B: want only its own finding (RLS should hide tenant A's), got %+v", listB)
+	}
+}
+
+// TestSecurityEngagementsTenantIsolation proves ROADMAP P30 phase 2's
+// security_engagements RLS actually isolates tenants (ADR 0033) — built
+// from its first migration, unlike remediation_proposals' retrofit, so this
+// is a "prove it was done right from day one" test, not a regression test
+// for a discovered gap.
+func TestSecurityEngagementsTenantIsolation(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+
+	if _, err := client.db.ExecContext(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rls_test_app') THEN
+				CREATE ROLE rls_test_app LOGIN PASSWORD 'rls_test_app' NOSUPERUSER;
+			END IF;
+		END $$;
+	`); err != nil {
+		t.Fatalf("create restricted test role: %v", err)
+	}
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON security_engagements TO rls_test_app`); err != nil {
+		t.Fatalf("grant restricted test role: %v", err)
+	}
+	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
+	if err != nil {
+		t.Fatalf("open restricted-role connection: %v", err)
+	}
+	defer appDB.Close()
+	appClient := &Client{db: appDB, logger: client.logger}
+
+	tenantA := uuid.New().String()
+	tenantB := uuid.New().String()
+
+	engA := &SecurityEngagement{
+		ID: uuid.New().String(), TenantID: tenantA, ClusterID: "cluster-a", Phase: 2,
+		Technique: "confirm-http-reachable", TargetNamespace: "payments",
+		TargetCheckID: "ingress-missing-tls", TargetResourceKind: "Ingress", TargetResourceName: "a-ingress",
+		RequestedBy: "alice", ExpiresAt: time.Now().Add(30 * time.Minute),
+	}
+	if err := appClient.CreateSecurityEngagement(ctx, engA); err != nil {
+		t.Fatalf("tenant A create: %v", err)
+	}
+	engB := &SecurityEngagement{
+		ID: uuid.New().String(), TenantID: tenantB, ClusterID: "cluster-b", Phase: 2,
+		Technique: "confirm-http-reachable", TargetNamespace: "payments",
+		TargetCheckID: "ingress-missing-tls", TargetResourceKind: "Ingress", TargetResourceName: "b-ingress",
+		RequestedBy: "bob", ExpiresAt: time.Now().Add(30 * time.Minute),
+	}
+	if err := appClient.CreateSecurityEngagement(ctx, engB); err != nil {
+		t.Fatalf("tenant B create: %v", err)
+	}
+
+	listA, err := appClient.ListSecurityEngagements(ctx, tenantA, "", 100)
+	if err != nil {
+		t.Fatalf("tenant A list: %v", err)
+	}
+	if len(listA) != 1 || listA[0].ID != engA.ID {
+		t.Fatalf("tenant A: want only its own engagement (RLS should hide tenant B's), got %+v", listA)
+	}
+
+	// Tenant B cannot fetch tenant A's engagement by ID even with the right ID.
+	if _, err := appClient.GetSecurityEngagement(ctx, tenantB, engA.ID); err == nil {
+		t.Fatalf("tenant B should not be able to read tenant A's engagement by ID, but no error was returned")
+	}
+	gotA, err := appClient.GetSecurityEngagement(ctx, tenantA, engA.ID)
+	if err != nil || gotA.ID != engA.ID {
+		t.Fatalf("tenant A should read its own engagement: got %+v, err=%v", gotA, err)
+	}
+
+	// Cross-tenant decide affects zero rows — RLS hides the row entirely
+	// rather than the WHERE clause simply not matching it.
+	ok, err := appClient.DecideSecurityEngagement(ctx, tenantB, engA.ID, "approved", "mallory")
+	if err != nil {
+		t.Fatalf("cross-tenant decide: %v", err)
+	}
+	if ok {
+		t.Fatalf("tenant B must not be able to decide tenant A's engagement")
+	}
+}
+
+// TestSecurityEngagementDecideAndComplete exercises the propose->approve->
+// complete lifecycle end to end, including the single-shot idempotency
+// guard (DecideRemediationProposal's own pattern) and CompleteSecurityEngagement's
+// atomic finding-confidence update — the one piece of behaviour that makes
+// Phase 2 actually useful (an approved, dispatched, successful check must
+// flip the finding's confidence from config-only to confirmed-live).
+func TestSecurityEngagementDecideAndComplete(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+	tenantID := uuid.New().String()
+	clusterID := "cluster-x"
+	ns := "payments"
+
+	if err := client.UpsertSecurityFindings(ctx, tenantID, clusterID, ns, []SecurityFinding{
+		{CheckID: "ingress-missing-tls", ResourceKind: "Ingress", ResourceName: "x-ingress",
+			Severity: "critical", Evidence: "no TLS configured", TargetHost: "x-ingress.payments.svc"},
+	}); err != nil {
+		t.Fatalf("seed finding: %v", err)
+	}
+
+	eng := &SecurityEngagement{
+		ID: uuid.New().String(), TenantID: tenantID, ClusterID: clusterID, Phase: 2,
+		Technique: "confirm-http-reachable", TargetNamespace: ns,
+		TargetCheckID: "ingress-missing-tls", TargetResourceKind: "Ingress", TargetResourceName: "x-ingress",
+		RequestedBy: "alice", ExpiresAt: time.Now().Add(30 * time.Minute),
+	}
+	if err := client.CreateSecurityEngagement(ctx, eng); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := client.GetSecurityEngagement(ctx, tenantID, eng.ID)
+	if err != nil || got.Status != "pending" {
+		t.Fatalf("new engagement should be pending: %+v, err=%v", got, err)
+	}
+
+	// First approve succeeds.
+	ok, err := client.DecideSecurityEngagement(ctx, tenantID, eng.ID, "approved", "alice")
+	if err != nil || !ok {
+		t.Fatalf("first approve should succeed: ok=%v err=%v", ok, err)
+	}
+	// A second decide (duplicate click / retry) affects zero rows — the
+	// single-shot WHERE status='pending' guard, same as remediation's.
+	ok, err = client.DecideSecurityEngagement(ctx, tenantID, eng.ID, "rejected", "bob")
+	if err != nil {
+		t.Fatalf("second decide errored: %v", err)
+	}
+	if ok {
+		t.Fatalf("second decide on an already-decided engagement must be a no-op (ok=false), got ok=true")
+	}
+	got, err = client.GetSecurityEngagement(ctx, tenantID, eng.ID)
+	if err != nil || got.Status != "approved" {
+		t.Fatalf("status must still be 'approved' after the no-op second decide, got %+v, err=%v", got, err)
+	}
+
+	// Complete with a definitive confirmed=true result: the target finding's
+	// confidence must flip to confirmed-live in the same transaction.
+	confirmed := true
+	if err := client.CompleteSecurityEngagement(ctx, tenantID, eng.ID, "completed",
+		map[string]interface{}{"http_status": 200}, "", &confirmed); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	got, err = client.GetSecurityEngagement(ctx, tenantID, eng.ID)
+	if err != nil || got.Status != "completed" || got.Result["http_status"] != float64(200) {
+		t.Fatalf("engagement should be completed with result recorded: %+v, err=%v", got, err)
+	}
+	finding, err := client.GetSecurityFinding(ctx, tenantID, ns, "ingress-missing-tls", "Ingress", "x-ingress")
+	if err != nil {
+		t.Fatalf("get finding: %v", err)
+	}
+	if finding.Confidence != "confirmed-live" {
+		t.Fatalf("finding confidence should flip to confirmed-live, got %q", finding.Confidence)
+	}
+	if finding.VerifiedByEngagementID != eng.ID {
+		t.Fatalf("finding should record which engagement verified it, got %q want %q", finding.VerifiedByEngagementID, eng.ID)
+	}
+}
+
+// TestSecurityEngagementCompleteWithNilConfirmed proves an inconclusive
+// dispatch (network error, timeout — the verifier never reached a
+// definitive answer) leaves the target finding's confidence untouched at
+// config-only, per CompleteSecurityEngagement's own doc comment: an
+// inconclusive check must never masquerade as a verified one.
+func TestSecurityEngagementCompleteWithNilConfirmed(t *testing.T) {
+	client := startEmbedded(t)
+	ctx := context.Background()
+	tenantID := uuid.New().String()
+	clusterID := "cluster-y"
+	ns := "payments"
+
+	if err := client.UpsertSecurityFindings(ctx, tenantID, clusterID, ns, []SecurityFinding{
+		{CheckID: "ingress-missing-tls", ResourceKind: "Ingress", ResourceName: "y-ingress",
+			Severity: "critical", Evidence: "no TLS configured", TargetHost: "y-ingress.payments.svc"},
+	}); err != nil {
+		t.Fatalf("seed finding: %v", err)
+	}
+
+	eng := &SecurityEngagement{
+		ID: uuid.New().String(), TenantID: tenantID, ClusterID: clusterID, Phase: 2,
+		Technique: "confirm-http-reachable", TargetNamespace: ns,
+		TargetCheckID: "ingress-missing-tls", TargetResourceKind: "Ingress", TargetResourceName: "y-ingress",
+		RequestedBy: "alice", ExpiresAt: time.Now().Add(30 * time.Minute),
+	}
+	if err := client.CreateSecurityEngagement(ctx, eng); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := client.DecideSecurityEngagement(ctx, tenantID, eng.ID, "approved", "alice"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	if err := client.CompleteSecurityEngagement(ctx, tenantID, eng.ID, "failed",
+		map[string]interface{}{}, "dial tcp: connection refused", nil); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	finding, err := client.GetSecurityFinding(ctx, tenantID, ns, "ingress-missing-tls", "Ingress", "y-ingress")
+	if err != nil {
+		t.Fatalf("get finding: %v", err)
+	}
+	if finding.Confidence != "config-only" {
+		t.Fatalf("an inconclusive completion must not change confidence from config-only, got %q", finding.Confidence)
+	}
+	if finding.VerifiedByEngagementID != "" {
+		t.Fatalf("an inconclusive completion must not stamp verified_by_engagement_id, got %q", finding.VerifiedByEngagementID)
+	}
+}
+
 func TestEventsWindowedQuery(t *testing.T) {
 	client := startEmbedded(t)
 	ctx := context.Background()
@@ -1012,7 +1643,7 @@ func TestEventsWindowedQuery(t *testing.T) {
 
 	// Window 14:05–14:25, entity pod-x, chronological: expect the 14:10 and 14:20
 	// samples only (excludes 14:00 boundary-before, 14:30 after, and pod-y).
-	rows, err := client.Query(ctx, pod, map[string]interface{}{
+	rows, err := client.Query(ctx, DefaultTenantID, pod, map[string]interface{}{
 		"since":  "2026-06-05T14:05:00Z",
 		"until":  "2026-06-05T14:25:00Z",
 		"entity": "pod-x",
@@ -1032,7 +1663,7 @@ func TestEventsWindowedQuery(t *testing.T) {
 	}
 
 	// Entity filter alone for pod-x: all 4 samples, recent-first by default.
-	all, err := client.Query(ctx, pod, map[string]interface{}{"entity": "pod-x"})
+	all, err := client.Query(ctx, DefaultTenantID, pod, map[string]interface{}{"entity": "pod-x"})
 	if err != nil || len(all) != 4 {
 		t.Fatalf("entity query: err=%v rows=%d (want 4)", err, len(all))
 	}
@@ -1041,7 +1672,7 @@ func TestEventsWindowedQuery(t *testing.T) {
 	}
 
 	// limit clamps result count.
-	lim, err := client.Query(ctx, pod, map[string]interface{}{"entity": "pod-x", "limit": float64(2)})
+	lim, err := client.Query(ctx, DefaultTenantID, pod, map[string]interface{}{"entity": "pod-x", "limit": float64(2)})
 	if err != nil || len(lim) != 2 {
 		t.Fatalf("limit query: err=%v rows=%d (want 2)", err, len(lim))
 	}
@@ -1082,7 +1713,7 @@ func TestPurgeOlderThan(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("purged %d rows, want 2", n)
 	}
-	rows, err := client.Query(ctx, pod, nil)
+	rows, err := client.Query(ctx, DefaultTenantID, pod, nil)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("after purge: err=%v rows=%d (want 1)", err, len(rows))
 	}

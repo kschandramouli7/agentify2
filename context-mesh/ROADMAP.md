@@ -19,7 +19,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | # | Item | Status | Lands in |
 |---|------|--------|----------|
 | **P1** | Two-tier query path (deterministic fast-path + agentic) | **✅ Done (validated 2026-06-01: health query 13.3s→1ms, 0 LLM calls)** | [ADR 0006](decisions/0006-two-tier-query-path.md) |
-| **P2a** | Egress / redaction / data-governance gate | **✅ v1 done (2026-06-01: allowlist redaction live; in-region client = follow-up)** | [ADR 0007](decisions/0007-egress-data-governance.md) + [policy](policies/data-governance.md) |
+| **P2a** | Egress / redaction / data-governance gate | **✅ v1 done (2026-06-01: allowlist redaction live; in-region client = follow-up).** **Widened 2026-09-14** ([ADR 0007 amendment](decisions/0007-egress-data-governance.md#amendment-2026-09-14--the-operators-question-is-now-in-scope-pii-coverage-widens-and-a-real-enforcement-gap-was-found)) — the operator's question is now denylist-redacted before every egress (LLM prompt, Langfuse trace), PII coverage widens past email-only (phone, credit card, IP, more key shapes), and a `claude_client.py` backstop catches what upstream call sites miss. A real enforcement gap (`incident_embeddings.summary` stored unredacted) was found in the same pass — tracked as **OPS-13**, a bug fix against already-adopted policy, not part of this widening | [ADR 0007](decisions/0007-egress-data-governance.md) + [policy](policies/data-governance.md) |
 | **P2b** | Collapse storage to a single **Postgres** store (Redis removed; pgvector deferred) | **✅ v1 done (2026-06-02: current_state+events tables; validated on real PG via embedded-postgres)** | [ADR 0010](decisions/0010-postgres-single-store.md) + [storage-strategy](policies/storage-strategy.md) |
 | **P2c** | Multi-provider / per-tenant model routing (in-region: Bedrock/Vertex/Foundry) | Proposed — **deferred until a client requires it** | [ADR 0008](decisions/0008-multi-provider-model-routing.md); now per-**deployment** (P3a resolved) |
 | **P3a** | Multi-tenancy / isolation model | **Superseded 2026-08-02 — ADR 0009's single-tenant-per-deployment call reversed by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md): row-level `tenant_id` + Postgres RLS** | [ADR 0009](decisions/0009-tenancy-single-tenant-per-deployment.md) (superseded), [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md) |
@@ -51,9 +51,10 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **still blocked on P27 phase 2**: no port is stored, so a generated policy could only say `allow all ports`. P21's coverage floor is the second prerequisite | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 2 SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)) — outcome (success/failure/timeout) and port now captured by all three producers; `service_dependencies` splits rows by port and carries outcome counters. **The Health-weighted graph UI payoff also shipped the same day** (`docs/SERVICE_DEPENDENCIES.md`'s "How it is coloured" section) — edges reuse the existing crit/warn status tokens, silent below 3 classified observations; **P24 remains explicitly deferred, not a current priority.** **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 4, 5 not started. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file, [ADR 0031](decisions/0031-edge-outcome-and-port-capture.md) — **phases 1 and 3 shipped with no ADR.** One is still owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
+| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 2 SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)) — outcome (success/failure/timeout) and port now captured by all three producers; `service_dependencies` splits rows by port and carries outcome counters. **The Health-weighted graph UI payoff also shipped the same day** (`docs/SERVICE_DEPENDENCIES.md`'s "How it is coloured" section) — edges reuse the existing crit/warn status tokens, silent below 3 classified observations; **P24 remains explicitly deferred, not a current priority.** **Phase 2b SHIPPED 2026-09-13** ([ADR 0032](decisions/0032-expected-failure-annotation-for-dependency-health.md)) — a `agentify.io/expected-failure` Service annotation, read by Discovery's live scan and joined in at read time, excludes a destination's edges from the unhealthy banner without touching its rendered colour, count, or tooltip; per-service scope, not per-edge. **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 4, 5 not started. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file, [ADR 0031](decisions/0031-edge-outcome-and-port-capture.md) — **phases 1 and 3 shipped with no ADR.** One is still owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 | **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
 | **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | Proposed (2026-09-12) — **two complementary halves: a path-filtered view of the mined graph (needs P27 phase 4, achievable), and an on-demand raw-log search keyed by trace ID/URL text (buildable on the existing Glue/Athena store; bounded by whether onboarded services already log a trace ID — not audited)** | this file — ADR at implementation |
+| **P30** | **Deployment Security Posture, staged toward active verification** — Phase 1 assesses the OWN cluster's security posture (NetworkPolicy coverage, pod securityContext, Ingress TLS) from what Discovery already reads, read-only, same evidence-based framing as P21; Phases 2-4 (named future direction) add engagement-gated active verification, exploitability checks, and eventually full pentest orchestration | **Phase 1 SHIPPED 2026-09-14** ([ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md)) — three checks (`namespace-has-networkpolicy`, `pod-security-context`, `ingress-missing-tls`), `security_findings` table with RLS from its first migration, `POST`/`GET /api/security-findings`, and a new "Security Posture" panel. **Promotes [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)'s use case #8**, flagged 2026-08-02. RBAC-surface scanning and CI/CD-visible findings (mutable ECR tags, no scan gate, EKS admin exposure) explicitly deferred, not part of Phase 1. Phases 2-4 intentionally not scheduled | [ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md) |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
@@ -2361,6 +2362,29 @@ conservative and returns "unknown" often — no per-field capture-rate
 denominator); the UI's ≥3-observations threshold and explicit "—" cells
 mitigate this but don't measure it precisely. See the warning below.
 
+### Phase 2b — expected-failure annotation (raised & shipped 2026-09-13) ([ADR 0032](decisions/0032-expected-failure-annotation-for-dependency-health.md))
+
+Phase 2's health banner correctly flagged `payment-batch → payment-worker` at
+100% failure — a real finding (`payment-worker` never listens on any port,
+confirmed live), but the follow-up question exposed a real gap: nothing let
+an operator say "this specific destination is expected to fail by design,
+stop alerting on it" without lying about the underlying evidence. There was
+no DB column, no admin endpoint, and no annotation read anywhere in the
+mining pipeline for this.
+
+**Shipped:** a `agentify.io/expected-failure: "<reason>"` annotation on the
+destination Service, read by Discovery's existing live scan (no new K8s
+call, no changes to either miner without live cluster access) and joined
+into `GET /api/service-dependencies` at read time from `cluster_services` —
+not stored on the edge itself, so there's exactly one writer and it
+self-reconciles every scan cycle with no staleness logic to get wrong. The
+frontend's `unhealthyEdges()` banner excludes an annotated destination's
+edges; `edgeHealth()`'s colour, the table's real `N/M failed` count, and both
+tooltips are **unchanged** — this suppresses the alert, never the evidence.
+`payment-worker` itself stays deliberately unannotated: its whole purpose is
+demonstrating this exact detection, so silencing it would defeat the
+fixture. Scope limit accepted: per-*service*, not per-edge — see the ADR.
+
 ### Phase 3 — reach past the namespace boundary — **PARTLY SHIPPED, partly withdrawn**
 
 Cross-namespace edges (`vault.vault`) and external egress
@@ -2684,6 +2708,155 @@ resolves to (1); "trace `<trace-id>`" resolves to (2).
 
 ---
 
+## P30 — Deployment Security Posture, staged toward active verification (proposed 2026-09-14, phased 2026-09-14)
+
+**The ask, in the terms it was raised:** screen data going to LLM calls for
+secrets/PII (that's P2a's 2026-09-14 widening, above) — and separately,
+have the platform itself identify security gaps in **how it and its
+neighbors are deployed and interact**, not code vulnerabilities: exposure,
+network segmentation, RBAC scope, TLS. When this ships somewhere, it should
+find these gaps from deployment config and deployment logs, and propose
+fixes. A follow-up widened the ambition explicitly: build this so it can
+grow into a **penetration-testing territory in its own right**, without
+having to redesign the schema/authorization model when that day comes —
+see [ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md)
+for the full decision this section summarizes.
+
+**Four phases, one item — same "phases of one initiative" shape P27
+already uses, decided together per ADR 0033 even though only Phase 1 is
+being built now:**
+
+| Phase | What | Trust boundary |
+|---|---|---|
+| **1 — Posture** (this pass) | Read K8s/IAM config — NetworkPolicy, RBAC, `securityContext`, TLS/exposure | Read-only, no approval gate — same as the existing dependency miner |
+| **2 — Active verification** (future) | Narrow, non-destructive live checks confirming a Phase 1 finding is *actually* live | Requires an approved `security_engagements` record |
+| **3 — Exploitability verification** (future) | Scoped PoC against a detected version's known CVEs | Requires an approved engagement, higher scrutiny |
+| **4 — Full pentest orchestration** (future, the named long-term focus) | Scheduled/on-demand campaigns, real rules of engagement | Requires an approved engagement; likely its own dedicated deployable |
+
+Phases 2-4 execute from a **separate, network-isolated service**, never the
+main backend/agent process, and are **never a Claude-callable tool** —
+identical reasoning to
+[P14a](#p14a--remediation-executor-as-its-own-network-isolated-agent)'s
+remediation-executor split and
+[ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md)
+Decision #5's write-tools-invisible-to-Claude rule, respectively. See ADR
+0033 for the full `security_findings`/`security_engagements` schema,
+including the confidence-tiering (`config-only` → `confirmed-live`/
+`refuted`) that lets a Phase 1 finding show, once Phase 2 exists, whether
+it's been verified rather than just flagged.
+
+**This is not greenfield.** [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)'s
+use case #8, "Config/RBAC/NetworkPolicy posture," already named this exact
+signal category on 2026-08-02 — "does this cluster have NetworkPolicies at
+all, what does its RBAC surface look like" — and explicitly deferred it as
+"a bigger scope increase than the others... tracked here but not assumed to
+ship with the first version of the collector." P30 is that deferral coming
+due, not a new idea. It's also **P24's missing input**: Policy Synthesis
+generates NetworkPolicies from the observed call graph, but has no notion
+today of what's *already* misconfigured before it starts proposing more
+config.
+
+**A 2026-09-14 audit (prompted by this request) found concrete findings
+this capability would report on day one — evidence it's worth building, not
+a hypothetical:**
+
+- **Zero `NetworkPolicy` objects anywhere in the repo** — not `agentify`,
+  not `payments-test`, not `vault`. Every pod can reach every pod.
+- **`agentify-discovery`'s ClusterRole grants cluster-wide `list`/`get` on
+  ALL Secrets** (`infra/kubernetes/discovery.yaml`), not just the
+  TLS-related ones it needs — the manifest's own comment says the narrowing
+  is client-side (`fieldSelector`), "enforced by the client, not by
+  Kubernetes."
+- **No pod `securityContext` anywhere** — no `runAsNonRoot`, no
+  `readOnlyRootFilesystem`, no `allowPrivilegeEscalation: false`, no
+  capability drops, across every workload in `infra/kubernetes/`.
+- **No TLS anywhere.** The ALB Ingress is HTTP-only (`ingress.yaml`, ACM
+  cert/redirect annotations commented out, "Dev: HTTP only — HTTPS requires
+  an ACM certificate + domain" — matches the parked domain-name decision),
+  and `/admin` and `/metrics` are exposed on that same unauthenticated HTTP
+  listener.
+- **A dev-mode Vault instance (root token) shares that same public,
+  internet-facing ALB** (`infra/kubernetes/vault/vault-ingress.yaml`) — the
+  single sharpest finding in the audit; see OPS-14 below, filed as an
+  immediate fix rather than left for this item to eventually detect.
+- **Weaviate is committed with anonymous access enabled, a `:latest` image
+  tag, and a `LoadBalancer` Service definition** (`infra/kubernetes/weaviate.yaml`)
+  — whether this is actually applied needs verifying, not assumed safe
+  because it's unused.
+- **No image/dependency scanning gates anything.** ECR has `scanOnPush`
+  enabled but nothing reads or gates on its findings; no Trivy/Grype/Snyk
+  step, no Dependabot, no SBOM. ECR repositories are also tag-**mutable**,
+  so even a "pinned" commit tag can be silently overwritten later.
+- **No CI-pass gate before deploy** — `02-deploy.yml` triggers on push to
+  `main` with no dependency on `01-ci.yml`'s result, despite its own header
+  comment claiming "on merge to main after CI passes."
+- **The EKS API endpoint is publicly reachable, and both the CI OIDC role
+  and the AWS root user hold cluster-admin** (`enable_cluster_creator_admin_permissions`,
+  `AmazonEKSClusterAdminPolicy` in Terraform) — contrast this with the
+  IRSA-scoped per-workload roles elsewhere in the same Terraform, which are
+  genuinely tight (fixed ARNs, no wildcard resources except where the AWS
+  API itself requires one). The posture is inconsistent, not uniformly bad
+  — which is exactly the kind of finding a posture scanner earns its keep
+  by surfacing precisely, not as a blanket "insecure" verdict.
+- **`events` has the identical missing-RLS gap `current_state` just had**
+  (ROADMAP OPS-10's fix, [ADR 0022 amendment](decisions/0022-multi-tenant-fleet-hub.md#amendment-2026-09-13--closing-the-current_state-rls-gap-and-what-it-actually-took))
+  — deliberately left open there as "a separate, not-yet-decided item." Not
+  re-decided here either; listed as an example of the kind of finding this
+  item's own database-posture checks (once scoped) would also need to catch.
+
+**Phase 1 design principles, carried over from this platform's existing
+precedent rather than invented fresh:**
+
+1. **Read-only, evidence-based, no auto-remediation.** Same boundary
+   [ADR 0003](decisions/0003-read-only-to-actions-boundary.md) already
+   draws and [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md)
+   reinforces for the *existing* remediation path — a security-posture
+   finding is a strong candidate for an operator to act on wrong, not
+   something to auto-fix. This produces findings, not changes.
+2. **Reads what's already reachable, don't grant new access.** Discovery
+   already has broad read RBAC (that's finding #2 above, in fact) — a
+   NetworkPolicy/RBAC/securityContext scan is a *read* of objects Discovery
+   or the backend's existing AWS credentials can already see (K8s API
+   objects, IAM policy documents via `iam:GetRolePolicy` if already
+   granted, ALB/Ingress specs) — this item's own RBAC footprint should not
+   grow past what's already justified elsewhere, and any new read it does
+   need gets the same least-privilege scrutiny this audit just applied to
+   everything else.
+3. **Same "coverage, not a verdict" framing as P21.** A namespace with zero
+   NetworkPolicies is a finding; a namespace where every workload
+   legitimately needs to talk to every other one is a false positive this
+   item cannot distinguish without a policy target to compare against —
+   report the fact, let a human (or eventually P24) judge whether it's a
+   gap.
+4. **CI/CD-adjacent findings (scanning gates, mutable tags, OIDC scope) are
+   a separate, smaller check reading the repo directly** — they're not
+   K8s-API-visible, so they don't ride the Discovery collector the way
+   cluster-state findings do. Whether this ships as part of the same
+   capability or a distinct lightweight repo-scanning step is a real open
+   question, not decided here.
+
+**What it needs first:** nothing — Phase 1 shipped 2026-09-14, no P27-style
+prerequisite blocked it. The open UI question (dedicated panel vs. folded
+into P21's blind-spot reporting vs. a chat-answerable intent) was resolved
+in favor of a dedicated panel (`SecurityPosturePanel.tsx`).
+
+**Status: Phase 1 SHIPPED 2026-09-14** (three checks, `security_findings`
+storage + API, Security Posture panel — see [ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md)'s
+2026-09-14 amendment for the exact scope and a real bug it caught in
+review).
+
+**Phase 2 SHIPPED 2026-09-14** — one technique end to end,
+`ingress-missing-tls` verified by a real plaintext HTTP GET. The engagement
+infrastructure (`security_engagements` schema/API, approve/reject gate,
+`agentify-security-verifier` isolated executor) is built sized for all of
+phases 2-4, per the explicit scoping choice made at the start of this work;
+see ADR 0033's 2026-09-14 Phase 2 amendment for the full shape, including
+the one schema addition it required (`security_findings.target_host`) that
+this ADR hadn't anticipated. **Phases 3-4 intentionally not scheduled** —
+named future direction, built when prioritized.
+
+---
+
 ## Operational backlog (not features — chores with a date attached)
 
 Small, non-feature actions that must not be lost between P-items.
@@ -2691,18 +2864,20 @@ Small, non-feature actions that must not be lost between P-items.
 | # | Action | Why | Raised |
 |---|---|---|---|
 | OPS-%d | **Migrate the timestamp columns to `TIMESTAMPTZ`** | Every timestamp column in the schema is naive `TIMESTAMP` written with `NOW()`, so it stores the *server's* local time while lib/pq hands it back to Go labelled UTC. The two agree only when the server's zone is UTC — RDS defaults to UTC, so production has always been correct **by luck**, and the embedded-postgres test instance (which inherits the host zone) read every timestamp ten hours into the future on an AEST machine. `pinUTC` now pins each session to UTC, which makes the assumption explicit and is enough for correctness, but the columns still cannot represent a non-UTC write and existing rows written before it are silently offset. Any freshness figure off by a whole number of hours is this. | 2026-09-05 |
-| OPS-1 | **Rotate the Langfuse API key pair** | The secret key was pasted into an editor buffer and a Claude Code transcript on 2026-08-30. Create a new pair in Langfuse → Settings → API Keys and **delete the old one** — creating a new key does not revoke the exposed one. Then update the `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` GitHub secrets, run `04 · Bootstrap Langfuse Secret` (writes them to Secrets Manager, which is where the agent reads from — the manifest sets no `LANGFUSE_*` env), `kubectl rollout restart deploy/agentify-agent -n agentify` (settings and the client are cached per process), then verify a Tier-2 trace still reports a non-null `prompt_version`. A `null` there means the agent is silently on local fallbacks. | 2026-08-30 |
-| OPS-2 | **Set `EVAL_AUTH_TOKEN`** | The prompt promotion gate returns 503 until it is set, now that an empty token fails closed outside dev ([ADR 0030](decisions/0030-version-pinned-prompt-evaluation.md) amendment). Same value in `infra/kubernetes/backend.yaml` (preferably a `secretKeyRef`) and the repo's Actions secrets. | 2026-09-01 |
+| OPS-1 | **Rotate the Langfuse API key pair** | **STILL BLOCKED on a manual step, attempted 2026-09-14.** The secret key was pasted into an editor buffer and a Claude Code transcript on 2026-08-30. Creating the new pair and deleting the old one can only happen in the Langfuse web console (Settings → API Keys) — no API/CLI path for key rotation exists, and this is exactly the kind of destructive, credential-affecting action that should not be automated even if it did. 2026-09-14 attempt additionally found the follow-up automation blocked too: `gh` CLI is not installed in this environment (can't update the `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` GitHub secrets or trigger `04 · Bootstrap Langfuse Secret`), and the AWS SSO session had expired (blocks any Secrets Manager/kubectl follow-up). Once a human creates the new pair and deletes the old one in Langfuse, the rest of this item's steps (update GitHub secrets, run the bootstrap workflow, `kubectl rollout restart deploy/agentify-agent -n agentify`, verify a Tier-2 trace's `prompt_version` is non-null) are still exactly as originally scoped and can be automated then. | 2026-08-30, still blocked 2026-09-14 |
+| OPS-2 | ~~Set `EVAL_AUTH_TOKEN`~~ | **FIXED 2026-09-13.** `backend.yaml` now sources it from `agentify-eval-secret` (`secretKeyRef`, `optional: true`), mirroring OPS-3's `REMEDIATION_AUTH_TOKEN` pattern exactly. Live deploy found a real process gap along the way: the manifest's `image:` field is a CI-substituted placeholder (`ACCOUNT_ID.dkr.ecr.../latest`) that the checked-in file never resolves, so a plain `kubectl apply -f` of it would have rolled the running image back to that literal, unpullable string — caught before running it. Fixed with a scoped `kubectl patch` touching only the `EVAL_AUTH_TOKEN` env entry, and closed the gap generally with `scripts/safe-kubectl-apply.sh` (refuses to apply any of the four templated manifests as-is) plus a warning comment on all four. Verified live: token loads (length 64), pod stable, `/health` 200. **Still needed: set the same token value as the `EVAL_AUTH_TOKEN` GitHub Actions secret** — not done here, no `gh` CLI access in this environment. | 2026-09-01, resolved 2026-09-13 |
 | OPS-3 | ~~`REMEDIATION_AUTH_TOKEN` and `COLLECTOR_TOKEN` still treat empty as open~~ | **`REMEDIATION_AUTH_TOKEN` FIXED 2026-09-12** — an unset token now fails closed outside dev, same fix as OPS-2's `EVAL_AUTH_TOKEN` ([ADR 0020 amendment](decisions/0020-phase-3-remediation-with-approval-gate.md#amendment-2026-09-12--an-unset-auth-token-now-fails-closed-outside-dev)); `backend.yaml` now sources it from `agentify-remediation-secret` rather than a literal `""`. **`COLLECTOR_TOKEN` is a separate, unrelated mechanism and was NOT touched** — it scopes which cluster a collector's push belongs to (an unset one falls back to `DefaultTenantID`, ADR 0024's own deliberate default for unscoped ingest), not an admin control-plane write like approve/reject; conflating the two in the original wording overstated what this item covers. | 2026-09-01, resolved 2026-09-12 |
 | OPS-4 | **Add a Voyage AI payment method** | Currently 3 RPM / 10K TPM. Embed writes are async and skipped on failure, so nothing breaks — vectors are simply dropped as diagnose volume rises ([SEMANTIC_MEMORY.md](../docs/SEMANTIC_MEMORY.md)). | 2026-08-31 |
 | OPS-8 | ~~payments-test manifests reference Docker Hub in a namespace with no internet route~~ | **WITHDRAWN 2026-09-01 — the hypothesis was wrong.** It assumed ADR 0021's no-NAT Fargate profile still describes this account. It does not: `05-payment-test.yml` records that "this account has a NAT gateway on the payments namespace's subnet, unlike ADR 0021's original no-NAT Fargate assumption", and `02-deploy.yml` says the same. Docker Hub is reachable, the plain image references are deliberate, and the init containers' `apk add curl jq` works for the same reason. **The genuine residue is dead code:** `03-vault-bootstrap.yml` still rewrites `ACCOUNT_ID.dkr.ecr…` in three manifests that contain no such placeholder, so the `sed` is a no-op that reads as though the ECR mirror were required. Worth deleting, or restoring the placeholder if a no-NAT deployment is still a supported shape. **This is therefore NOT the cause of OPS-5** — that remains unexplained. | 2026-09-01 |
-| OPS-12 | **`current_state` never forgets a pod — no delete path exists** | A `DELETED` pod watch event is normalised to `event_type='pod_deleted'` and **upserted** like any other, so the row survives holding the dead pod's final state; there is no `DELETE FROM current_state` anywhere in the codebase. After ten rollouts on 2026-09-05 each agentify service had ~10 pod rows, and `ListServiceHealth` counted all of them — rendering a 1-replica Deployment as **"9/1 · 1 not ready"** while `kubectl` showed `1/1 Running`. Mitigated the same day by excluding `pod_deleted` from the query and by sourcing the ready/desired ratio from the Deployment status instead of watch counts. **The residual is real:** a pod that vanishes while the watch is reconnecting produces no DELETED event, so its row persists indefinitely and still pollutes phase and restart aggregates. Freshness cannot substitute — the watch is change-driven, so a healthy stable pod emits nothing for hours and would age out wrongly. The fix is a genuine delete path on the generic store (a design change: `current_state` has no per-row Go struct and no delete semantics, cf. ADR 0022's note) or periodic reconciliation against the live pod list the scan already fetches. | 2026-09-05 |
-| OPS-11 | **Delete the fabricated external-egress edges** | The `external` tier shipped and was disabled on 2026-09-05 (see `docs/SERVICE_DEPENDENCIES.md`). It wrote `www.nokia.com` (a scanner's `Referer`), `internet-measurement.com` (a scanner's `User-Agent`) and `dashboard.voyageai.com` / `docs.voyageai.com` (URLs quoted in Voyage's own 402 body) as dependencies of the platform — and because the receiving backend predated the `target_kind` column, they were stored in the **strong** tier as `service`. The UI now reclassifies them by shape, but the rows are still wrong. A Kubernetes Service name is an RFC 1123 label and never contains a dot, so this is exact: `DELETE FROM service_dependencies WHERE to_service LIKE '%.%' AND to_service NOT LIKE '%.svc.cluster.local';`. The three `c53b9dca-…` targets were **explained and fixed on 2026-09-05**: `_HOSTNAME_RE` accepts hex and hyphens, so a trace UUID followed by a real namespace passed the cross-namespace tier, which validated only the namespace segment. Both segments are now checked against the real Service list. Rows already written still need this DELETE. | 2026-09-05 |
-| OPS-10 | **`current_state` has `tenant_id` but no RLS policy** | Every other table carrying per-customer data has `ENABLE`/`FORCE ROW LEVEL SECURITY` plus a `tenant_isolation` policy; `current_state` has the column and no policy, because [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md) deferred it as "a query-retrofit-phase decision" and the retrofit never happened. `ListServiceHealth` (P22, added 2026-09-05) therefore filters `tenant_id` in its **own WHERE clause** with no backstop — drop that predicate and one tenant's service inventory and pod state leak to another, silently. Either add the policy (and the grant) or keep every future reader of this table auditing its own scoping. | 2026-09-05 |
-| OPS-9 | **`get_pod_logs` sends no `container` parameter** | The Kubernetes API returns 400 for any multi-container pod, and the function logs a warning and returns `""`. So agentify silently reads **no logs at all** from multi-container pods — which in a service-mesh cluster is every pod. Affects both dependency mining and the diagnose skill's log tail. Fix is to pass the first (or a named) container; the reason it has not bitten yet is that every current workload is single-container, which `payment-batch.yaml` deliberately preserves. | 2026-09-01 |
+| OPS-12 | ~~`current_state` never forgets a pod — no delete path exists~~ | **PARTIALLY FIXED 2026-09-14.** A genuine delete path now exists: new `CurrentState.Delete(ctx, tenantID, podID, entityKey)` (RLS-scoped, same tenant-context pattern as `Store`) issues a real `DELETE FROM current_state`, and `ingester.go`'s `storeEvent` calls it — instead of `Store` — for any event whose type ends `_deleted` (`pod_deleted`, `service_deleted`; matched generically, not hardcoded to pods, since both share the identical bug shape) on a `kv`-backed pod. A backend that doesn't implement the delete interface falls back to the old upsert behavior rather than panicking. Covered by 4 new `ingestion` package tests (delete-not-store, service_deleted also deletes, fallback-when-unsupported, ordinary events still store) and a new `TestCurrentStateDelete` proving both the delete itself and its RLS scoping (one tenant cannot delete another's row even knowing its exact pod_id/entity_key). **The residual named in this item is NOT fixed and remains open:** a pod that vanishes while the watch is reconnecting still produces no DELETED event, so no delete call ever fires and its row persists indefinitely; `ListServiceHealth`'s defensive `WHERE event_type <> 'pod_deleted'` filter and the Deployment-status-sourced ready ratio both stay in place as the mitigation for that gap. Periodic reconciliation against the live pod list remains a real fix for that residual, not built here. | 2026-09-05, partially resolved 2026-09-14 |
+| OPS-11 | ~~Delete the fabricated external-egress edges~~ | **VERIFIED CLEAN 2026-09-13, no DELETE needed.** Re-ran the exact query this item specified (`SELECT ... WHERE to_service LIKE '%.%' AND to_service NOT LIKE '%.svc.cluster.local'`) plus a broader check for `target_kind = 'external'` or any nokia/voyageai/measurement hostname — **zero rows** in the live database. The fabricated rows described here (`www.nokia.com`, `internet-measurement.com`, `dashboard.voyageai.com`, `docs.voyageai.com`) are no longer present; whatever wrote them either aged out, was cleaned up separately, or never reached this database instance. Leaving the DELETE statement above in this entry's history for reference, but nothing was run against live data since there was nothing to remove. | 2026-09-05, verified clean 2026-09-13 |
+| OPS-10 | ~~`current_state` has `tenant_id` but no RLS policy~~ | **FIXED 2026-09-13** ([ADR 0022 amendment](decisions/0022-multi-tenant-fleet-hub.md#amendment-2026-09-13--closing-the-current_state-rls-gap-and-what-it-actually-took)) — turned out to require more than the policy itself: `FORCE ROW LEVEL SECURITY` applies per-role to every query regardless of which Go method issues it, and `HandleQuery` (`POST /api/query`, the primary chat/ask endpoint) had **no tenant resolution anywhere in its call chain** — its own comment said outright it was "not cluster-scoped." Fixed by threading a server-resolved `tenantID` through `storage.Backend.Query`, `QueryExecutor.FetchFromPod`, `HandleQuery`/`HandleAgentFetch` (both now call the existing `resolveTenantContext`, same as every other handler — no `Authorization` header required, so this is behaviorally a no-op for today's effectively-single-tenant deployment), and `CurrentState.TrackedEntities` (which had **no** tenant filtering at all, not even a manual WHERE clause). New `TestCurrentStateTenantIsolation` proves it — and along the way found `current_state`'s primary key has no `tenant_id` component, accepted as fine since ADR 0024's cluster-scoped `pod_id` already makes the collision it would guard against impossible in practice (see the amendment). `events` (`Client.Query`/`Store`) has the identical missing-RLS gap, deliberately left open as a separate item. | 2026-09-05, resolved 2026-09-13 |
+| OPS-9 | ~~`get_pod_logs` sends no `container` parameter~~ | **FIXED 2026-09-14.** Rather than requiring every caller to pass a container name upfront, `get_pod_logs`/`live_get_pod_logs` (three call sites: `discovery/k8s_client.py`, `discovery/live_tools.py`, `agent/k8fy/live_diagnostics.py`) now retry once on an ambiguous-container 400, parsing the container choices K8s' own error message already names (`"choose one of: [app istio-proxy]"`) rather than making a second API call to discover them. A single-container pod's request is unaffected (no retry ever fires); an explicitly-wrong `container` is never silently swapped for another. Covered by new tests in all three modules (`test_k8s_client.py`, `test_live_tools.py`, `test_live_diagnostics.py`) plus the pre-existing `test_scan_coverage.py` regression suite, all passing. | 2026-09-01, resolved 2026-09-14 |
 | OPS-5 | **`payment-worker` has zero ready replicas; two `payment-api` pods `Pending`** | The agent flagged it `critical` and correlated it to the 11:36 payments deploy. It is also why an eval item reported `degraded`, so the eval baseline is measuring a broken cluster. **Cause unknown** — image pulls were investigated and ruled out (OPS-8). `Pending` with a NAT-enabled subnet points at scheduling instead: Fargate capacity, resource requests, or the Vault Agent Injector's init container failing. Decide it with `kubectl describe pod -n payments <pod> \| tail -20` and read the Events. | 2026-09-01 |
 | OPS-6 | **Migrate `scripts/run_evals.py` and `scripts/seed_eval_dataset.py` off langfuse v2** | They use the v2 dataset API (`lf.trace`, `item.link`, `score`) while the agent pins `>=4.14`. That split caused two separate failures on 2026-08-30 — a dead prompt REST path and a missing `create_score` — each of which reported success while doing nothing. See [ADR 0019](decisions/0019-eval-harness-as-ci-gate.md)'s correction. | 2026-08-31 |
 | OPS-7 | **Local AWS SSO / kubeconfig for account `637423369012`** | Unresolved; CloudShell is the working path ([CLOUDSHELL_RUNBOOK.md](../docs/CLOUDSHELL_RUNBOOK.md)). The Microsoft `myapps` tile URL cannot be an `sso_start_url` — `aws sso login` needs an IAM Identity Center portal URL, verified 2026-08-30. | 2026-08-30 |
+| OPS-13 | ~~`incident_embeddings.summary` is stored unredacted~~ | **FIXED 2026-09-14.** `embedAndStoreIncident` (`handlers.go`) now calls `h.redactor.RedactText(summary)` before the `/embed` POST and before `InsertIncidentEmbedding` — the identical call `investigator.go`'s `Alert.Summary`/`Cause` already make ("defense-in-depth on prose egress"). No dedicated unit test added: exercising this path would need a full `orchestrator`/backend-factory test double disproportionate to a one-line fix, and `RedactText` itself is already covered by `governance/redact_test.go`; verified instead via `go build`/`go vet` and the full existing test suite staying green. | 2026-09-14, resolved 2026-09-14 |
+| OPS-14 | ~~Dev-mode Vault (root token) is reachable over plain HTTP on the public internet-facing ALB~~ | **FIXED 2026-09-14.** Confirmed nothing legitimate needed the public path: `03-vault-bootstrap.yml` and `scripts/vault-setup.sh` both already reach Vault via `kubectl port-forward`, and `agentify-agent` talks to it over the in-cluster ClusterIP DNS name (`infra/kubernetes/agent.yaml`'s `VAULT_ADDR`) — the Ingress existed purely so a human could browse the UI without port-forwarding. Deleted `infra/kubernetes/vault/vault-ingress.yaml` and its `kubectl apply` line in `02-deploy.yml`, replaced with a permanent, idempotent `kubectl delete ingress vault-ui -n vault --ignore-not-found` step so a stale branch that still applies the old manifest can't silently re-expose it. `vault-values.yaml` and `vault-setup.sh`'s echoed instructions now point only at the port-forward path. No direct cluster write was made — the live Ingress is removed by the pipeline on its next run, per this repo's no-direct-writes convention. | 2026-09-14, resolved 2026-09-14 |
 
 ---
 
