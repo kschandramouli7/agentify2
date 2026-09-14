@@ -132,3 +132,74 @@ func TestRedactTextDisabledIsPassthrough(t *testing.T) {
 		t.Errorf("disabled RedactText should pass through, got %q", got)
 	}
 }
+
+// TestRedactTextWidenedPII is ADR 0007's 2026-09-14 amendment's Decision #2:
+// PII coverage widens past email-only.
+func TestRedactTextWidenedPII(t *testing.T) {
+	r := NewRedactor(true, false, slog.Default())
+	// Slack/Stripe test values are split across concatenated literals so the
+	// realistic-enough fake shape doesn't appear contiguously in this file —
+	// GitHub's own secret-scanning push protection otherwise flags it despite
+	// being a synthetic test fixture, not a real credential.
+	slackToken := "xoxb-123456789012-" + "abcdefghijklmnopqrstuvwx"
+	stripeKey := "sk_live_" + "ABCDEFGHIJKLMNOPQRSTUVWX"
+	in := "call the customer at +1 415-555-0132 or (415) 555-0199\n" +
+		"card on file: 4111 1111 1111 1111\n" +
+		"internal host 10.0.4.17, external peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334\n" +
+		"compressed form 2001:db8::1 and loopback ::1\n" +
+		"leaked keys: ghp_abcdefghijklmnopqrstuvwxyz0123456789 github_pat_ABCDEFGHIJKLMNOPQRSTUVWX\n" +
+		slackToken + "\n" +
+		"AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456\n" +
+		stripeKey + "\n" +
+		"sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+
+	out := r.RedactText(in)
+
+	leaks := []string{
+		"415-555-0132", "415) 555-0199",
+		"4111 1111 1111 1111",
+		"10.0.4.17",
+		"2001:0db8:85a3:0000:0000:8a2e:0370:7334", "2001:db8::1", "::1",
+		"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"github_pat_ABCDEFGHIJKLMNOPQRSTUVWX",
+		slackToken,
+		"AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456",
+		stripeKey,
+		"sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+	}
+	for _, s := range leaks {
+		if strings.Contains(out, s) {
+			t.Errorf("RedactText leaked %q\n--- output ---\n%s", s, out)
+		}
+	}
+}
+
+// TestRedactTextCreditCardRequiresLuhn proves the credit-card scrubber only
+// masks a candidate that passes the Luhn checksum — per the ADR's own
+// "Luhn-checked, not just digit-shape" requirement, an ordinary 16-digit
+// numeric ID (trace ID, pod hash fragment) must survive untouched.
+func TestRedactTextCreditCardRequiresLuhn(t *testing.T) {
+	r := NewRedactor(true, false, slog.Default())
+
+	valid := "4111111111111111" // well-known Luhn-valid test Visa number
+	if out := r.RedactText("card: " + valid); strings.Contains(out, valid) {
+		t.Errorf("Luhn-valid card number was not redacted: %s", out)
+	}
+
+	invalid := "4111111111111112" // same shape, fails Luhn (last digit flipped)
+	if out := r.RedactText("trace id: " + invalid); !strings.Contains(out, invalid) {
+		t.Errorf("a Luhn-INVALID 16-digit number must survive (likely a trace ID/numeric ID, not a card), got: %s", out)
+	}
+}
+
+// TestRedactTextIPv6DoesNotCatchClockStrings guards the false-positive this
+// pattern is most at risk of: an HH:MM:SS timestamp is 3 hex-shaped groups
+// (2 colons) and must never be mistaken for a compressed IPv6 address.
+func TestRedactTextIPv6DoesNotCatchClockStrings(t *testing.T) {
+	r := NewRedactor(true, false, slog.Default())
+	in := "request completed at 14:23:05 in 00:00:12"
+	out := r.RedactText(in)
+	if !strings.Contains(out, "14:23:05") || !strings.Contains(out, "00:00:12") {
+		t.Errorf("RedactText over-scrubbed clock-shaped text as IPv6:\n%s", out)
+	}
+}

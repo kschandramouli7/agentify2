@@ -101,6 +101,38 @@ miss, the same "defense in depth, not the primary control" framing
 `investigator.go`'s existing double-redaction already established for the
 webhook path.
 
+**Shipped (same day).** All four decisions above are implemented, not just
+decided:
+
+1. `agent.py` gained `_redact_context_question` (applied inside
+   `_build_user_message`, covering `_reason_single`/`_reason_advisor_executor`/
+   `_reason_pattern_a` in one place) and `_redact_chat_messages` (applied
+   inside `_traced_chat`, which wraps `reason_chat`). The latter redacts
+   *before* opening the Langfuse span, not after — `_traced_chat`'s
+   `tracing.observe(...)` block runs before the wrapped method body ever
+   executes, so redacting inside `reason_chat`'s own body would have been in
+   time for the prompt but too late for the trace's `input=`.
+2. `redact.go`'s `logScrubbers` and both `log_redaction.py` copies gained
+   phone, IPv4, IPv6, GitHub/Slack/Google/Stripe/generic-`sk-` key patterns,
+   plus a separate Luhn-validated credit-card pass (candidates are matched by
+   digit-shape, then only masked if they also pass the Luhn checksum — kept
+   as its own function since Luhn validation is a computed check, not a
+   static regex).
+3. Shipped as ROADMAP OPS-13, see that item and this ADR's own 2026-09-14
+   entry above.
+4. `config/claude_client.py`'s module-level `client` is now a
+   `RedactingAnthropicClient` wrapping the real `AsyncAnthropic` — its
+   `.messages.create`/`.beta.messages.create` redact `messages`/`system`
+   immediately before delegating to the real call, recursively covering
+   nested content blocks (including a `tool_result` block's JSON-string
+   `content`). `K8fyAgent.__init__` picks this up automatically via
+   `get_claude_client()`, no call-site changes needed.
+
+`policies/data-governance.md` is updated to match — the operator's question
+redaction and the client-level backstop are now documented there instead of
+being listed under Non-goals, which had gone stale relative to this
+amendment's own decisions.
+
 ## Consequences
 
 - **Positive:** removes the raw-egress finding; minimizes tokens sent to the
@@ -124,5 +156,11 @@ webhook path.
   on the question path. The `claude_client.py` backstop only catches
   denylist-shaped leaks, not a genuinely novel secret format — it raises the
   floor, it does not close the residual risk Decision #1 already accepted.
+- **Positive (shipped 2026-09-14):** all four amendment decisions above are
+  now code, not just decided — see the "Shipped" note in the amendment
+  itself for exactly what changed and where. The original v1 Consequences
+  bullet above ("the operator's free-text question is not redacted") is
+  superseded by this; left in place as the historical record of what v1
+  actually shipped with, per this file's own append-only convention.
 
 See [policies/data-governance.md](../policies/data-governance.md) for the living rules.

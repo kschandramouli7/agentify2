@@ -18,6 +18,7 @@ from k8fy.prompt_manager import ResolvedPrompt
 from k8fy.prompt_manager import resolve as resolve_prompt
 from k8fy.prompts import CHAT_STRUCTURE_PROMPT, CHAT_SYSTEM_PROMPT, SYSTEM_PROMPT
 from k8fy.live_diagnostics import LIVE_DIAGNOSTIC_TOOLS
+from k8fy.log_redaction import redact_log_text
 from k8fy.tools import TOOLS, process_tool_call
 from models.response import AgentResponse, ReasoningOutput, ToolCall
 
@@ -128,16 +129,25 @@ def _traced_chat(method):
     @functools.wraps(method)
     async def wrapper(self, messages, context=None, *args, **kwargs):
         ctx = context or {}
+        # ADR 0007's 2026-09-14 amendment, Decision #1: redact BEFORE this
+        # trace's `input=` is captured, not after — this decorator wraps
+        # reason_chat and its `with tracing.observe(...)` block runs before
+        # `method(...)` (the actual reasoning body) ever executes, so
+        # redacting inside reason_chat's own body would be too late for the
+        # trace, only in time for the prompt. Using the same redacted list
+        # for both `input=` here and the call to `method(...)` below closes
+        # both egress points in this one place.
+        safe_messages = _redact_chat_messages(messages) if messages else messages
         rp = _active_prompt.get()
         with tracing.observe(
             "chat:turn",
             model=self.model,
-            input=messages,
+            input=safe_messages,
             prompt=rp.raw if rp else None,
             session_id=str(ctx.get("session_id") or ""),
             metadata={"turns": len(messages) if messages else 0},
         ) as span:
-            result = await method(self, messages, context, *args, **kwargs)
+            result = await method(self, safe_messages, context, *args, **kwargs)
             if isinstance(result, AgentResponse):
                 tracing._safe_update(span, output=result.answer)
             return result
@@ -454,6 +464,49 @@ def _latest_user_text(messages: List[Dict[str, Any]]) -> str:
             content = m.get("content")
             return content if isinstance(content, str) else json.dumps(content)
     return ""
+
+
+def _redact_context_question(context: Dict[str, Any]) -> Dict[str, Any]:
+    """ADR 0007's 2026-09-14 amendment, Decision #1: the operator's free-text
+    question is no longer exempt from redaction. `context["question"]` is set
+    by the Go backend's dependency-question path (handlers.go) — unlike the
+    rest of `context` (structured, backend-controlled fields like namespace/
+    session_id), it is arbitrary operator-authored text that can contain a
+    pasted secret. Applies the same denylist as K8s log text, since free text
+    can't be allowlisted, only screened for known-dangerous shapes.
+
+    `_build_user_message` is the single function `_reason_single`,
+    `_reason_advisor_executor`, and `_reason_pattern_a` all use to build their
+    prompt from `context` — redacting here covers all three call sites (and,
+    for pattern-a, its `tracing.observe` span too, since that reads the
+    already-redacted `user_content` built afterward) without each needing to
+    remember individually.
+    """
+    question = context.get("question")
+    if not isinstance(question, str) or not question:
+        return context
+    safe = dict(context)
+    safe["question"] = redact_log_text(question)
+    return safe
+
+
+def _redact_chat_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Redacts string message content before it reaches either egress point
+    a chat turn has: the Claude prompt and the Langfuse trace (`_traced_chat`
+    uses this same redacted list for both — see its own comment). Only plain
+    string `content` is touched; a list of content blocks (assistant turns
+    already in the conversation, or tool-result blocks) is left as-is — this
+    function only runs on the incoming request's own messages, before any
+    tool-loop turn gets appended, so `content` is always plain text here in
+    practice, but the isinstance guard keeps this safe if that ever changes.
+    """
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str) and content:
+            m = {**m, "content": redact_log_text(content)}
+        out.append(m)
+    return out
 
 
 def _looks_like_dependency_question(messages: List[Dict[str, Any]]) -> bool:
@@ -807,6 +860,11 @@ class K8fyAgent:
         the local string. Pass `system_prompt` instead to pin an exact string and
         skip Langfuse entirely — for tests and callers that supply their own text.
         """
+        # Type is really RedactingAnthropicClient (config/claude_client.py) —
+        # AsyncAnthropic-shaped for the .messages/.beta.messages surface this
+        # agent uses, with a redaction backstop wrapped around it (ADR 0007's
+        # 2026-09-14 amendment). Annotated as AsyncAnthropic since tests
+        # commonly replace this attribute with their own fake client.
         self.client: AsyncAnthropic = get_claude_client()
         self.model = settings.claude_model
         self.max_tokens = settings.claude_max_tokens
@@ -1475,9 +1533,10 @@ class K8fyAgent:
         self, intent: str, data: Dict[str, Any], context: Dict[str, Any]
     ) -> str:
         """Build the user message for Claude based on intent and data."""
+        safe_context = _redact_context_question(context)
         return (
             f"Intent: {intent}\n"
-            f"Context: {json.dumps(context, indent=2)}\n\n"
+            f"Context: {json.dumps(safe_context, indent=2)}\n\n"
             f"Data already fetched for this query:\n{json.dumps(data, indent=2, default=str)}\n\n"
             "Analyze this data and answer the operator's question. If you need more "
             "detail, call a tool to fetch it; otherwise answer directly."
