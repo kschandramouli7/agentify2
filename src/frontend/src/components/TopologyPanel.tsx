@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listServiceDependencies, listClusterIngress, listScanCoverage, listServiceProfiles,
-  listServiceHealth,
-  type ServiceDependency,
+  listServiceHealth, createChatSession, sendChatMessage,
+  type ServiceDependency, type CallTrace,
 } from "../api";
 import { DependencyFlow, confidence, edgeHealth, rarelyObserved, silentServices, unhealthyEdges, type FlowEdge, type NodeMeta } from "./DependencyFlow";
+import { SequenceDiagram } from "./SequenceDiagram";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
 //
@@ -234,6 +235,36 @@ export function TopologyPanel() {
   const [typed, setTyped] = useState("");
   const [focus, setFocus] = useState<string | null>(null);
   const [showMermaid, setShowMermaid] = useState(false);
+
+  // ROADMAP P29 — "trace <trace-id-or-path>" inline search. A lazily-created
+  // chat session, reused across searches in this panel visit rather than one
+  // per query: it's a real row that will also show up in the Chat tab's own
+  // session list (an accepted, cosmetic side effect of reusing the existing
+  // send path — see the plan — rather than adding a dedicated endpoint).
+  const traceSessionIdRef = useRef<string | null>(null);
+  const [traceInput, setTraceInput] = useState("");
+  const [traceBusy, setTraceBusy] = useState(false);
+  const [traceResult, setTraceResult] = useState<{ answer: string; call_trace?: CallTrace } | null>(null);
+  const [traceError, setTraceError] = useState<string | null>(null);
+
+  async function submitTrace() {
+    const input = traceInput.trim();
+    if (!input) return;
+    setTraceBusy(true);
+    setTraceError(null);
+    try {
+      if (!traceSessionIdRef.current) {
+        const session = await createChatSession({ namespace: applied });
+        traceSessionIdRef.current = session.id;
+      }
+      const { message } = await sendChatMessage(traceSessionIdRef.current, `trace ${input}`);
+      setTraceResult({ answer: message.content, call_trace: message.details?.call_trace });
+    } catch (e) {
+      setTraceError(e instanceof Error ? e.message : "trace search failed");
+    } finally {
+      setTraceBusy(false);
+    }
+  }
 
   // Poll while empty (discovery may not have pushed inventory yet), then back
   // off — the same pattern SearchInput uses against this endpoint.
@@ -496,19 +527,47 @@ export function TopologyPanel() {
           <button className="adm-btn adm-btn--ghost" type="button" onClick={() => refetch()}>
             {isFetching ? "Refreshing…" : "Refresh"}
           </button>
-          {/* Placeholder only — marks the entry point without committing to a
-            * design. What it should send (focus? whole graph? just the
-            * namespace?) and whether it opens chat in-place or navigates to
-            * the Chat tab are still open; see ROADMAP.md P22. */}
+        </div>
+      </div>
+
+      {/* ROADMAP P29 — traces one specific call (a trace ID or "METHOD
+        * /path") across every onboarded cluster's raw logs, distinct from
+        * the aggregate graph below: "what happened for this one call" vs.
+        * "what has this namespace historically done". */}
+      <div className="adm-panel__section">
+        <h3>Trace a specific call</h3>
+        <p className="adm-panel__desc">
+          Paste a trace ID or a request like <code>POST /charge</code> to search raw logs
+          across every onboarded cluster for what that specific call touched, in order.
+        </p>
+        <div className="adm-filters">
+          <input
+            className="adm-date-input"
+            style={{ minWidth: 260 }}
+            value={traceInput}
+            onChange={e => setTraceInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && traceInput.trim() && !traceBusy) submitTrace(); }}
+            placeholder="trace ID or POST /charge"
+            aria-label="Trace ID or URL/path"
+          />
           <button
             className="adm-btn adm-btn--ghost"
             type="button"
-            disabled
-            title="Coming soon — ask questions about this namespace's dependency graph without leaving the panel."
+            disabled={!traceInput.trim() || traceBusy}
+            onClick={submitTrace}
           >
-            Ask about dependencies
+            {traceBusy ? "Searching…" : "Trace"}
           </button>
         </div>
+        {traceError && <p className="adm-error">{traceError}</p>}
+        {traceResult && (
+          <div className="topo-trace__result">
+            <p style={{ whiteSpace: "pre-wrap" }}>{traceResult.answer}</p>
+            {traceResult.call_trace && traceResult.call_trace.hops.length > 0 && (
+              <SequenceDiagram trace={traceResult.call_trace} />
+            )}
+          </div>
+        )}
       </div>
 
       {isLoading && <p className="adm-loading">Loading…</p>}

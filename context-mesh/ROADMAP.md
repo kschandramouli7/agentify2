@@ -2011,6 +2011,14 @@ already logs, rather than a whole namespace — see **P29** below, which
 covers both: a path-filtered view of the mined graph, and an on-demand raw-
 log search by trace ID for one specific call.
 
+**Superseded 2026-09-15** by P29 half (2) shipping: the placeholder button is
+gone, replaced by a real inline text box + inline sequence-diagram rendering
+in `TopologyPanel.tsx`, answering "what it sends" (namespace context + a
+`"trace <input>"`-prefixed message), "where the answer appears" (inline in
+this panel, not the Chat tab), and "whether it needs new plumbing"
+(no — composes the existing chat-send path) all at once. See P29 below for
+the full implementation.
+
 ### Also raised 2026-09-12: chat should reflect real-time failure state, not just the mined graph
 
 Today, the deterministic `dependencies` route (tier1,
@@ -2699,12 +2707,38 @@ resolves to (1); "trace `<trace-id>`" resolves to (2).
 
 **What it needs first:**
 - P27 phase 4 (path/operation-class capture) — hard prerequisite for (1),
-  not started.
+  still not started.
 - For (2): confirming which onboarded services actually log a
   request/trace ID today (unknown — not audited), since the feature's
   value is bounded by that, not by anything this item can build.
 
-**Status: not started.** ADR at implementation.
+**Status: half (2) SHIPPED 2026-09-15** — on-demand cross-cluster trace/URL
+search, delivered via the chat entry point exactly as scoped above. New
+`src/agent/k8fy/trace_search.py`: classifies input as a trace ID (hex-only,
+covers UUID/Jaeger/Zipkin/X-Ray shapes) or a `METHOD /path`, queries Athena
+with no cluster/namespace `WHERE` clause at all (the entire point — a
+distributed request crosses namespace boundaries), keeps and parses each
+CRI line's own timestamp (unlike `dependency_miner.py`'s `_parse_cri_message`,
+which discards it — this feature's whole value is order), and for URL/path
+matches applies a whitelist-only "request-line context" filter (the path
+must appear immediately after an HTTP verb or a `path=`/`route=`/`"uri":`
+field) — the direct fix for the exact false-positive class that fabricated
+`www.nokia.com`/`dashboard.voyageai.com` edges from bare substring matches.
+Selectors are fetched lazily, only for the `(cluster_id, namespace)` pairs
+that actually appear in the matched rows. Wired into `agent.py`'s
+`reason_chat` as a new deterministic `"trace"` route (tier1, no model
+call) — an explicit `"trace <input>"` trigger checked before the inferred
+`"dependencies"` heuristic, so it never loses to a keyword guess. Rendered
+as a hand-rolled SVG sequence diagram (`SequenceDiagram.tsx`, no new
+dependency — none is installed anywhere in this repo) inline in the
+Dependencies panel via a real text box that replaces the "Ask about
+dependencies" placeholder button shipped 2026-09-12, composing
+`"trace " + input` through the existing chat-send path (no new backend
+endpoint). No Go backend changes were needed — `/admin/integrations` and
+`/api/cluster-service-selectors` already sufficed. 42 new tests (30 in
+`test_trace_search.py`, 12 in `test_chat_trace.py`), full existing suite
+green. **Half (1) — the path-filtered view of the mined graph — remains
+blocked on P27 phase 4 and is not started.**
 
 ---
 

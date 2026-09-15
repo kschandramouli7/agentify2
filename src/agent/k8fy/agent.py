@@ -1,5 +1,6 @@
 """K8fy agent: Claude-powered Kubernetes operations reasoning."""
 
+import datetime
 import functools
 import json
 import logging
@@ -534,16 +535,34 @@ def _focus_service(messages: List[Dict[str, Any]], context: Dict[str, Any], serv
     return ctx_service if isinstance(ctx_service, str) and ctx_service in services else None
 
 
+# ROADMAP P29 (second half): "trace <input>" is an explicit trigger word
+# chosen specifically so this route needs no inferred-intent gate the way
+# "dependencies" needs _NEEDS_SYNTHESIS_RE — an operator who types "trace"
+# means it literally, so there is no false-positive risk to guard against.
+_TRACE_TRIGGER_RE = re.compile(r"^\s*trace\s+(.+)$", re.IGNORECASE)
+
+
+def _trace_query_text(messages: List[Dict[str, Any]]) -> Optional[str]:
+    m = _TRACE_TRIGGER_RE.match(_latest_user_text(messages).strip())
+    return m.group(1).strip() if m else None
+
+
 def _chat_route(messages: List[Dict[str, Any]]) -> Optional[str]:
     """Which deterministic route, if any, should answer this chat turn.
 
-    Returns "dependencies" only when the latest turn is asking about the call
-    graph AND about nothing else. Deliberately conservative: a false negative
-    costs one model call and still shows the graph (reason_chat attaches it
-    either way), while a false positive answers a question the caller did not
-    ask and drops the part it cannot see.
+    Returns "trace" for an explicit "trace <input>" turn (checked first,
+    before the inferred-intent dependency check below — an explicit trigger
+    word should never lose to a keyword heuristic). Returns "dependencies"
+    only when the latest turn is asking about the call graph AND about
+    nothing else. Deliberately conservative: a false negative costs one model
+    call and still shows the graph (reason_chat attaches it either way),
+    while a false positive answers a question the caller did not ask and
+    drops the part it cannot see.
     """
-    lowered = _latest_user_text(messages).lower()
+    latest_raw = _latest_user_text(messages).strip()
+    if _TRACE_TRIGGER_RE.match(latest_raw):
+        return "trace"
+    lowered = latest_raw.lower()
     if not _DEPENDENCY_QUESTION_RE.search(lowered):
         return None
     if _NEEDS_SYNTHESIS_RE.search(lowered):
@@ -680,6 +699,76 @@ def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
         "service_graph": graph,
     }
     return answer, details
+
+
+def _trace_answer(query_text: str, result: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
+    """Prose + `details` for a "trace <input>" chat turn, with no model call —
+    same reasoning as _dependency_answer: this is a lookup with one correct
+    answer (what did Athena actually return), not a synthesis task.
+
+    Four distinct shapes, per ROADMAP P29's own framing of what each outcome
+    genuinely means:
+      - invalid input: the text didn't look like either a trace ID or a
+        "METHOD /path" — say so plainly, don't guess.
+      - query error: the Athena call itself failed.
+      - empty hops: no error, but nothing matched — states the genuine limit
+        (this only works when a service's own logs actually mention the
+        identifier) rather than implying the search itself is broken.
+      - hops found: hop count, span, first/last service, then the ordered
+        list — details["call_trace"] carries the ordered hops so the UI can
+        draw a sequence diagram instead of paraphrasing it.
+    """
+    if "error" in result:
+        if result.get("error_kind") == "invalid_input":
+            return (
+                f"\"{query_text}\" doesn't look like a trace ID or a \"METHOD /path\" "
+                f"(e.g. \"POST /charge\" or \"/charge\"). {result['error']}",
+                {"severity": "warning"},
+            )
+        return f"Trace search failed: {result['error']}", {"severity": "warning"}
+
+    hops = result["hops"]
+    kind_noun = "trace ID" if result["kind"] == "trace_id" else "URL/path"
+    hours_back = result["hours_back"]
+
+    if not hops:
+        return (
+            f'No log lines mentioned the {kind_noun} "{query_text}" in the last {hours_back}h '
+            "across any onboarded cluster. Either this request predates the search window, or "
+            f"none of the services it touched log this {kind_noun}.",
+            {"severity": "info", "call_trace": {"query": query_text, "kind": result["kind"], "hops": []}},
+        )
+
+    first, last = hops[0], hops[-1]
+    span_seconds = 0.0
+    try:
+        span_seconds = (
+            datetime.datetime.fromisoformat(last["timestamp"]) - datetime.datetime.fromisoformat(first["timestamp"])
+        ).total_seconds()
+    except ValueError:
+        pass
+    first_service = first["service"] or first["pod_name"]
+    last_service = last["service"] or last["pod_name"]
+
+    lines = [
+        f'"{query_text}" touched {len(hops)} log line{"" if len(hops) == 1 else "s"} '
+        f"across {len({h['cluster_id'] for h in hops})} cluster"
+        f"{'' if len({h['cluster_id'] for h in hops}) == 1 else 's'}, "
+        f"spanning {span_seconds:.2f}s from {first_service} to {last_service}.",
+        "",
+    ]
+    for h in hops:
+        service = h["service"] or f"{h['pod_name']} (unattributed)"
+        outcome = f" [{h['outcome']}]" if h["outcome"] else ""
+        lines.append(f"{h['seq']}. {h['timestamp']} — {service}{outcome}: {h['log_excerpt']}")
+    if result.get("unattributed_count"):
+        lines += ["", f"{result['unattributed_count']} log line(s) could not be attributed to a known service."]
+
+    details = {
+        "severity": "info",
+        "call_trace": {"query": query_text, "kind": result["kind"], "hops": hops},
+    }
+    return "\n".join(lines), details
 
 
 async def _resolve_namespace(question: str, backend_url: str) -> Optional[str]:
@@ -871,6 +960,15 @@ class K8fyAgent:
         self.effort = settings.claude_effort
         self.backend_url = settings.backend_url
         self.max_iterations = settings.agent_max_tool_iterations
+        # ROADMAP P29: the same global (not per-cluster) Athena config
+        # app.py already builds for dependency_miner.run_forever — a "trace
+        # <input>" chat turn (see reason_chat below) queries it on demand.
+        self.athena_config = {
+            "workgroup": settings.athena_workgroup,
+            "database": settings.athena_database,
+            "table": settings.athena_table,
+            "region": settings.aws_region,
+        }
         self._static_system_prompt = system_prompt
         self._prompt_name = prompt_name
         self._prompt_fallback = prompt_fallback or SYSTEM_PROMPT
@@ -1289,7 +1387,40 @@ class K8fyAgent:
         # graph, or an unexpected failure. A dependency question with no mined
         # evidence is better served by the model, which can explain why the
         # namespace is empty; a bare "no data" would be a dead end.
-        if _chat_route(messages) == "dependencies":
+        route = _chat_route(messages)
+
+        # ROADMAP P29: "trace <trace-id-or-path>" searches raw Athena logs
+        # on demand, across every onboarded cluster/namespace — a different
+        # question from "dependencies" (the pre-aggregated call graph) and
+        # answered by a different module entirely. Deterministic like the
+        # dependencies route below: one Athena query has one correct answer,
+        # no model call belongs in reading it back. A search failure (bad
+        # Athena config, a transient AWS error) falls through to the model
+        # rather than surfacing a raw exception — the same "never let
+        # observability take down the thing it's asked about" posture
+        # tracing.py's own docstring states for Langfuse.
+        if route == "trace":
+            from k8fy import trace_search  # lazy import — same rationale as _build_service_graph's
+
+            query_text = _trace_query_text(messages) or ""
+            try:
+                result = await trace_search.search_trace(query_text, self.backend_url, self.athena_config)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("trace search failed, falling back to model: %s", e)
+                result = None
+            if result is not None:
+                answer, details = _trace_answer(query_text, result)
+                metrics.record_request("ok")
+                logger.info(
+                    "chat answered deterministically: intent=trace kind=%s hops=%d",
+                    result.get("kind"), len(result.get("hops", [])),
+                )
+                return AgentResponse(
+                    answer=answer, status="ok", confidence=1.0,
+                    sources=["raw_logs (Athena)"], tool_calls=[], details=details, tier="tier1",
+                )
+
+        if route == "dependencies":
             try:
                 graph = await _build_service_graph(messages, context, self.backend_url)
             except Exception as e:  # noqa: BLE001

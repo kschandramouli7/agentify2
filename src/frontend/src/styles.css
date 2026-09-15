@@ -1539,6 +1539,15 @@ code {
 .adm-panel__section { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
 .adm-panel__section h3 { margin: 0 0 4px; font-size: 15px; font-weight: 700; }
 .adm-panel__section > .adm-panel__desc { margin-bottom: 12px; }
+.topo-trace__result {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
 
 .adm-updated { font-size: 12px; color: var(--muted); white-space: nowrap; align-self: center; }
 .adm-loading { color: var(--muted); font-size: 13px; }
@@ -3127,3 +3136,35 @@ code {
   border-top: 2px solid var(--dim);
 }
 .flow-toobig { margin-bottom: 16px; }
+
+/* SequenceDiagram (ROADMAP P29) — one call's ordered hops, deliberately a
+   simpler layout than .flow above: order is already given by the data, so
+   this is N lifelines + one row per hop, not a layered graph. */
+.seq { margin: 10px 0; }
+.seq__caveat {
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--dim);
+  border-radius: var(--r-sm);
+}
+.seq__scroll { overflow-x: auto; overflow-y: hidden; padding: 2px 0 6px; }
+.seq__svg { display: block; max-width: none; }
+.seq__lane-label { fill: var(--text); font-size: 12px; font-weight: 600; text-anchor: middle; }
+.seq__lifeline { stroke: var(--border); stroke-width: 1.5; }
+.seq__tick { stroke: var(--surface); stroke-width: 1.5; }
+.seq__tick--ok    { fill: var(--ok); }
+.seq__tick--warn  { fill: var(--warn); }
+.seq__tick--crit  { fill: var(--crit); }
+.seq__tick--muted { fill: var(--dim); }
+.seq__tick-label { fill: var(--muted); font-size: 10px; }
+.seq__arrow { stroke: var(--dim); stroke-width: 1.5; }
+.seq__arrow--ok    { stroke: var(--ok); }
+.seq__arrow--warn  { stroke: var(--warn); }
+.seq__arrow--crit  { stroke: var(--crit); }
+.seq__arrow-label { fill: var(--muted); font-size: 10px; text-anchor: middle; }
+.seq__arrowhead { fill: var(--dim); }

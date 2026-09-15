@@ -107,6 +107,28 @@ export interface RecommendedAction {
   arguments: Record<string, unknown>;
 }
 
+// One ordered log-line match for a "trace <input>" chat turn (ROADMAP P29).
+// `service`/`outcome` are nullable: a matching row that couldn't be
+// attributed to a known service, or whose line carried no classifiable
+// outcome, is still included — see trace_search.py's own "never silently
+// drop" convention — never omitted just because part of it is unknown.
+export interface TraceHop {
+  seq: number;
+  timestamp: string;
+  cluster_id: string;
+  namespace: string;
+  service: string | null;
+  pod_name: string;
+  outcome: "success" | "failure" | "timeout" | null;
+  log_excerpt: string;
+}
+
+export interface CallTrace {
+  query: string;
+  kind: "trace_id" | "url_path";
+  hops: TraceHop[];
+}
+
 export interface ChatMessageDetails {
   status?: string;
   severity?: string;
@@ -127,6 +149,12 @@ export interface ChatMessageDetails {
     focus?: string | null;
     dependencies: ServiceDependency[];
   };
+  /**
+   * The ordered result of a "trace <input>" chat turn (ROADMAP P29) — one
+   * on-demand raw-log search across every onboarded cluster, rendered as a
+   * sequence diagram rather than paraphrased, same reasoning as service_graph.
+   */
+  call_trace?: CallTrace;
 }
 
 export interface ChatMessage {
