@@ -19,7 +19,10 @@ function relTime(iso: string) {
 
 // ── Message bubble ────────────────────────────────────────────────────────────
 
-function Bubble({ msg }: { msg: ChatMessage }) {
+// Exported so DependencyChatPanel.tsx (ROADMAP P29's docked chat panel in
+// the Dependencies view) can render messages identically, rather than
+// reimplementing the structured-details-vs-prose branch a second time.
+export function Bubble({ msg }: { msg: ChatMessage }) {
   const isUser = msg.role === "user";
   const hasStructuredDetails =
     !isUser && msg.details && Object.keys(msg.details).length > 0;

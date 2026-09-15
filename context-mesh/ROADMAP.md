@@ -2730,15 +2730,49 @@ that actually appear in the matched rows. Wired into `agent.py`'s
 call) — an explicit `"trace <input>"` trigger checked before the inferred
 `"dependencies"` heuristic, so it never loses to a keyword guess. Rendered
 as a hand-rolled SVG sequence diagram (`SequenceDiagram.tsx`, no new
-dependency — none is installed anywhere in this repo) inline in the
-Dependencies panel via a real text box that replaces the "Ask about
-dependencies" placeholder button shipped 2026-09-12, composing
-`"trace " + input` through the existing chat-send path (no new backend
-endpoint). No Go backend changes were needed — `/admin/integrations` and
-`/api/cluster-service-selectors` already sufficed. 42 new tests (30 in
-`test_trace_search.py`, 12 in `test_chat_trace.py`), full existing suite
-green. **Half (1) — the path-filtered view of the mined graph — remains
-blocked on P27 phase 4 and is not started.**
+dependency — none is installed anywhere in this repo), surfaced via
+`DiagnosisReport`'s `call_trace` section — the same generic structured-
+details renderer every other deterministic/model answer already uses, so
+it draws identically whichever surface answered.
+
+**Delivery UX revised same day:** the original single inline text box
+(replacing the "Ask about dependencies" placeholder button shipped
+2026-09-12) was itself replaced by a **docked chat panel** —
+`DependencyChatPanel.tsx` — in a new two-column layout (`TopologyPanel.tsx`'s
+`.topo-columns`: mined graph on the left, chat on the right, stacking below
+900px). Matches the Investigate page's interface (`ChatPanel.tsx`) rather
+than a bare search box: a welcome message suggests both trace-ID/URL-path
+search and free-form questions, with example buttons; ordinary questions
+route exactly like the Investigate page always has (deterministic first,
+model as fallback), scoped to this namespace and, when one is focused, that
+service — since `createChatSession({namespace, service})` threads both into
+every message this session sends. One difference from the Investigate page
+by design: no session-list sidebar, since this is one running conversation
+for the current namespace view, not a multi-conversation manager — the
+panel remounts (`key={namespace}`) on namespace change, starting fresh
+rather than carrying stale context forward. `Bubble` is now exported from
+`ChatPanel.tsx` so both surfaces render messages identically rather than
+duplicating the structured-details-vs-prose branch.
+
+Fixed along the way: `_trace_answer`'s `details` dict must be **empty**
+(`{}`) for every outcome except "hops found" — `ChatPanel.tsx`'s `Bubble`
+renders structured `details` INSTEAD OF the prose `answer` whenever
+`details` has any key at all, so the first version's `{"severity": ...}`
+on every branch was silently hiding the invalid-input/error/empty-result
+prose behind a blank report. Only "hops found" now attaches
+`details["call_trace"]` (for the diagram) and `details["incident_summary"]`
+(so the chat bubble's banner shows the headline, not nothing).
+
+No Go backend changes were needed anywhere in this item — `/admin/integrations`
+and `/api/cluster-service-selectors` already sufficed, and the Go chat
+handler already passes `agentResp.Details` through as a flexible map. 43
+new/updated tests (30 in `test_trace_search.py`, 13 in `test_chat_trace.py`),
+full existing suite green, `tsc`/production build clean. **Not yet done:
+a live browser check** — no browser-automation tool is available in this
+environment, so the layout/panel was verified via type-checking and a
+production build only, not by actually looking at it render. **Half (1) —
+the path-filtered view of the mined graph — remains blocked on P27 phase 4
+and is not started.**
 
 ---
 

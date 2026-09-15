@@ -1539,15 +1539,6 @@ code {
 .adm-panel__section { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
 .adm-panel__section h3 { margin: 0 0 4px; font-size: 15px; font-weight: 700; }
 .adm-panel__section > .adm-panel__desc { margin-bottom: 12px; }
-.topo-trace__result {
-  margin-top: 10px;
-  padding: 10px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  font-size: 12.5px;
-  line-height: 1.55;
-}
 
 .adm-updated { font-size: 12px; color: var(--muted); white-space: nowrap; align-self: center; }
 .adm-loading { color: var(--muted); font-size: 13px; }
@@ -2875,6 +2866,49 @@ code {
    tooltip, never colour alone. */
 .topo-evidence--rare .topo-evidence__fill { background: var(--warn); }
 .topo-evidence--new  .topo-evidence__fill { background: var(--dim); }
+
+/* Two-column layout (ROADMAP P29): the mined graph and its detail on the
+   left, a docked chat panel on the right — "what has this namespace
+   historically done" next to "ask about it or trace one specific call",
+   rather than the chat living on a separate tab. Stacks on narrow viewports
+   since a side-by-side chat panel has no room to be useful below ~900px. */
+.topo-columns { display: flex; gap: 20px; align-items: flex-start; }
+.topo-main { flex: 1; min-width: 0; }
+.topo-side { width: 340px; flex: none; }
+@media (max-width: 900px) {
+  .topo-columns { flex-direction: column; }
+  .topo-side { width: 100%; }
+}
+
+.topo-chat {
+  display: flex;
+  flex-direction: column;
+  height: 560px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.topo-chat__thread {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+/* Bubbles reuse ChatPanel.tsx's own classes but need to fit a ~340px rail
+   instead of a 740px-wide conversation column. */
+.topo-chat__thread .chat-bubble { max-width: 100%; }
+.topo-chat__welcome {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.topo-chat__welcome p { margin: 0 0 12px; }
+.topo-chat__welcome code { color: var(--text); }
+.topo-chat__examples { display: flex; flex-direction: column; gap: 6px; }
+.topo-chat .chat-input-row { padding: 10px; }
 
 /* The finding, not a decoration: an edge the miner rarely catches means it is
    probably missing edges entirely, so this sits above the diagram rather than

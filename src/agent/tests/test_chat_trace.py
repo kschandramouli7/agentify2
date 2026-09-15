@@ -68,22 +68,27 @@ def test_trace_query_text_extracts_the_input():
 # ── _trace_answer prose ───────────────────────────────────────────────────────
 
 def test_trace_answer_invalid_input():
+    """details must be EMPTY here, not just missing call_trace: the frontend
+    hides `answer` entirely whenever `details` has ANY key, so an
+    error/empty-result answer with a non-empty details dict would silently
+    disappear behind a blank report — see this function's own docstring."""
     answer, details = _trace_answer("nonsense", {"error": "bad shape", "error_kind": "invalid_input"})
     assert "doesn't look like a trace ID" in answer
-    assert "call_trace" not in details
+    assert details == {}
 
 
 def test_trace_answer_query_error():
     answer, details = _trace_answer("POST /charge", {"error": "Athena timed out", "error_kind": "query_failed"})
     assert "Trace search failed" in answer
     assert "Athena timed out" in answer
+    assert details == {}
 
 
 def test_trace_answer_empty_hops_states_the_genuine_limit():
     result = {"kind": "url_path", "query": "POST /charge", "hours_back": 24, "hops": [], "unattributed_count": 0}
     answer, details = _trace_answer("POST /charge", result)
     assert "No log lines mentioned" in answer
-    assert details["call_trace"]["hops"] == []
+    assert details == {}
 
 
 def test_trace_answer_hops_found():
@@ -103,6 +108,21 @@ def test_trace_answer_hops_found():
     assert "2 log lines" in answer
     assert "frontend" in answer and "payment-api" in answer
     assert details["call_trace"]["hops"] == result["hops"]
+    # The banner in DiagnosisReport reads incident_summary — must be set, or
+    # the chat bubble would show an empty report once details is non-empty.
+    assert details["incident_summary"] == answer.split("\n")[0]
+
+
+def test_trace_answer_hops_found_notes_unattributed_count():
+    result = {
+        "kind": "trace_id", "query": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4", "hours_back": 24,
+        "hops": [{"seq": 1, "timestamp": "2026-09-15T10:00:00+00:00", "cluster_id": "cluster-a",
+                  "namespace": "payments", "service": None, "pod_name": "unknown-pod-abc",
+                  "outcome": None, "log_excerpt": "handling trace"}],
+        "unattributed_count": 1,
+    }
+    _, details = _trace_answer("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4", result)
+    assert any("could not be attributed" in f for f in details["findings"])
 
 
 # ── reason_chat wiring ────────────────────────────────────────────────────────

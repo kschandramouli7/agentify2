@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listServiceDependencies, listClusterIngress, listScanCoverage, listServiceProfiles,
-  listServiceHealth, createChatSession, sendChatMessage,
-  type ServiceDependency, type CallTrace,
+  listServiceHealth,
+  type ServiceDependency,
 } from "../api";
 import { DependencyFlow, confidence, edgeHealth, rarelyObserved, silentServices, unhealthyEdges, type FlowEdge, type NodeMeta } from "./DependencyFlow";
-import { SequenceDiagram } from "./SequenceDiagram";
+import { DependencyChatPanel } from "./DependencyChatPanel";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
 //
@@ -235,36 +235,6 @@ export function TopologyPanel() {
   const [typed, setTyped] = useState("");
   const [focus, setFocus] = useState<string | null>(null);
   const [showMermaid, setShowMermaid] = useState(false);
-
-  // ROADMAP P29 — "trace <trace-id-or-path>" inline search. A lazily-created
-  // chat session, reused across searches in this panel visit rather than one
-  // per query: it's a real row that will also show up in the Chat tab's own
-  // session list (an accepted, cosmetic side effect of reusing the existing
-  // send path — see the plan — rather than adding a dedicated endpoint).
-  const traceSessionIdRef = useRef<string | null>(null);
-  const [traceInput, setTraceInput] = useState("");
-  const [traceBusy, setTraceBusy] = useState(false);
-  const [traceResult, setTraceResult] = useState<{ answer: string; call_trace?: CallTrace } | null>(null);
-  const [traceError, setTraceError] = useState<string | null>(null);
-
-  async function submitTrace() {
-    const input = traceInput.trim();
-    if (!input) return;
-    setTraceBusy(true);
-    setTraceError(null);
-    try {
-      if (!traceSessionIdRef.current) {
-        const session = await createChatSession({ namespace: applied });
-        traceSessionIdRef.current = session.id;
-      }
-      const { message } = await sendChatMessage(traceSessionIdRef.current, `trace ${input}`);
-      setTraceResult({ answer: message.content, call_trace: message.details?.call_trace });
-    } catch (e) {
-      setTraceError(e instanceof Error ? e.message : "trace search failed");
-    } finally {
-      setTraceBusy(false);
-    }
-  }
 
   // Poll while empty (discovery may not have pushed inventory yet), then back
   // off — the same pattern SearchInput uses against this endpoint.
@@ -530,239 +500,214 @@ export function TopologyPanel() {
         </div>
       </div>
 
-      {/* ROADMAP P29 — traces one specific call (a trace ID or "METHOD
-        * /path") across every onboarded cluster's raw logs, distinct from
-        * the aggregate graph below: "what happened for this one call" vs.
-        * "what has this namespace historically done". */}
-      <div className="adm-panel__section">
-        <h3>Trace a specific call</h3>
-        <p className="adm-panel__desc">
-          Paste a trace ID or a request like <code>POST /charge</code> to search raw logs
-          across every onboarded cluster for what that specific call touched, in order.
-        </p>
-        <div className="adm-filters">
-          <input
-            className="adm-date-input"
-            style={{ minWidth: 260 }}
-            value={traceInput}
-            onChange={e => setTraceInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter" && traceInput.trim() && !traceBusy) submitTrace(); }}
-            placeholder="trace ID or POST /charge"
-            aria-label="Trace ID or URL/path"
-          />
-          <button
-            className="adm-btn adm-btn--ghost"
-            type="button"
-            disabled={!traceInput.trim() || traceBusy}
-            onClick={submitTrace}
-          >
-            {traceBusy ? "Searching…" : "Trace"}
-          </button>
-        </div>
-        {traceError && <p className="adm-error">{traceError}</p>}
-        {traceResult && (
-          <div className="topo-trace__result">
-            <p style={{ whiteSpace: "pre-wrap" }}>{traceResult.answer}</p>
-            {traceResult.call_trace && traceResult.call_trace.hops.length > 0 && (
-              <SequenceDiagram trace={traceResult.call_trace} />
-            )}
-          </div>
-        )}
-      </div>
-
-      {isLoading && <p className="adm-loading">Loading…</p>}
-      {isError && (
-        <p className="adm-error">{error instanceof Error ? error.message : "Failed to load dependencies."}</p>
-      )}
-
-      {!isLoading && !isError && graph.edges.length === 0 && arch.standalone.length === 0 && (
-        <div className="adm-empty">
-          <p>
-            No dependency evidence for <strong>{applied}</strong>
-            {inventory.length > 0 && <> — and no services in the inventory either</>}.
-          </p>
-          <p className="adm-muted">
-            Expected when nothing in the namespace logs a callee's hostname. The miner needs
-            the caller to have a Service (to attribute <code>from_service</code>) and to print
-            the target host — either <code>svc.ns</code> or a bare <code>//svc</code> /
-            <code>svc:port</code>. <code>docs/SERVICE_DEPENDENCIES.md</code> §4 lists the eight
-            reasons a namespace comes back empty, in order of likelihood.
-          </p>
-        </div>
-      )}
-
-      {(graph.edges.length > 0 || arch.standalone.length > 0) && (
-        <>
-          <div className="adm-stats-row">
-            <StatCard
-              label="Services"
-              value={String(Math.max(arch.known.size, graph.services.length))}
-              sub={
-                arch.standalone.length > 0
-                  ? `${arch.standalone.length} with no observed calls`
-                  : "all appear in the graph"
-              }
-            />
-            <StatCard
-              label="Observed calls"
-              value={String(graph.edges.length)}
-              sub={ingress.length > 0 ? `+ ${ingress.length} declared route${ingress.length === 1 ? "" : "s"}` : undefined}
-            />
-            <StatCard
-              label="Entry points"
-              value={String(graph.entries.length)}
-              sub={summarise(graph.entries, "every service has a caller")}
-            />
-            <StatCard
-              label="Terminal"
-              value={String(graph.terminals.length)}
-              sub={summarise(graph.terminals, "none observed")}
-            />
-            <StatCard
-              label="Stale edges"
-              value={String(graph.staleCount)}
-              sub={graph.staleCount > 0 ? "no evidence in 15m" : "all fresh"}
-            />
-          </div>
-
-          {unhealthy.length > 0 && (
-            <p className="topo-gap">
-              <span className={`adm-badge adm-badge--${unhealthy.some(e => edgeHealth(e).key === "failing") ? "crit" : "warn"}`}>
-                unhealthy
-              </span>{" "}
-              {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
-              {unhealthy.map(e => {
-                const h = edgeHealth(e);
-                return `${e.from_service}→${e.to_service} (${h.badCount}/${h.classified} failed)`;
-              }).join(", ")}. Based only on calls with a classified outcome — most evidence has
-              none yet (outcome inference is deliberately conservative), so this is a lower bound
-              on how many dependencies are actually unhealthy, not the full picture.
-            </p>
+      <div className="topo-columns">
+        <div className="topo-main">
+          {isLoading && <p className="adm-loading">Loading…</p>}
+          {isError && (
+            <p className="adm-error">{error instanceof Error ? error.message : "Failed to load dependencies."}</p>
           )}
 
-          {rare.length > 0 && (
-            <p className="topo-gap">
-              <span className="adm-badge adm-badge--warn">incomplete</span>{" "}
-              {rare.length === 1 ? "1 edge is" : `${rare.length} edges are`} caught in under a
-              quarter of scans ({rare.map(e => `${e.from_service}→${e.to_service}`).join(", ")}).
-              The miner samples only 5 pods per namespace and the last 200 log lines, so edges
-              it rarely catches are a sign it is <strong>missing others entirely</strong> — treat
-              this graph as more incomplete than the counts suggest.
-            </p>
-          )}
-
-          {/* The collector-down banner.
-            *
-            * Deliberately ONE banner rather than a warning on every node: if
-            * the whole pipeline has stopped, every box is equally old and
-            * marking them all individually communicates less, not more. The
-            * per-node marker (see NodeMeta.unreportedForMs) handles the
-            * opposite, asymmetric case.
-            *
-            * This is the layer that had no staleness signal at all until
-            * 2026-09-05. Edges have had one since they shipped — dashed past
-            * 15 minutes, with a "Stale edges" stat above. The node boxes drew
-            * live pod health with no way to tell 30 seconds from 3 hours,
-            * which is the same defect class as OPS-10/11/12: a confident
-            * number over data with no validity check. */}
-          {arch.newestLive !== null && Date.now() - arch.newestLive > STALE_AFTER_MS && (
-            <p className="topo-gap">
-              <span className="adm-badge adm-badge--warn">not live</span>{" "}
-              No pod state has been reported for <strong>any</strong> service in this namespace
-              since {relTime(new Date(arch.newestLive).toISOString())} (
-              {absTime(new Date(arch.newestLive).toISOString())}). Replica counts, readiness and
-              restarts below are a <strong>snapshot from then</strong>, not current state — the
-              discovery collector has most likely stopped. The declared structure (services,
-              ingress, ports) is still accurate; only the live numbers are frozen.
-            </p>
-          )}
-
-          <DependencyFlow
-            edges={arch.edges}
-            standalone={arch.standalone}
-            meta={arch.meta}
-            focus={selected}
-            onFocus={setFocus}
-          />
-
-          <div className="topo-focus">
-            <div className="topo-focus__services">
-              <span className="adm-muted topo-focus__hint">Focus a service:</span>
-              {graph.services.map(s => (
-                <button
-                  key={s}
-                  type="button"
-                  className={`topo-chip${selected === s ? " topo-chip--active" : ""}`}
-                  onClick={() => setFocus(selected === s ? null : s)}
-                >
-                  {s}
-                </button>
-              ))}
+          {!isLoading && !isError && graph.edges.length === 0 && arch.standalone.length === 0 && (
+            <div className="adm-empty">
+              <p>
+                No dependency evidence for <strong>{applied}</strong>
+                {inventory.length > 0 && <> — and no services in the inventory either</>}.
+              </p>
+              <p className="adm-muted">
+                Expected when nothing in the namespace logs a callee's hostname. The miner needs
+                the caller to have a Service (to attribute <code>from_service</code>) and to print
+                the target host — either <code>svc.ns</code> or a bare <code>//svc</code> /
+                <code>svc:port</code>. <code>docs/SERVICE_DEPENDENCIES.md</code> §4 lists the eight
+                reasons a namespace comes back empty, in order of likelihood.
+              </p>
             </div>
+          )}
 
-            {selected && (
-              <div className="topo-focus__detail">
-                <div className="topo-focus__col">
-                  <h4>{selected} calls</h4>
-                  <EdgeList
-                    edges={graph.callees.get(selected) ?? []}
-                    direction="out" onSelect={setFocus}
-                  />
-                </div>
-                <div className="topo-focus__col">
-                  <h4>Called by {selected}</h4>
-                  <EdgeList
-                    edges={graph.callers.get(selected) ?? []}
-                    direction="in" onSelect={setFocus}
-                  />
-                </div>
+          {(graph.edges.length > 0 || arch.standalone.length > 0) && (
+            <>
+              <div className="adm-stats-row">
+                <StatCard
+                  label="Services"
+                  value={String(Math.max(arch.known.size, graph.services.length))}
+                  sub={
+                    arch.standalone.length > 0
+                      ? `${arch.standalone.length} with no observed calls`
+                      : "all appear in the graph"
+                  }
+                />
+                <StatCard
+                  label="Observed calls"
+                  value={String(graph.edges.length)}
+                  sub={ingress.length > 0 ? `+ ${ingress.length} declared route${ingress.length === 1 ? "" : "s"}` : undefined}
+                />
+                <StatCard
+                  label="Entry points"
+                  value={String(graph.entries.length)}
+                  sub={summarise(graph.entries, "every service has a caller")}
+                />
+                <StatCard
+                  label="Terminal"
+                  value={String(graph.terminals.length)}
+                  sub={summarise(graph.terminals, "none observed")}
+                />
+                <StatCard
+                  label="Stale edges"
+                  value={String(graph.staleCount)}
+                  sub={graph.staleCount > 0 ? "no evidence in 15m" : "all fresh"}
+                />
               </div>
-            )}
-          </div>
 
-          <div className="adm-table-wrap">
-            <table className="adm-table">
-              <thead>
-                <tr>
-                  <th>From</th><th></th><th>To</th><th>Port</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
-                </tr>
-              </thead>
-              <tbody>
-                {graph.edges
-                  .slice()
-                  .sort((a, b) => b.evidence_count - a.evidence_count)
-                  .map(e => (
-                    <tr key={e.id}>
-                      <td><button type="button" className="topo-link" onClick={() => setFocus(e.from_service)}>{e.from_service}</button></td>
-                      <td className="adm-muted">→</td>
-                      <td><button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button></td>
-                      <td className="adm-muted">{e.port ? e.port : "—"}</td>
-                      <td><EvidenceBar edge={e} /></td>
-                      <td><HealthCell edge={e} /></td>
-                      <td><Freshness lastSeen={e.last_seen} /></td>
-                      <td className="adm-muted" title={absTime(e.first_seen)}>{relTime(e.first_seen)}</td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="topo-export">
-            <button className="adm-btn adm-btn--ghost" type="button" onClick={() => setShowMermaid(v => !v)}>
-              {showMermaid ? "Hide" : "Show"} Mermaid diagram
-            </button>
-            {showMermaid && (
-              <>
-                <p className="adm-muted topo-export__hint">
-                  Paste into a Markdown file, PR or incident writeup — GitHub renders it. Edge
-                  labels are observation counts.
+              {unhealthy.length > 0 && (
+                <p className="topo-gap">
+                  <span className={`adm-badge adm-badge--${unhealthy.some(e => edgeHealth(e).key === "failing") ? "crit" : "warn"}`}>
+                    unhealthy
+                  </span>{" "}
+                  {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
+                  {unhealthy.map(e => {
+                    const h = edgeHealth(e);
+                    return `${e.from_service}→${e.to_service} (${h.badCount}/${h.classified} failed)`;
+                  }).join(", ")}. Based only on calls with a classified outcome — most evidence has
+                  none yet (outcome inference is deliberately conservative), so this is a lower bound
+                  on how many dependencies are actually unhealthy, not the full picture.
                 </p>
-                <pre className="topo-export__code">{toMermaid(graph, applied)}</pre>
-              </>
-            )}
-          </div>
-        </>
-      )}
+              )}
+
+              {rare.length > 0 && (
+                <p className="topo-gap">
+                  <span className="adm-badge adm-badge--warn">incomplete</span>{" "}
+                  {rare.length === 1 ? "1 edge is" : `${rare.length} edges are`} caught in under a
+                  quarter of scans ({rare.map(e => `${e.from_service}→${e.to_service}`).join(", ")}).
+                  The miner samples only 5 pods per namespace and the last 200 log lines, so edges
+                  it rarely catches are a sign it is <strong>missing others entirely</strong> — treat
+                  this graph as more incomplete than the counts suggest.
+                </p>
+              )}
+
+              {/* The collector-down banner.
+                *
+                * Deliberately ONE banner rather than a warning on every node: if
+                * the whole pipeline has stopped, every box is equally old and
+                * marking them all individually communicates less, not more. The
+                * per-node marker (see NodeMeta.unreportedForMs) handles the
+                * opposite, asymmetric case.
+                *
+                * This is the layer that had no staleness signal at all until
+                * 2026-09-05. Edges have had one since they shipped — dashed past
+                * 15 minutes, with a "Stale edges" stat above. The node boxes drew
+                * live pod health with no way to tell 30 seconds from 3 hours,
+                * which is the same defect class as OPS-10/11/12: a confident
+                * number over data with no validity check. */}
+              {arch.newestLive !== null && Date.now() - arch.newestLive > STALE_AFTER_MS && (
+                <p className="topo-gap">
+                  <span className="adm-badge adm-badge--warn">not live</span>{" "}
+                  No pod state has been reported for <strong>any</strong> service in this namespace
+                  since {relTime(new Date(arch.newestLive).toISOString())} (
+                  {absTime(new Date(arch.newestLive).toISOString())}). Replica counts, readiness and
+                  restarts below are a <strong>snapshot from then</strong>, not current state — the
+                  discovery collector has most likely stopped. The declared structure (services,
+                  ingress, ports) is still accurate; only the live numbers are frozen.
+                </p>
+              )}
+
+              <DependencyFlow
+                edges={arch.edges}
+                standalone={arch.standalone}
+                meta={arch.meta}
+                focus={selected}
+                onFocus={setFocus}
+              />
+
+              <div className="topo-focus">
+                <div className="topo-focus__services">
+                  <span className="adm-muted topo-focus__hint">Focus a service:</span>
+                  {graph.services.map(s => (
+                    <button
+                      key={s}
+                      type="button"
+                      className={`topo-chip${selected === s ? " topo-chip--active" : ""}`}
+                      onClick={() => setFocus(selected === s ? null : s)}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+
+                {selected && (
+                  <div className="topo-focus__detail">
+                    <div className="topo-focus__col">
+                      <h4>{selected} calls</h4>
+                      <EdgeList
+                        edges={graph.callees.get(selected) ?? []}
+                        direction="out" onSelect={setFocus}
+                      />
+                    </div>
+                    <div className="topo-focus__col">
+                      <h4>Called by {selected}</h4>
+                      <EdgeList
+                        edges={graph.callers.get(selected) ?? []}
+                        direction="in" onSelect={setFocus}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="adm-table-wrap">
+                <table className="adm-table">
+                  <thead>
+                    <tr>
+                      <th>From</th><th></th><th>To</th><th>Port</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {graph.edges
+                      .slice()
+                      .sort((a, b) => b.evidence_count - a.evidence_count)
+                      .map(e => (
+                        <tr key={e.id}>
+                          <td><button type="button" className="topo-link" onClick={() => setFocus(e.from_service)}>{e.from_service}</button></td>
+                          <td className="adm-muted">→</td>
+                          <td><button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button></td>
+                          <td className="adm-muted">{e.port ? e.port : "—"}</td>
+                          <td><EvidenceBar edge={e} /></td>
+                          <td><HealthCell edge={e} /></td>
+                          <td><Freshness lastSeen={e.last_seen} /></td>
+                          <td className="adm-muted" title={absTime(e.first_seen)}>{relTime(e.first_seen)}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="topo-export">
+                <button className="adm-btn adm-btn--ghost" type="button" onClick={() => setShowMermaid(v => !v)}>
+                  {showMermaid ? "Hide" : "Show"} Mermaid diagram
+                </button>
+                {showMermaid && (
+                  <>
+                    <p className="adm-muted topo-export__hint">
+                      Paste into a Markdown file, PR or incident writeup — GitHub renders it. Edge
+                      labels are observation counts.
+                    </p>
+                    <pre className="topo-export__code">{toMermaid(graph, applied)}</pre>
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* ROADMAP P29 — a docked chat panel, not a plain search box: search
+          * a specific call (a trace ID or "METHOD /path") across every
+          * onboarded cluster's raw logs, or ask a free-form question about
+          * this namespace's dependencies, the same interface style as the
+          * Investigate page. Remounted on namespace change (key={applied})
+          * so switching namespaces starts a fresh conversation rather than
+          * carrying stale context forward. */}
+        <div className="topo-side">
+          <DependencyChatPanel key={applied} namespace={applied} focus={selected} />
+        </div>
+      </div>
     </div>
   );
 }

@@ -706,26 +706,35 @@ def _trace_answer(query_text: str, result: Dict[str, Any]) -> "tuple[str, Dict[s
     same reasoning as _dependency_answer: this is a lookup with one correct
     answer (what did Athena actually return), not a synthesis task.
 
-    Four distinct shapes, per ROADMAP P29's own framing of what each outcome
-    genuinely means:
-      - invalid input: the text didn't look like either a trace ID or a
-        "METHOD /path" — say so plainly, don't guess.
-      - query error: the Athena call itself failed.
-      - empty hops: no error, but nothing matched — states the genuine limit
-        (this only works when a service's own logs actually mention the
-        identifier) rather than implying the search itself is broken.
+    `details` is deliberately EMPTY ({}) for every outcome except "hops
+    found": the frontend's Bubble component renders structured `details`
+    INSTEAD OF the prose `answer` whenever `details` has any keys at all
+    (same convention DiagnosisReport's other callers rely on), so attaching
+    an empty-but-non-empty details dict to an error/empty-result answer would
+    silently hide that answer's own prose behind an empty report. Only the
+    "hops found" case has something worth structuring: `details["call_trace"]`
+    carries the ordered hops so the UI draws a sequence diagram, and
+    `details["incident_summary"]` carries the same headline the prose leads
+    with, so the chat bubble's banner isn't blank.
+
+    Three distinct shapes, per ROADMAP P29's own framing of what each
+    outcome genuinely means:
+      - invalid input / query error: say so plainly, don't guess.
+      - empty hops: states the genuine limit (this only works when a
+        service's own logs actually mention the identifier) rather than
+        implying the search itself is broken.
       - hops found: hop count, span, first/last service, then the ordered
-        list — details["call_trace"] carries the ordered hops so the UI can
-        draw a sequence diagram instead of paraphrasing it.
+        list as prose (kept in `answer` for any consumer that only reads
+        plain text) alongside the structured `call_trace` for the diagram.
     """
     if "error" in result:
         if result.get("error_kind") == "invalid_input":
             return (
                 f"\"{query_text}\" doesn't look like a trace ID or a \"METHOD /path\" "
                 f"(e.g. \"POST /charge\" or \"/charge\"). {result['error']}",
-                {"severity": "warning"},
+                {},
             )
-        return f"Trace search failed: {result['error']}", {"severity": "warning"}
+        return f"Trace search failed: {result['error']}", {}
 
     hops = result["hops"]
     kind_noun = "trace ID" if result["kind"] == "trace_id" else "URL/path"
@@ -736,7 +745,7 @@ def _trace_answer(query_text: str, result: Dict[str, Any]) -> "tuple[str, Dict[s
             f'No log lines mentioned the {kind_noun} "{query_text}" in the last {hours_back}h '
             "across any onboarded cluster. Either this request predates the search window, or "
             f"none of the services it touched log this {kind_noun}.",
-            {"severity": "info", "call_trace": {"query": query_text, "kind": result["kind"], "hops": []}},
+            {},
         )
 
     first, last = hops[0], hops[-1]
@@ -750,22 +759,24 @@ def _trace_answer(query_text: str, result: Dict[str, Any]) -> "tuple[str, Dict[s
     first_service = first["service"] or first["pod_name"]
     last_service = last["service"] or last["pod_name"]
 
-    lines = [
+    headline = (
         f'"{query_text}" touched {len(hops)} log line{"" if len(hops) == 1 else "s"} '
         f"across {len({h['cluster_id'] for h in hops})} cluster"
         f"{'' if len({h['cluster_id'] for h in hops}) == 1 else 's'}, "
-        f"spanning {span_seconds:.2f}s from {first_service} to {last_service}.",
-        "",
-    ]
+        f"spanning {span_seconds:.2f}s from {first_service} to {last_service}."
+    )
+    lines = [headline, ""]
     for h in hops:
         service = h["service"] or f"{h['pod_name']} (unattributed)"
         outcome = f" [{h['outcome']}]" if h["outcome"] else ""
         lines.append(f"{h['seq']}. {h['timestamp']} — {service}{outcome}: {h['log_excerpt']}")
+    findings = []
     if result.get("unattributed_count"):
-        lines += ["", f"{result['unattributed_count']} log line(s) could not be attributed to a known service."]
+        findings.append(f"{result['unattributed_count']} log line(s) could not be attributed to a known service.")
 
     details = {
-        "severity": "info",
+        "incident_summary": headline,
+        "findings": findings,
         "call_trace": {"query": query_text, "kind": result["kind"], "hops": hops},
     }
     return "\n".join(lines), details

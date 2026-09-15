@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { runLiveTool, type ChatMessageDetails, type RecommendedAction, type ServiceDependency } from "../api";
 import { DependencyFlow, reach } from "./DependencyFlow";
+import { SequenceDiagram } from "./SequenceDiagram";
 
 function statusIcon(status: string): string {
   if (status === "healthy") return "✓";
@@ -522,6 +523,12 @@ export function DiagnosisReport({ details }: { details: ChatMessageDetails }) {
 
       {(details.service_graph?.dependencies ?? []).length > 0 && (
         <ServiceGraphSection graph={details.service_graph!} />
+      )}
+
+      {/* ROADMAP P29 — the ordered result of a "trace <input>" chat turn:
+          which services one specific call touched, and in what order. */}
+      {(details.call_trace?.hops ?? []).length > 0 && (
+        <SequenceDiagram trace={details.call_trace!} />
       )}
 
       {(details.recommended_actions ?? []).length > 0 && (
