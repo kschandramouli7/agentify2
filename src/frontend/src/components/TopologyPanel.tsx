@@ -127,12 +127,47 @@ function summarise(names: string[], emptyText: string): string {
   return `${names.slice(0, 2).join(", ")} +${names.length - 2} more`;
 }
 
-function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function StatCard({
+  label, value, sub, icon, warn,
+}: {
+  label: string; value: string; sub?: string; icon: string;
+  // Only a genuine problem earns the warn tint (e.g. stale edges > 0) — a
+  // plain count (services, entry points) never gets colour, matching this
+  // app's own "colour is reserved for state, never decoration" rule.
+  warn?: boolean;
+}) {
   return (
-    <div className="adm-stat">
+    <div className={`adm-stat${warn ? " adm-stat--warn" : ""}`}>
+      <div className="adm-stat__icon" aria-hidden="true">{icon}</div>
       <div className="adm-stat__value">{value}</div>
       <div className="adm-stat__label">{label}</div>
       {sub && <div className="adm-stat__sub">{sub}</div>}
+    </div>
+  );
+}
+
+// A richer alert than a plain paragraph: an icon anchor, a bold one-line
+// headline (what's wrong, in short), and a smaller supporting-detail line
+// below it — replaces a dense wall-of-text banner with something scannable
+// at a glance, full explanation still there for whoever reads on.
+function Alert({
+  tone, label, headline, detail,
+}: {
+  tone: "warn" | "crit";
+  label: string;
+  headline: React.ReactNode;
+  detail: React.ReactNode;
+}) {
+  return (
+    <div className={`topo-alert topo-alert--${tone}`}>
+      <span className="topo-alert__icon" aria-hidden="true">{tone === "crit" ? "⛔" : "⚠"}</span>
+      <div className="topo-alert__body">
+        <div className="topo-alert__headline">
+          <span className={`adm-badge adm-badge--${tone}`}>{label}</span>
+          {headline}
+        </div>
+        <div className="topo-alert__detail">{detail}</div>
+      </div>
     </div>
   );
 }
@@ -527,6 +562,7 @@ export function TopologyPanel() {
             <>
               <div className="adm-stats-row">
                 <StatCard
+                  icon="⬡"
                   label="Services"
                   value={String(Math.max(arch.known.size, graph.services.length))}
                   sub={
@@ -536,51 +572,73 @@ export function TopologyPanel() {
                   }
                 />
                 <StatCard
+                  icon="⇄"
                   label="Observed calls"
                   value={String(graph.edges.length)}
                   sub={ingress.length > 0 ? `+ ${ingress.length} declared route${ingress.length === 1 ? "" : "s"}` : undefined}
                 />
                 <StatCard
+                  icon="→"
                   label="Entry points"
                   value={String(graph.entries.length)}
                   sub={summarise(graph.entries, "every service has a caller")}
                 />
                 <StatCard
+                  icon="⏹"
                   label="Terminal"
                   value={String(graph.terminals.length)}
                   sub={summarise(graph.terminals, "none observed")}
                 />
                 <StatCard
+                  icon="⏱"
                   label="Stale edges"
                   value={String(graph.staleCount)}
                   sub={graph.staleCount > 0 ? "no evidence in 15m" : "all fresh"}
+                  warn={graph.staleCount > 0}
                 />
               </div>
 
               {unhealthy.length > 0 && (
-                <p className="topo-gap">
-                  <span className={`adm-badge adm-badge--${unhealthy.some(e => edgeHealth(e).key === "failing") ? "crit" : "warn"}`}>
-                    unhealthy
-                  </span>{" "}
-                  {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
-                  {unhealthy.map(e => {
-                    const h = edgeHealth(e);
-                    return `${e.from_service}→${e.to_service} (${h.badCount}/${h.classified} failed)`;
-                  }).join(", ")}. Based only on calls with a classified outcome — most evidence has
-                  none yet (outcome inference is deliberately conservative), so this is a lower bound
-                  on how many dependencies are actually unhealthy, not the full picture.
-                </p>
+                <Alert
+                  tone={unhealthy.some(e => edgeHealth(e).key === "failing") ? "crit" : "warn"}
+                  label="unhealthy"
+                  headline={
+                    <>
+                      {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
+                      failing: {unhealthy.map(e => {
+                        const h = edgeHealth(e);
+                        return `${e.from_service}→${e.to_service} (${h.badCount}/${h.classified} failed)`;
+                      }).join(", ")}.
+                    </>
+                  }
+                  detail={
+                    <>
+                      Based only on calls with a classified outcome — most evidence has none yet
+                      (outcome inference is deliberately conservative), so this is a lower bound on
+                      how many dependencies are actually unhealthy, not the full picture.
+                    </>
+                  }
+                />
               )}
 
               {rare.length > 0 && (
-                <p className="topo-gap">
-                  <span className="adm-badge adm-badge--warn">incomplete</span>{" "}
-                  {rare.length === 1 ? "1 edge is" : `${rare.length} edges are`} caught in under a
-                  quarter of scans ({rare.map(e => `${e.from_service}→${e.to_service}`).join(", ")}).
-                  The miner samples only 5 pods per namespace and the last 200 log lines, so edges
-                  it rarely catches are a sign it is <strong>missing others entirely</strong> — treat
-                  this graph as more incomplete than the counts suggest.
-                </p>
+                <Alert
+                  tone="warn"
+                  label="incomplete"
+                  headline={
+                    <>
+                      {rare.length === 1 ? "1 edge is" : `${rare.length} edges are`} caught in under a
+                      quarter of scans ({rare.map(e => `${e.from_service}→${e.to_service}`).join(", ")}).
+                    </>
+                  }
+                  detail={
+                    <>
+                      The miner samples only 5 pods per namespace and the last 200 log lines, so edges
+                      it rarely catches are a sign it is <strong>missing others entirely</strong> — treat
+                      this graph as more incomplete than the counts suggest.
+                    </>
+                  }
+                />
               )}
 
               {/* The collector-down banner.
@@ -598,15 +656,24 @@ export function TopologyPanel() {
                 * which is the same defect class as OPS-10/11/12: a confident
                 * number over data with no validity check. */}
               {arch.newestLive !== null && Date.now() - arch.newestLive > STALE_AFTER_MS && (
-                <p className="topo-gap">
-                  <span className="adm-badge adm-badge--warn">not live</span>{" "}
-                  No pod state has been reported for <strong>any</strong> service in this namespace
-                  since {relTime(new Date(arch.newestLive).toISOString())} (
-                  {absTime(new Date(arch.newestLive).toISOString())}). Replica counts, readiness and
-                  restarts below are a <strong>snapshot from then</strong>, not current state — the
-                  discovery collector has most likely stopped. The declared structure (services,
-                  ingress, ports) is still accurate; only the live numbers are frozen.
-                </p>
+                <Alert
+                  tone="warn"
+                  label="not live"
+                  headline={
+                    <>
+                      No pod state has been reported for <strong>any</strong> service in this
+                      namespace since {relTime(new Date(arch.newestLive).toISOString())}.
+                    </>
+                  }
+                  detail={
+                    <>
+                      ({absTime(new Date(arch.newestLive).toISOString())}) Replica counts, readiness
+                      and restarts below are a <strong>snapshot from then</strong>, not current state
+                      — the discovery collector has most likely stopped. The declared structure
+                      (services, ingress, ports) is still accurate; only the live numbers are frozen.
+                    </>
+                  }
+                />
               )}
 
               <DependencyFlow

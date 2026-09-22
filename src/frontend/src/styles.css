@@ -1799,6 +1799,27 @@ code {
   border-color: var(--border-bright);
 }
 
+/* Icon chip (ROADMAP P29 pass) — a visual anchor per stat, and a place for
+   colour to land when the number IS the finding (only .adm-stat--warn uses
+   it; a plain count like "Services" never gets tinted — colour stays
+   reserved for state, per this app's own rule elsewhere). Opt-in per
+   component: only TopologyPanel's StatCard passes an icon today. */
+.adm-stat__icon {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-dim);
+  color: var(--accent-light);
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.adm-stat--warn { border-color: var(--warn-border); }
+.adm-stat--warn .adm-stat__icon { background: var(--warn-bg); color: var(--warn); }
+.adm-stat--warn .adm-stat__value { color: var(--warn); }
+
 .adm-stat__value { font-size: 26px; font-weight: 800; color: var(--text); letter-spacing: -0.03em; }
 .adm-stat__label { font-size: 12px; color: var(--muted); margin-top: 2px; font-weight: 500; }
 .adm-stat__sub   { font-size: 11px; color: var(--dim); margin-top: 4px; }
@@ -2968,7 +2989,8 @@ code {
 
 /* The finding, not a decoration: an edge the miner rarely catches means it is
    probably missing edges entirely, so this sits above the diagram rather than
-   in a tooltip. */
+   in a tooltip. Kept for SecurityPosturePanel.tsx; TopologyPanel's own three
+   banners moved to the richer .topo-alert below. */
 .topo-gap {
   margin: 0 0 12px;
   padding: 9px 11px;
@@ -2980,6 +3002,44 @@ code {
   border-radius: var(--r-sm);
 }
 .topo-gap .adm-badge { margin-right: 2px; }
+
+/* Alert (ROADMAP P29 pass) — icon + bold one-line headline + smaller
+   supporting detail, instead of one dense paragraph behind a badge. The
+   badge stays (it's the scannable severity word), but it now leads a real
+   headline rather than being glued to the front of a wall of text. */
+.topo-alert {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid;
+}
+.topo-alert__icon { font-size: 15px; line-height: 1.45; flex: none; }
+.topo-alert__body { flex: 1; min-width: 0; }
+.topo-alert__headline {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 7px;
+}
+.topo-alert__headline .adm-badge { flex: none; }
+.topo-alert__detail {
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.topo-alert--warn { background: var(--warn-bg); border-color: var(--warn-border); }
+.topo-alert--warn .topo-alert__icon { color: var(--warn); }
+.topo-alert--crit { background: var(--crit-bg); border-color: var(--crit-border); }
+.topo-alert--crit .topo-alert__icon { color: var(--crit); }
 
 .topo-focus { margin: 12px 0 16px; }
 .topo-focus__services {
