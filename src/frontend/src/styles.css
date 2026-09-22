@@ -1517,6 +1517,12 @@ code {
    ───────────────────────────────────────────────────────────────────────────── */
 
 .adm-panel { max-width: 980px; }
+/* TopologyPanel only (ROADMAP P29's two-column layout: mined graph +
+   docked chat rail). 980px was tight even for the graph alone; splitting
+   380px+20px off for the chat panel left the diagram needing a horizontal
+   scrollbar for graphs that fit fine before. Capped, not unlimited, so it
+   doesn't run edge-to-edge on an ultrawide monitor. */
+.adm-panel--wide { max-width: 1600px; }
 
 .adm-panel__header {
   display: flex;
@@ -2899,6 +2905,24 @@ code {
 @media (max-width: 960px) {
   .topo-columns { flex-direction: column; }
   .topo-side { width: 100%; }
+}
+
+/* Compact stat cards, scoped to this panel only: the default .adm-stat
+   (16px/20px padding, 140px min-width, wraps) needs ~750px for 5 cards —
+   more than .topo-main has once the 380px+20px chat rail is subtracted, so
+   they wrapped into two uneven rows. `flex: 1 1 0` with no min-width means
+   the row always fits in one line, shrinking each card rather than
+   wrapping; labels/sub text ellipsize instead of breaking awkwardly. Other
+   panels' stat rows (MetricsPanel, SecurityPosturePanel) are untouched. */
+.topo-main .adm-stats-row { flex-wrap: nowrap; gap: 8px; margin-bottom: 20px; }
+.topo-main .adm-stat { min-width: 0; flex: 1 1 0; padding: 11px 12px; }
+.topo-main .adm-stat__icon { width: 21px; height: 21px; font-size: 10.5px; margin-bottom: 7px; }
+.topo-main .adm-stat__value { font-size: 19px; }
+.topo-main .adm-stat__label,
+.topo-main .adm-stat__sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* --panel and --bg are only one shade apart, so a plain --panel box (the

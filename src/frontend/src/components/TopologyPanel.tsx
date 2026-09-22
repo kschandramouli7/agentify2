@@ -480,7 +480,7 @@ export function TopologyPanel() {
   const selected = focus && graph.services.includes(focus) ? focus : null;
 
   return (
-    <div className="adm-panel">
+    <div className="adm-panel adm-panel--wide">
       <div className="adm-panel__header">
         <div>
           <h2>Service Dependencies</h2>
