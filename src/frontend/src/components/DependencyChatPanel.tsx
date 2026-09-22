@@ -68,22 +68,33 @@ export function DependencyChatPanel({ namespace, focus }: { namespace: string; f
   }
 
   const messages = session?.messages ?? [];
+  // "trace GET /health", not "POST /charge": these are the actual routes the
+  // namespace's own services expose (a plain nginx catch-all + /health) —
+  // an invented path would be a guaranteed dead end for anyone who tries it.
   const examples = [
-    "trace POST /charge",
+    "trace GET /health",
     focus ? `What does ${focus} depend on?` : "What are the entry points in this namespace?",
     focus ? `Is ${focus} healthy right now?` : "Which services here are unhealthy?",
   ];
 
   return (
     <div className="topo-chat">
+      <div className="topo-chat__header">
+        <span className="topo-chat__header-icon" aria-hidden="true">✦</span>
+        <span className="topo-chat__header-title">
+          Ask about {focus ?? (namespace || "this namespace")}
+        </span>
+      </div>
+
       <div className="topo-chat__thread">
         {messages.length === 0 && (
           <div className="topo-chat__welcome">
             <p>
               Search a specific call — paste a <strong>trace ID</strong> or a request like{" "}
-              <code>POST /charge</code> — or ask a question about{" "}
+              <code>GET /health</code> — or ask a question about{" "}
               {focus ? <strong>{focus}</strong> : "this namespace"}'s dependencies.
             </p>
+            <div className="topo-chat__examples-label">Try asking</div>
             <div className="topo-chat__examples">
               {examples.map(ex => (
                 <button
@@ -118,7 +129,7 @@ export function DependencyChatPanel({ namespace, focus }: { namespace: string; f
           ref={inputRef}
           className="chat-input"
           rows={2}
-          placeholder="trace <id or POST /path>, or ask a question…"
+          placeholder="trace <id or GET /path>, or ask a question…"
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={onKeyDown}
