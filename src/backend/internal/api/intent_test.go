@@ -56,6 +56,8 @@ func TestInferIntent_Dependencies(t *testing.T) {
 		// these silently fell through. Word-boundary matching fixes it.
 		{"service topology for payments", "dependencies"},
 		{"what is the call graph topology of payments", "dependencies"},
+		{"what are the entry points in this namespace?", "dependencies"},
+		{"which services are the entrypoints here?", "dependencies"},
 
 		// Diagnostic phrasing wins, exactly as it does over health and cert.
 		// The graph is context for a diagnosis, never the answer to one.

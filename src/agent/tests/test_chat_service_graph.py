@@ -384,6 +384,100 @@ async def test_deterministic_answer_is_not_stamped_with_a_prompt_version(monkeyp
     assert resp.prompt_version is None
 
 
+@pytest.mark.asyncio
+async def test_entry_points_question_is_answered_deterministically(monkeypatch):
+    """Regression: "entry point"/"entrypoint" were missing from
+    _DEPENDENCY_QUESTION_RE, so this fell through to the model even though
+    _dependency_answer's no-focus branch already computes it for free."""
+    async def fake_fetch(namespace, backend_url):
+        return EDGES
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+
+    agent = _bare_agent()
+
+    resp = await type(agent).reason_chat(
+        agent, _user("what are the entry points in this namespace?"), {"namespace": "payments"},
+    )
+
+    assert resp.tier == "tier1"
+    assert resp.input_tokens == 0 and resp.output_tokens == 0
+    assert "payment-batch" in resp.answer  # the only service nothing else calls
+
+
+# ── Model-path scope injection ────────────────────────────────────────────────
+
+class _CapturingMessages:
+    """Records every call's kwargs and answers with plain, unstructured text —
+    close enough for reason_chat's tool loop (no tool_use) and harmless for
+    _structure_chat_answer's second call (its JSON parse fails and that method
+    degrades to {} by design, which this test doesn't care about)."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+
+        class _Block:
+            type = "text"
+            text = "This namespace has 3 services and no unhealthy ones observed."
+
+        class _Response:
+            content = [_Block()]
+            stop_reason = "end_turn"
+            usage = None
+
+        return _Response()
+
+
+class _CapturingClient:
+    def __init__(self):
+        self.messages = _CapturingMessages()
+
+
+@pytest.mark.asyncio
+async def test_model_path_is_told_the_session_namespace():
+    """Regression: the deterministic routes read context["namespace"] directly,
+    but a turn that falls through to the model (anything _chat_route doesn't
+    recognize) used to never mention it at all — chat_messages was the raw
+    frontend history and `system` was only self._system_text(). The model would
+    then ask the operator to confirm a namespace the session already carries,
+    exactly as CHAT_SYSTEM_PROMPT's "ask if genuinely ambiguous" guideline
+    says to when it is never told otherwise.
+
+    "which services here are unhealthy?" deliberately does not match
+    _DEPENDENCY_QUESTION_RE, so this exercises the model path, not the
+    deterministic one.
+    """
+    agent = _bare_agent()
+    agent.client = _CapturingClient()
+
+    resp = await type(agent).reason_chat(
+        agent, _user("which services here are unhealthy?"), {"namespace": "payments", "service": "payment-api"},
+    )
+
+    assert resp.tier != "tier1"
+    first_call = agent.client.messages.calls[0]
+    system_text = " ".join(b["text"] for b in first_call["system"])
+    assert "payments" in system_text
+    assert "payment-api" in system_text
+
+
+@pytest.mark.asyncio
+async def test_model_path_adds_no_scope_block_when_context_is_empty():
+    """The cached system block must stay exactly self._system_text() when chat
+    carries no namespace (the plain Investigate ChatPanel case, session
+    namespace "") — no second block, so nothing to disrupt the cache prefix."""
+    agent = _bare_agent()
+    agent.client = _CapturingClient()
+
+    await type(agent).reason_chat(agent, _user("which services here are unhealthy?"), {})
+
+    first_call = agent.client.messages.calls[0]
+    assert len(first_call["system"]) == 1
+
+
 # ── Word-boundary matching ────────────────────────────────────────────────────
 
 
@@ -433,6 +527,8 @@ def test_go_and_python_agree_on_the_routing_rule():
         ("what's the blast radius of payment-api going down", "dependencies"),
         ("what is impacted if payment-api stops", "dependencies"),
         ("service topology for payments", "dependencies"),
+        ("what are the entry points in this namespace?", "dependencies"),
+        ("which services are the entrypoints here?", "dependencies"),
         ("why is payment-api slow, does it depend on vault?", None),
         ("what's wrong with payment-api's dependencies?", None),
         ("investigate what payment-api depends on", None),

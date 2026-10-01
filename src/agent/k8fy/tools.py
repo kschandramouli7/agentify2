@@ -339,7 +339,12 @@ TOOLS = [
             "check for upstream services that might be causing it, or downstream "
             "services that might be the actual root cause. Best-effort and often "
             "sparse — an empty result means no evidence has been mined yet, not "
-            "that the service has no dependencies."
+            "that the service has no dependencies. In this graph, an 'entry point' "
+            "is a service with no observed caller and a 'terminal' service is one "
+            "observed calling nothing else — derive these from the edges returned, "
+            "they are not a separate field. This graph has no visibility into K8s "
+            "Ingress objects or container entrypoint commands; say so if asked "
+            "about those rather than answering from this data."
         ),
         "input_schema": {
             "type": "object",

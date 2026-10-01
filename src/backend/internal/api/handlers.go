@@ -788,7 +788,7 @@ func inferIntent(question string) string {
 // forward means "log" catches "logs" and "expir" catches "expiring", without
 // catching a stem buried mid-word.
 var (
-	dependencyKeywordRE = regexp.MustCompile(`\b(dependenc|depends on|depend on|upstream|downstream|who calls|what calls|calls what|call graph|caller|callee|blast radius|service graph|service topology|impacted if|affected if)`)
+	dependencyKeywordRE = regexp.MustCompile(`\b(dependenc|depends on|depend on|upstream|downstream|who calls|what calls|calls what|call graph|caller|callee|blast radius|service graph|service topology|impacted if|affected if|entry point|entrypoint)`)
 
 	// Concerns the deterministic answer holds no data for. A question mixing any
 	// of these with a graph keyword needs synthesis, so it must fall through to

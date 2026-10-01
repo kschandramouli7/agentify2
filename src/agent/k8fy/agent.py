@@ -420,7 +420,7 @@ REMEDIATION_REASONING_SCHEMA: Dict[str, Any] = {
 _DEPENDENCY_QUESTION_RE = re.compile(
     r"\b(dependenc|depends on|depend on|upstream|downstream|who calls|what calls"
     r"|calls what|call graph|caller|callee|blast radius|service graph"
-    r"|service topology|impacted if|affected if)"
+    r"|service topology|impacted if|affected if|entry point|entrypoint)"
 )
 
 # Concerns that need synthesis. A question touching any of these goes to the
@@ -1457,6 +1457,35 @@ class K8fyAgent:
                 )
 
         system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
+        # The deterministic routes above read context["namespace"]/["service"]
+        # directly, but a turn that falls through to the model never did — the
+        # model only ever saw the raw frontend messages, with no mention of the
+        # session's own scope. DependencyChatPanel passes namespace/service into
+        # createChatSession() precisely so a question like "what are the entry
+        # points in this namespace?" or "which services here are unhealthy?"
+        # doesn't have to restate it, but CHAT_SYSTEM_PROMPT's "ask a clarifying
+        # question if the namespace is genuinely ambiguous" guideline fires
+        # anyway when the model is simply never told. This block is deliberately
+        # a second, UNCACHED system block appended after the cached prompt text,
+        # so per-session scope doesn't bust the cache prefix every other session
+        # already shares.
+        scope_bits = []
+        if isinstance(context.get("namespace"), str) and context["namespace"]:
+            scope_bits.append(f"namespace {context['namespace']!r}")
+        if isinstance(context.get("service"), str) and context["service"]:
+            scope_bits.append(f"service {context['service']!r}")
+        if scope_bits:
+            system.append({
+                "type": "text",
+                "text": (
+                    "Session scope: this conversation is already scoped to "
+                    + " and ".join(scope_bits)
+                    + ". Treat references like \"this namespace\", \"here\", or \"this "
+                    "service\" as referring to it, and use it for any tool call that "
+                    "takes a namespace or service — do not ask the operator to confirm "
+                    "it."
+                ),
+            })
         chat_messages = list(messages)  # copy so we can append tool results
         tool_calls_made: List[ToolCall] = []
         total_in_tok = total_out_tok = total_cache_write = total_cache_read = 0
