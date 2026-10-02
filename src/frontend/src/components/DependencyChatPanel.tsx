@@ -18,9 +18,17 @@ import { Bubble } from "./ChatPanel";
 //     one is focused, this service) via the session's own namespace/service
 //     fields, which reason_chat's context threads into every deterministic
 //     route and every model call for this session.
-export function DependencyChatPanel({ namespace, focus }: { namespace: string; focus: string | null }) {
+export function DependencyChatPanel({
+  namespace, focus, initialSessionId,
+}: {
+  namespace: string;
+  focus: string | null;
+  // Set by the standalone tab (see main.tsx) to resume the conversation the
+  // docked panel already had going, rather than starting a blank one.
+  initialSessionId?: string | null;
+}) {
   const qc = useQueryClient();
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(initialSessionId ?? null);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -67,6 +75,20 @@ export function DependencyChatPanel({ namespace, focus }: { namespace: string; f
     }
   }
 
+  // Opens the SAME conversation in its own tab — same namespace/focus, and
+  // the session id too once one exists, so the new tab resumes rather than
+  // starting a second, disconnected conversation. Before a session exists
+  // (no message sent yet) the new tab just starts fresh with the same scope.
+  function openInNewTab() {
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.searchParams.set("view", "dependency-chat");
+    url.searchParams.set("namespace", namespace);
+    if (focus) url.searchParams.set("focus", focus);
+    if (sessionId) url.searchParams.set("session", sessionId);
+    window.open(url.toString(), "_blank", "noopener,noreferrer");
+  }
+
   const messages = session?.messages ?? [];
   // "trace GET /health", not "POST /charge": these are the actual routes the
   // namespace's own services expose (a plain nginx catch-all + /health) —
@@ -84,6 +106,15 @@ export function DependencyChatPanel({ namespace, focus }: { namespace: string; f
         <span className="topo-chat__header-title">
           Ask about {focus ?? (namespace || "this namespace")}
         </span>
+        <button
+          type="button"
+          className="topo-chat__expand"
+          onClick={openInNewTab}
+          title="Open this conversation in a new tab"
+          aria-label="Open this conversation in a new tab"
+        >
+          ⤢
+        </button>
       </div>
 
       <div className="topo-chat__thread">

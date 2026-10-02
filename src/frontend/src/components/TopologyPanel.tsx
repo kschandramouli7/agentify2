@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listServiceDependencies, listClusterIngress, listScanCoverage, listServiceProfiles,
@@ -34,6 +34,14 @@ import { DependencyChatPanel } from "./DependencyChatPanel";
 
 const STALE_AFTER_MS = 15 * 60 * 1000; // ~15 cycles at the miner's 60s SCAN_INTERVAL_SECONDS,
                                        // so a single missed cycle never reads as stale
+
+// Drag-to-resize bounds for .topo-side, and the same 960px breakpoint
+// styles.css stacks the columns at (see .topo-columns there) — kept as one
+// constant so the two never drift apart.
+const TOPO_SIDE_DEFAULT = 380;
+const TOPO_SIDE_MIN = 320;
+const TOPO_SIDE_MAX = 720;
+const TOPO_SIDE_BY_SIDE_QUERY = "(min-width: 961px)";
 
 // /admin/tracked returns "namespace/service" pairs — the same source the
 // observability search box uses. Namespaces are its distinct prefixes.
@@ -270,6 +278,63 @@ export function TopologyPanel() {
   const [typed, setTyped] = useState("");
   const [focus, setFocus] = useState<string | null>(null);
   const [showMermaid, setShowMermaid] = useState(false);
+
+  // Drag-to-resize the chat rail (`.topo-side`) against the diagram
+  // (`.topo-main`). Width lives in state so it can be dragged; persisted to
+  // localStorage so a reader's preferred split survives a reload. Only
+  // meaningful in the side-by-side layout — below 960px CSS stacks the
+  // columns and `.topo-side` goes to 100% width, so the drag handle is
+  // hidden and the inline width below is withheld there, or it would
+  // override that 100% rule (inline style always wins over a media query).
+  const [sideWidth, setSideWidth] = useState<number>(() => {
+    const saved = Number(localStorage.getItem("agentify.topo.sideWidth"));
+    return saved >= TOPO_SIDE_MIN && saved <= TOPO_SIDE_MAX ? saved : TOPO_SIDE_DEFAULT;
+  });
+  const [resizing, setResizing] = useState(false);
+  const [isSideBySide, setIsSideBySide] = useState(
+    () => window.matchMedia(TOPO_SIDE_BY_SIDE_QUERY).matches,
+  );
+  const dragStart = useRef<{ x: number; width: number } | null>(null);
+
+  useEffect(() => {
+    const mq = window.matchMedia(TOPO_SIDE_BY_SIDE_QUERY);
+    const onChange = () => setIsSideBySide(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("agentify.topo.sideWidth", String(sideWidth));
+  }, [sideWidth]);
+
+  const onResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    dragStart.current = { x: e.clientX, width: sideWidth };
+    setResizing(true);
+    document.body.style.userSelect = "none";
+  }, [sideWidth]);
+
+  useEffect(() => {
+    if (!resizing) return;
+    function onMove(e: MouseEvent) {
+      if (!dragStart.current) return;
+      // The handle sits left of the side panel, so dragging left (negative
+      // delta) widens it and dragging right narrows it.
+      const next = dragStart.current.width - (e.clientX - dragStart.current.x);
+      setSideWidth(Math.min(TOPO_SIDE_MAX, Math.max(TOPO_SIDE_MIN, next)));
+    }
+    function onUp() {
+      setResizing(false);
+      dragStart.current = null;
+      document.body.style.userSelect = "";
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    return () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+  }, [resizing]);
 
   // Poll while empty (discovery may not have pushed inventory yet), then back
   // off — the same pattern SearchInput uses against this endpoint.
@@ -771,7 +836,16 @@ export function TopologyPanel() {
           * Investigate page. Remounted on namespace change (key={applied})
           * so switching namespaces starts a fresh conversation rather than
           * carrying stale context forward. */}
-        <div className="topo-side">
+        {isSideBySide && (
+          <div
+            className={`topo-resize-handle${resizing ? " topo-resize-handle--active" : ""}`}
+            onMouseDown={onResizeStart}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize chat panel"
+          />
+        )}
+        <div className="topo-side" style={isSideBySide ? { width: sideWidth } : undefined}>
           <DependencyChatPanel key={applied} namespace={applied} focus={selected} />
         </div>
       </div>

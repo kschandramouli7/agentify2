@@ -125,6 +125,34 @@ async def test_build_service_graph_returns_edges_and_focus(monkeypatch):
     # The edges must arrive unchanged — the UI's line weights and counts come
     # straight from these.
     assert graph["dependencies"] == EDGES
+    # A focused question is about one named service's own edges and never
+    # reads known_services (see _dependency_answer's focus branch) — assert
+    # it stays empty rather than paying for the extra /admin/tracked fetch.
+    assert graph["known_services"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_service_graph_fetches_known_services_only_when_unfocused(monkeypatch):
+    """The no-focus "what's in this namespace" answer needs the full inventory
+    to report declared-but-silent services (test_known_services_with_no_edges_
+    are_reported_separately_not_dropped) — this proves _build_service_graph
+    actually wires that fetch in, not just that _dependency_answer can accept
+    the field if handed it."""
+    async def fake_fetch(namespace, backend_url):
+        return EDGES
+
+    async def fake_known(namespace, backend_url):
+        assert namespace == "payments"
+        return {"payment-batch", "payment-worker", "payment-api", "test-pod"}
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_service_dependencies", fake_fetch)
+    monkeypatch.setattr("k8fy.service_topology.get_known_services", fake_known)
+
+    graph = await _build_service_graph(_user("who calls what here?"), {"namespace": "payments"}, "http://backend")
+
+    assert graph is not None
+    assert graph["focus"] is None
+    assert graph["known_services"] == ["payment-api", "payment-batch", "payment-worker", "test-pod"]
 
 
 @pytest.mark.asyncio
@@ -241,6 +269,43 @@ def test_namespace_wide_answer_when_no_service_is_named():
     assert "payment-batch" in answer   # the entry point
     assert "Name a service" in answer  # tells the user how to narrow it
     assert details["service_graph"]["focus"] is None
+
+
+def test_known_services_with_no_edges_are_reported_separately_not_dropped():
+    """Regression: the dashboard's stat row counts the full /admin/tracked
+    inventory (TopologyPanel.tsx), including a service like test-pod with zero
+    observed calls in either direction. _dependency_answer used to count only
+    edge_services, so its "N services" silently undercounted against that
+    stat row (4 vs 5) for the exact same namespace at the exact same moment.
+
+    A zero-in/zero-out service is neither an entry point (it calls nothing) nor
+    a terminal (nothing calls it) — conflating it into either list would claim
+    an observation that was never made, so it gets its own "no observed calls"
+    bucket, matching TopologyPanel's own node-subtitle wording.
+    """
+    answer, details = _dependency_answer({
+        "namespace": "payments", "focus": None, "dependencies": EDGES,
+        "known_services": ["payment-batch", "payment-worker", "payment-api", "test-pod"],
+    })
+    assert "4 known services" in details["incident_summary"]
+    assert "3 with observed calls" in details["incident_summary"]
+    assert "test-pod" not in details["findings"][1]   # not folded into entry points
+    assert "test-pod" not in details["findings"][2]   # not folded into terminals
+    assert "No observed calls: test-pod" in details["findings"]
+    assert "No observed calls" in answer and "test-pod" in answer
+
+
+def test_known_services_subset_of_edges_keeps_the_original_wording_exactly():
+    """When known_services adds nothing beyond what the edges already show
+    (the common case — most tracked services do have observed calls), the
+    headline must stay byte-identical to the pre-reconciliation wording; the
+    test above's assertions on the other shape must never fire here."""
+    answer, details = _dependency_answer({
+        "namespace": "payments", "focus": None, "dependencies": EDGES,
+        "known_services": ["payment-batch", "payment-api"],  # subset of EDGES' own services
+    })
+    assert "3 services with 3 observed calls" in details["incident_summary"]
+    assert "known services" not in details["incident_summary"]
 
 
 def test_reach_matches_a_breadth_first_reading():

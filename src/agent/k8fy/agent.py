@@ -612,7 +612,14 @@ def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
     edges = graph["dependencies"]
     namespace = graph["namespace"]
     focus = graph.get("focus")
-    services = sorted({e[k] for e in edges for k in ("from_service", "to_service")})
+    edge_services = {e[k] for e in edges for k in ("from_service", "to_service")}
+    # known_services (the /admin/tracked inventory — only populated for the
+    # no-focus branch below, see _build_service_graph) is UNIONED in so a
+    # service with zero observed calls still counts — otherwise this answer's
+    # "N services" silently undercounted against the dashboard's stat row,
+    # which reads the same inventory. A focused answer has no known_services
+    # and is unaffected: edge_services alone is exactly its own graph.
+    services = sorted(edge_services | set(graph.get("known_services") or ()))
     callers_of = {s: sorted({e["from_service"] for e in edges if e["to_service"] == s}) for s in services}
     callees_of = {s: sorted({e["to_service"] for e in edges if e["from_service"] == s}) for s in services}
 
@@ -663,11 +670,26 @@ def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
                 f"{focus} transitively reaches {len(down_all)} services, including indirect dependencies"
             )
     else:
-        entries = [s for s in services if not callers_of.get(s)]
-        terminals = [s for s in services if not callees_of.get(s)]
-        headline = (
-            f"{namespace} has {len(services)} services with {len(edges)} observed calls between them."
-        )
+        # A service with BOTH zero inbound and zero outbound isn't an entry
+        # point (it calls nothing) or a terminal (nothing calls it) — the
+        # dashboard calls this "no observed calls" (TopologyPanel's node
+        # subtitle) and so does this answer, rather than folding it into
+        # either list, which would overstate what's actually been observed
+        # about it.
+        entries = [s for s in services if not callers_of.get(s) and callees_of.get(s)]
+        terminals = [s for s in services if callers_of.get(s) and not callees_of.get(s)]
+        silent = [s for s in services if not callers_of.get(s) and not callees_of.get(s)]
+        if silent:
+            headline = (
+                f"{namespace} has {len(services)} known services — {len(edge_services)} with "
+                f"observed calls, {len(edges)} observed calls between them."
+            )
+        else:
+            # No known_services beyond the edges themselves: the exact original
+            # wording, unconditionally — a test asserts it verbatim.
+            headline = (
+                f"{namespace} has {len(services)} services with {len(edges)} observed calls between them."
+            )
         lines = [
             headline,
             "",
@@ -675,14 +697,20 @@ def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
             + (", ".join(entries) if entries else "none"),
             "Terminal — observed calling nothing: "
             + (", ".join(terminals) if terminals else "none"),
-            "",
-            "Name a service to see its upstream and downstream dependencies.",
         ]
+        if silent:
+            lines.append(
+                "No observed calls — known to exist but not seen calling or called: "
+                + ", ".join(silent)
+            )
+        lines += ["", "Name a service to see its upstream and downstream dependencies."]
         findings = [
             f"{len(services)} services, {len(edges)} observed calls",
             f"Entry points: {', '.join(entries) if entries else 'none'}",
             f"Terminal services: {', '.join(terminals) if terminals else 'none'}",
         ]
+        if silent:
+            findings.append(f"No observed calls: {', '.join(silent)}")
 
     answer = "\n".join(lines + ["", caveat])
     details = {
@@ -862,10 +890,23 @@ async def _build_service_graph(
     services = sorted({
         str(e[k]) for e in edges for k in ("from_service", "to_service") if e.get(k)
     })
+    focus = _focus_service(messages, context, services)
+
+    # Only the no-focus "what's in this namespace" answer needs the full
+    # inventory (see _dependency_answer's no-focus branch) — a focused answer
+    # is about one named service's own edges and never reads known_services,
+    # so skip the extra /admin/tracked round trip there.
+    known_services: List[str] = []
+    if not focus:
+        from k8fy.service_topology import get_known_services
+
+        known_services = sorted(await get_known_services(namespace, backend_url))
+
     return {
         "namespace": namespace,
-        "focus": _focus_service(messages, context, services),
+        "focus": focus,
         "dependencies": edges,
+        "known_services": known_services,
     }
 
 

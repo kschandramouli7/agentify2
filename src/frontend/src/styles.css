@@ -2899,12 +2899,42 @@ code {
    historically done" next to "ask about it or trace one specific call",
    rather than the chat living on a separate tab. Stacks on narrow viewports
    since a side-by-side chat panel has no room to be useful below ~960px. */
-.topo-columns { display: flex; gap: 20px; align-items: flex-start; }
+.topo-columns { display: flex; gap: 0; align-items: flex-start; }
 .topo-main { flex: 1; min-width: 0; }
 .topo-side { width: 380px; flex: none; }
 @media (max-width: 960px) {
-  .topo-columns { flex-direction: column; }
+  /* The resize handle isn't rendered here (TopologyPanel only mounts it in
+     the side-by-side layout), so it isn't there to provide the stacked
+     columns' vertical gap either — restore it directly. */
+  .topo-columns { flex-direction: column; gap: 20px; }
   .topo-side { width: 100%; }
+}
+
+/* Drag handle between .topo-main and .topo-side — replaces .topo-columns'
+   old 20px gap with the same total width, so it's the only source of that
+   spacing rather than stacking on top of it. The grabbable hit area is wider
+   than the visible line (a 3px line is a poor mouse target). Hidden below
+   960px, where the columns stack and there's nothing to drag. */
+.topo-resize-handle {
+  flex: none;
+  width: 20px;
+  cursor: col-resize;
+  position: relative;
+}
+.topo-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 8px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--border-bright);
+  transition: background 0.15s;
+}
+.topo-resize-handle:hover::after,
+.topo-resize-handle--active::after {
+  background: var(--accent-light);
 }
 
 /* Compact stat cards, scoped to this panel only: the default .adm-stat
@@ -2942,6 +2972,19 @@ code {
   overflow: hidden;
   box-shadow: var(--shadow-md);
 }
+
+/* The standalone tab (StandaloneDependencyChat.tsx, opened by
+   topo-chat__expand) has nothing else on the page, so the fixed 600px from
+   the docked rail would leave most of the viewport empty — fill it instead. */
+.standalone-chat {
+  display: flex;
+  min-height: 0;
+}
+.standalone-chat .topo-chat {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+}
 .topo-chat__header {
   display: flex;
   align-items: center;
@@ -2953,12 +2996,34 @@ code {
 }
 .topo-chat__header-icon { color: var(--accent-light); font-size: 14px; }
 .topo-chat__header-title {
+  flex: 1;
   font-size: 13px;
   font-weight: 700;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.topo-chat__expand {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.topo-chat__expand:hover {
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border-bright);
 }
 .topo-chat__thread {
   flex: 1;
