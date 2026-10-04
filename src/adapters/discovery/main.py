@@ -116,23 +116,27 @@ async def _scan_namespace(
         coverage[from_service]["log_lines"] += raw_logs.count("\n") + 1
         logs = redact_log_text(raw_logs)
 
-        # Last KNOWN outcome per (to_service, port) wins within this pod's own
-        # log tail (ROADMAP P27 phase 2) — extract_service_calls returns
+        # Last KNOWN outcome per (to_service, port, path) wins within this
+        # pod's own log tail (ROADMAP P27 phase 2; path joined the key in
+        # phase 4 — two distinct paths on the same (service, port) are two
+        # distinct rows, not one, so collapsing them here would silently
+        # discard one path's evidence). extract_service_calls returns
         # observations in line order, so a later one reflects more recent
         # state than an earlier one for the same target. A line that mentions
         # the target again without a classifiable outcome must not erase an
         # earlier confident one. Per-pod push granularity is unchanged: each
         # sampled pod still pushes independently, same as before this phase.
-        last_outcome: Dict[Tuple[str, int], Optional[str]] = {}
+        last_outcome: Dict[Tuple[str, int, str], Optional[str]] = {}
         for obs in extract_service_calls(logs, ns, known):
             if obs.service == from_service:
                 continue  # self-mention, not a dependency
-            key = (obs.service, obs.port or 0)
+            key = (obs.service, obs.port or 0, obs.path)
             if key not in last_outcome or obs.outcome is not None:
                 last_outcome[key] = obs.outcome
-        for (to_service, port), outcome in last_outcome.items():
+        for (to_service, port, path), outcome in last_outcome.items():
             await push_dependency(
-                ns, from_service, to_service, cfg.backend_url, cfg.collector_token, port=port, outcome=outcome,
+                ns, from_service, to_service, cfg.backend_url, cfg.collector_token,
+                port=port, outcome=outcome, path=path,
             )
 
         # Beyond the namespace boundary (ROADMAP P27 phase 3): the calls that

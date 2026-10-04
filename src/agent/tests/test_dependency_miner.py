@@ -156,9 +156,10 @@ async def test_push_edge_sends_no_bearer_token_and_includes_cluster_id(monkeypat
     assert captured["body"] == {
         "namespace": "payments", "from_service": "payment-worker",
         "to_service": "payment-api", "cluster_id": "cluster-a",
-        # 0/"" are the "not captured" sentinels (ROADMAP P27 phase 2) —
-        # sent explicitly when port/outcome aren't passed, never omitted.
-        "port": 0, "outcome": "",
+        # 0/""/"" are the "not captured" sentinels (ROADMAP P27 phases 2 and
+        # 4) — sent explicitly when port/outcome/path aren't passed, never
+        # omitted.
+        "port": 0, "outcome": "", "path": "",
     }
 
 
@@ -190,8 +191,9 @@ async def test_mine_namespace_end_to_end(monkeypatch):
 
     pushed = []
 
-    async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service, port=None, outcome=None):
-        pushed.append((cluster_id, namespace, from_service, to_service, port, outcome))
+    async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
+                              port=None, outcome=None, path=""):
+        pushed.append((cluster_id, namespace, from_service, to_service, port, outcome, path))
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
 
@@ -201,7 +203,8 @@ async def test_mine_namespace_end_to_end(monkeypatch):
 
     # The FQDN form carries no port, and "GET payment-api...svc.cluster.local"
     # has no classifiable outcome — both correctly land as unknown (0/None).
-    assert pushed == [("cluster-a", "payments", "payment-worker", "payment-api", 0, None)]
+    # Nothing trails the hostname match, so path is also "not captured" ("").
+    assert pushed == [("cluster-a", "payments", "payment-worker", "payment-api", 0, None, "")]
     assert "cluster_id = 'cluster-a'" in fake_client.started_with["query"]
 
 
@@ -221,7 +224,8 @@ async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatc
 
     pushed = []
 
-    async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service, port=None, outcome=None):
+    async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
+                              port=None, outcome=None, path=""):
         pushed.append((from_service, to_service))
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)

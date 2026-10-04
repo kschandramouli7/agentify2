@@ -23,6 +23,8 @@ type fakeServiceDependencyStore struct {
 	// ROADMAP P27 phase 2 (ADR 0031).
 	lastPort    int
 	lastOutcome string
+	// ROADMAP P27 phase 4.
+	lastPath string
 
 	// Scan-coverage calls, recorded so the coverage tests can assert on them
 	// (ROADMAP P27 phase 1).
@@ -53,7 +55,7 @@ func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenan
 	return f.coverageRows, nil
 }
 
-func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome string) error {
+func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path string) error {
 	f.upsertCalled = true
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
@@ -63,6 +65,7 @@ func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context
 	f.lastTargetKind = targetKind
 	f.lastPort = port
 	f.lastOutcome = outcome
+	f.lastPath = path
 	return nil
 }
 
@@ -204,6 +207,47 @@ func TestHandleServiceDependencyUpsert_PortAndOutcome(t *testing.T) {
 		}
 		if store.lastOutcome != "" {
 			t.Errorf("outcome: want empty (unknown sentinel), got %q", store.lastOutcome)
+		}
+	})
+}
+
+// TestHandleServiceDependencyUpsert_Path pins ROADMAP P27 phase 4: path
+// passes through from the request body to the store unchanged, including the
+// "absent from the body" case — an older collector that predates this phase
+// — where Go's JSON decoder leaves it at the zero value (""), exactly the
+// sentinel the schema already treats as "not captured".
+func TestHandleServiceDependencyUpsert_Path(t *testing.T) {
+	t.Run("path present in the body is passed through as-is", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api","path":"/orders/:id"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastPath != "/orders/:id" {
+			t.Errorf("path: want %q, got %q", "/orders/:id", store.lastPath)
+		}
+	})
+
+	t.Run("path absent from the body — an older collector — defaults to the empty sentinel", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastPath != "" {
+			t.Errorf("path: want empty (unknown sentinel), got %q", store.lastPath)
 		}
 	})
 }

@@ -225,6 +225,64 @@ def test_extract_service_mentions_still_matches_extract_service_calls_exactly():
     assert mentioned == from_calls == {"payment-backend", "agentify-agent"}
 
 
+# ── path / operation class (ROADMAP P27 phase 4) ──────────────────────────────
+#
+# These cases mirror src/agent/tests/test_service_topology.py's path-capture
+# coverage exactly, since the logic (extract_service_calls, _normalize_path)
+# must not drift between the two copies.
+
+def test_extract_service_calls_captures_path_after_bare_host_port():
+    log_text = "POST http://agentify-backend:8080/api/query"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-backend"})
+    assert calls[0].path == "/api/query"
+
+
+def test_extract_service_calls_captures_port_and_path_after_qualified_fqdn():
+    """Regression: the qualified-hostname branch never looked past its own
+    match at all, so a line with both a port and a path right there captured
+    neither — this is the "bonus fix" phase 4 includes alongside path itself."""
+    log_text = "calling http://payment-backend.payments.svc.cluster.local:8080/charge"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
+    assert calls[0].port == 8080
+    assert calls[0].path == "/charge"
+
+
+def test_extract_service_calls_path_absent_is_the_empty_sentinel():
+    log_text = "upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3)"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert calls[0].path == ""
+
+
+def test_extract_service_calls_path_stops_at_the_query_string():
+    log_text = "calling http://payment-api.payments.svc.cluster.local/orders/48213?token=abc"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert calls[0].path == "/orders/:id"  # numeric segment normalized, query dropped entirely
+
+
+def test_extract_service_calls_path_stops_at_trailing_log_prose():
+    log_text = "GET http://vault.vault.svc.cluster.local:8200/v1/pki/issue -> 200"
+    calls = st.extract_service_calls(log_text, "vault", {"vault"})
+    assert calls[0].path == "/v1/pki/issue"
+
+
+@pytest.mark.parametrize("raw, normalized", [
+    ("/orders/48213", "/orders/:id"),
+    ("/orders/550e8400-e29b-41d4-a716-446655440000", "/orders/:id"),
+    ("/sessions/0123456789abcdef0123456789abcdef", "/sessions/:id"),  # 32-char hex
+    ("/health", "/health"),              # no identifier segment — unchanged
+    ("/v1/pki/issue", "/v1/pki/issue"),  # no identifier segment — unchanged
+    ("", ""),
+])
+def test_normalize_path(raw, normalized):
+    assert st._normalize_path(raw) == normalized
+
+
+def test_normalize_path_rejects_an_implausibly_long_capture():
+    """A long unbroken run is more likely log prose that happened to start
+    with '/' than a real path — treated as not captured, not trusted as-is."""
+    assert st._normalize_path("/" + "x" * 300) == ""
+
+
 # ── push_dependency ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -261,6 +319,7 @@ async def test_push_dependency_sends_port_and_outcome_sentinels_when_unknown(mon
 
     assert captured["body"]["port"] == 0
     assert captured["body"]["outcome"] == ""
+    assert captured["body"]["path"] == ""  # ROADMAP P27 phase 4's "not captured" sentinel
 
 
 @pytest.mark.asyncio

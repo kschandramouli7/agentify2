@@ -657,13 +657,13 @@ func TestPostgresStores(t *testing.T) {
 		// 2 subtest below, which does both).
 		tenantID := uuid.New().String()
 
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "checkout-ui", "checkout-api", "service", 0, ""); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "checkout-ui", "checkout-api", "service", 0, "", ""); err != nil {
 			t.Fatalf("upsert cluster-a dependency: %v", err)
 		}
 		// Same namespace, same from/to service *names* but a different
 		// cluster — the realistic "downstream service lives in a different
 		// cluster" scenario use case #4 names explicitly.
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-b", "payments", "checkout-ui", "checkout-api", "service", 0, ""); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-b", "payments", "checkout-ui", "checkout-api", "service", 0, "", ""); err != nil {
 			t.Fatalf("upsert cluster-b dependency: %v", err)
 		}
 
@@ -699,18 +699,18 @@ func TestPostgresStores(t *testing.T) {
 		// Three observations for (outcome-caller -> outcome-callee, port
 		// 8443): two failures, one success. Must land on ONE row with
 		// evidence_count=3, outcome_failure_count=2, outcome_success_count=1.
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "failure"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "failure", ""); err != nil {
 			t.Fatalf("upsert #1: %v", err)
 		}
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "failure"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "failure", ""); err != nil {
 			t.Fatalf("upsert #2: %v", err)
 		}
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "success"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 8443, "success", ""); err != nil {
 			t.Fatalf("upsert #3: %v", err)
 		}
 		// Same (from, to) pair, but port unknown (0) — a qualified-FQDN-form
 		// sighting, say. Must land on a SEPARATE row from the port=8443 one.
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 0, ""); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "outcome-caller", "outcome-callee", "service", 0, "", ""); err != nil {
 			t.Fatalf("upsert port-unknown row: %v", err)
 		}
 
@@ -778,10 +778,10 @@ func TestPostgresStores(t *testing.T) {
 		// OLD 5-column constraint but not the current 6-column one, then
 		// re-run initSchema exactly as a pod restart would.
 		tenantID := uuid.New().String()
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart-caller", "restart-callee", "service", 8443, ""); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart-caller", "restart-callee", "service", 8443, "", ""); err != nil {
 			t.Fatalf("upsert port 8443: %v", err)
 		}
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart-caller", "restart-callee", "service", 0, ""); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart-caller", "restart-callee", "service", 0, "", ""); err != nil {
 			t.Fatalf("upsert port 0: %v", err)
 		}
 
@@ -806,6 +806,107 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P27 phase 4: a row is split by path too, on top of port", func(t *testing.T) {
+		// Same shape as the phase 2 port-split subtest above, one dimension
+		// further: two different (normalized) paths on the SAME (pair, port)
+		// must land on two separate rows, each accumulating its own
+		// evidence_count independently — the entire point of joining path
+		// into the unique key rather than collapsing it like outcome.
+		tenantID := uuid.New().String()
+
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "path-caller", "path-callee", "service", 8443, "success", "/orders/:id"); err != nil {
+			t.Fatalf("upsert /orders/:id #1: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "path-caller", "path-callee", "service", 8443, "success", "/orders/:id"); err != nil {
+			t.Fatalf("upsert /orders/:id #2: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "path-caller", "path-callee", "service", 8443, "failure", "/refund"); err != nil {
+			t.Fatalf("upsert /refund: %v", err)
+		}
+		// Same pair/port, no path captured on this observation — a third,
+		// separate row, not merged into either path above.
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "path-caller", "path-callee", "service", 8443, "", ""); err != nil {
+			t.Fatalf("upsert path-unknown row: %v", err)
+		}
+
+		deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list dependencies: %v", err)
+		}
+		byPath := map[string]ServiceDependency{}
+		for _, d := range deps {
+			if d.FromService == "path-caller" && d.ToService == "path-callee" {
+				byPath[d.Path] = d
+			}
+		}
+		if len(byPath) != 3 {
+			t.Fatalf("want 3 rows (one per path) for path-caller->path-callee, got %d: %+v", len(byPath), byPath)
+		}
+
+		orders, ok := byPath["/orders/:id"]
+		if !ok {
+			t.Fatalf("no row for /orders/:id; got %+v", byPath)
+		}
+		if orders.EvidenceCount != 2 {
+			t.Errorf("/orders/:id evidence_count = %d, want 2", orders.EvidenceCount)
+		}
+		if orders.OutcomeSuccessCount != 2 {
+			t.Errorf("/orders/:id outcome_success_count = %d, want 2", orders.OutcomeSuccessCount)
+		}
+
+		refund, ok := byPath["/refund"]
+		if !ok {
+			t.Fatalf("no row for /refund; got %+v", byPath)
+		}
+		if refund.EvidenceCount != 1 || refund.OutcomeFailureCount != 1 {
+			t.Errorf("/refund row = %+v, want evidence_count=1 outcome_failure_count=1", refund)
+		}
+
+		unknownPath, ok := byPath[""]
+		if !ok {
+			t.Fatalf("no row for path-unknown (\"\"); got %+v", byPath)
+		}
+		if unknownPath.EvidenceCount != 1 {
+			t.Errorf("path-unknown evidence_count = %d, want 1", unknownPath.EvidenceCount)
+		}
+	})
+
+	t.Run("ROADMAP P27 phase 4 regression: re-running schema init after path-differentiated data exists must not fail", func(t *testing.T) {
+		// Same regression shape as phase 2's equivalent test above, for the
+		// same bug class: initSchema's three service_dependencies constraint
+		// migrations (ADR 0022 tenant/cluster, phase 2 port, phase 4 path)
+		// must each recognize every OTHER stage's target constraint name as
+		// an acceptable already-done state, or a pod restart after path data
+		// exists would see the path-based constraint name, not recognize it,
+		// drop it, and try to recreate an earlier, narrower one — which fails
+		// outright once real data has multiple rows differing only by path.
+		tenantID := uuid.New().String()
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart4-caller", "restart4-callee", "service", 8443, "", "/charge"); err != nil {
+			t.Fatalf("upsert /charge: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "restart4-caller", "restart4-callee", "service", 8443, "", "/refund"); err != nil {
+			t.Fatalf("upsert /refund: %v", err)
+		}
+
+		if err := client.initSchema(ctx); err != nil {
+			t.Fatalf("initSchema must be idempotent even with path-differentiated data present, got: %v", err)
+		}
+
+		deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list after re-init: %v", err)
+		}
+		byPath := map[string]bool{}
+		for _, d := range deps {
+			if d.FromService == "restart4-caller" && d.ToService == "restart4-callee" {
+				byPath[d.Path] = true
+			}
+		}
+		if !byPath["/charge"] || !byPath["/refund"] {
+			t.Fatalf("want both path rows to survive a schema re-init, got %+v", byPath)
+		}
+	})
+
 	t.Run("ADR 0032: expected_failure_reason joins in from cluster_services and reconciles on re-push", func(t *testing.T) {
 		// The reason lives on cluster_services (one row per Service, written
 		// only by Discovery's live scan), never on service_dependencies
@@ -821,7 +922,7 @@ func TestPostgresStores(t *testing.T) {
 		// cluster_services column, proving this isn't stuck "sticky" once set.
 		tenantID := uuid.New().String()
 
-		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "annot-caller", "annot-target", "service", 443, "failure"); err != nil {
+		if err := client.UpsertServiceDependency(ctx, uuid.New().String(), tenantID, "cluster-a", "payments", "annot-caller", "annot-target", "service", 443, "failure", ""); err != nil {
 			t.Fatalf("upsert edge: %v", err)
 		}
 
@@ -1089,15 +1190,15 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	// would silently collide under the OLD (namespace, from_service,
 	// to_service) unique constraint, merging two tenants' evidence into
 	// one row.
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service", 0, ""); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service", 0, "", ""); err != nil {
 		t.Fatalf("upsert tenant A dependency: %v", err)
 	}
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantB, clusterB.ID, "payments", "payment-ui", "payment-backend", "service", 0, ""); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantB, clusterB.ID, "payments", "payment-ui", "payment-backend", "service", 0, "", ""); err != nil {
 		t.Fatalf("upsert tenant B dependency: %v", err)
 	}
 	// Evidence again for tenant A only — proves ON CONFLICT is scoped per
 	// tenant (increments A's row), not global (which would also bump B's).
-	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service", 0, ""); err != nil {
+	if err := appClient.UpsertServiceDependency(ctx, uuid.New().String(), tenantA, clusterA.ID, "payments", "payment-ui", "payment-backend", "service", 0, "", ""); err != nil {
 		t.Fatalf("re-upsert tenant A dependency: %v", err)
 	}
 

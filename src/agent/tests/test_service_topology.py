@@ -226,6 +226,60 @@ def test_extract_service_mentions_still_matches_extract_service_calls_exactly():
     assert mentioned == from_calls == {"payment-backend", "agentify-agent"}
 
 
+# ── path / operation class (ROADMAP P27 phase 4) ──────────────────────────────
+
+def test_extract_service_calls_captures_path_after_bare_host_port():
+    log_text = "POST http://agentify-backend:8080/api/query"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-backend"})
+    assert calls[0].path == "/api/query"
+
+
+def test_extract_service_calls_captures_port_and_path_after_qualified_fqdn():
+    """Regression: the qualified-hostname branch never looked past its own
+    match at all, so a line with both a port and a path right there captured
+    neither — this is the "bonus fix" phase 4 includes alongside path itself."""
+    log_text = "calling http://payment-backend.payments.svc.cluster.local:8080/charge"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
+    assert calls[0].port == 8080
+    assert calls[0].path == "/charge"
+
+
+def test_extract_service_calls_path_absent_is_the_empty_sentinel():
+    log_text = "upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3)"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert calls[0].path == ""
+
+
+def test_extract_service_calls_path_stops_at_the_query_string():
+    log_text = "calling http://payment-api.payments.svc.cluster.local/orders/48213?token=abc"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
+    assert calls[0].path == "/orders/:id"  # numeric segment normalized, query dropped entirely
+
+
+def test_extract_service_calls_path_stops_at_trailing_log_prose():
+    log_text = "GET http://vault.vault.svc.cluster.local:8200/v1/pki/issue -> 200"
+    calls = st.extract_service_calls(log_text, "vault", {"vault"})
+    assert calls[0].path == "/v1/pki/issue"
+
+
+@pytest.mark.parametrize("raw, normalized", [
+    ("/orders/48213", "/orders/:id"),
+    ("/orders/550e8400-e29b-41d4-a716-446655440000", "/orders/:id"),
+    ("/sessions/0123456789abcdef0123456789abcdef", "/sessions/:id"),  # 32-char hex
+    ("/health", "/health"),              # no identifier segment — unchanged
+    ("/v1/pki/issue", "/v1/pki/issue"),  # no identifier segment — unchanged
+    ("", ""),
+])
+def test_normalize_path(raw, normalized):
+    assert st._normalize_path(raw) == normalized
+
+
+def test_normalize_path_rejects_an_implausibly_long_capture():
+    """A long unbroken run is more likely log prose that happened to start
+    with '/' than a real path — treated as not captured, not trusted as-is."""
+    assert st._normalize_path("/" + "x" * 300) == ""
+
+
 # ── get_known_services ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -339,8 +393,8 @@ async def test_mine_service_dependencies_upserts_validated_edges(monkeypatch):
         known_services_calls.append(namespace)
         return {"payment-backend", "payment-ui"}
 
-    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None):
-        upserted.append((namespace, from_service, to_service, port, outcome))
+    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None, path=""):
+        upserted.append((namespace, from_service, to_service, port, outcome, path))
 
     monkeypatch.setattr(st, "get_known_services", fake_get_known_services)
     monkeypatch.setattr(st, "upsert_service_dependency", fake_upsert)
@@ -351,7 +405,9 @@ async def test_mine_service_dependencies_upserts_validated_edges(monkeypatch):
     assert known_services_calls == ["payments"]
     # Qualified FQDN form carries no port, and the line has no classifiable
     # outcome — both correctly land as unknown (0/None) (ROADMAP P27 phase 2).
-    assert upserted == [("payments", "payment-ui", "payment-backend", 0, None)]
+    # Nothing trails the hostname match ("now", not a port/path), so path is
+    # also the "not captured" sentinel (ROADMAP P27 phase 4).
+    assert upserted == [("payments", "payment-ui", "payment-backend", 0, None, "")]
 
 
 @pytest.mark.asyncio

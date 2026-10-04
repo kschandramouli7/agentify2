@@ -1978,6 +1978,10 @@ type serviceDependencyUpsertRequest struct {
 	// this observation — see service_topology.py's upsert_service_dependency.
 	Port    int    `json:"port"`
 	Outcome string `json:"outcome"`
+	// ROADMAP P27 phase 4. "" is the same kind of "not captured" sentinel as
+	// port/outcome above — already normalized by the producer (see
+	// k8fy/service_topology.py's _normalize_path) before it ever reaches here.
+	Path string `json:"path"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
@@ -2255,7 +2259,7 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 	// The kind is taken from the body rather than inferred: only the miner
 	// knows which tier produced the edge, and guessing from the string shape
 	// here would silently reclassify edges on a format change.
-	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome); err != nil {
+	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome, req.Path); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

@@ -452,6 +452,11 @@ export type ServiceDependency = {
    *  Ingress object, see DependencyFlow's FlowEdge) have no port at all —
    *  same reasoning as target_kind/cluster_id above. */
   port?: number;
+  /** ROADMAP P27 phase 4. "" or absent means "never captured" — a row is
+   *  also split by path, so two paths on the same (from, to, port) are two
+   *  distinct rows. Already normalized server-side (/orders/12345 arrives
+   *  as /orders/:id) — never the raw, unboundedly-cardinal original. */
+  path?: string;
   /** Cumulative since first_seen. There is no separate "unknown" counter —
    *  it is evidence_count minus the sum of these three. Optional for the
    *  same reason port is; a real observed row always has a real (possibly

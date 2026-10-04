@@ -48,12 +48,12 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P21** | **Self-Observability Agent** — the platform reports where it is blind: services that never log a hostname, pods whose logs are unreadable, namespaces with pods but no mined edges | **Proposed (2026-09-01)** — not built, but **its substrate now is**: `scan_coverage` (P27 phase 1, `c3e93c7`) gives measured coverage, and the Dependencies panel already ships a v0 of its central finding — the "incomplete: N edges caught in under a quarter of scans" banner. What remains is the agent and the per-finding recommendations | this file — ADR at implementation |
 | **P22** | **Architecture View** — a cluster's architecture drawn from observation and kept current, delivered as the Dependencies panel: entry points, call graph, terminal dependencies, ingress exposure, per-service profile and live health, each carrying its own coverage | **v1 SHIPPED 2026-09-03/05.** Live in the Dependencies panel: whole-namespace inventory (`d15e466`), declared entry points, per-service coverage, service profiles — workload kind, replicas, ports, image (`7af085d`), and live pod health (`b71473e`). Its recorded hard blocker, pod→service attribution, was resolved in `5bc3a2a`. **Renamed from "Architecture Autodoc" 2026-09-05 to drop the generated-document promise**. **2026-09-05: node freshness** — the boxes drew live pod health with no staleness signal at all while the edges had one, so a dead collector and a stable deployment rendered identically. Now a `not live` banner (nothing reporting) and an amber `silent Nm` box (this service dark while its neighbours report). v2 (version skew over time) is unchanged | this file — **v1 shipped with no ADR.** One is owed: health is read from the Deployment's `readyReplicas` rather than from pod-watch counts, which is the non-obvious call (OPS-12 in the operational backlog below) |
 | **P23** | **Distillation** — distil deterministic *rules* out of trace history: find model-answered questions a rule could have answered, and propose the rule as a reviewed PR | Proposed (2026-09-01) — **blocked, and the blocker worsened**: the eval set is invalid twice over, by OPS-5's degraded cluster in the baseline and by an unfunded Anthropic account failing every Tier-2 item (2026-09-05) | this file — ADR at implementation |
-| **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **still blocked on P27 phase 2**: no port is stored, so a generated policy could only say `allow all ports`. P21's coverage floor is the second prerequisite | this file — ADR at implementation |
+| **P24** | **Policy Synthesis** — turn the observed call graph into enforceable config: least-privilege NetworkPolicies first, then PodDisruptionBudgets and resource requests. Audit-mode only; a missing edge is an outage | Proposed (2026-09-01) — **P27 phase 2's port blocker shipped 2026-09-12** (stale "still blocked" line here corrected 2026-10-04); **deliberately deferred regardless**, not a current priority. P21's coverage floor is the still-open second prerequisite | this file — ADR at implementation |
 | **P25** | **Change Correlation** — rank which of the recent changes could explain a symptom, using graph reachability and temporal proximity. Ranks candidates; never claims proof | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
-| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 2 SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)) — outcome (success/failure/timeout) and port now captured by all three producers; `service_dependencies` splits rows by port and carries outcome counters. **The Health-weighted graph UI payoff also shipped the same day** (`docs/SERVICE_DEPENDENCIES.md`'s "How it is coloured" section) — edges reuse the existing crit/warn status tokens, silent below 3 classified observations; **P24 remains explicitly deferred, not a current priority.** **Phase 2b SHIPPED 2026-09-13** ([ADR 0032](decisions/0032-expected-failure-annotation-for-dependency-health.md)) — a `agentify.io/expected-failure` Service annotation, read by Discovery's live scan and joined in at read time, excludes a destination's edges from the unhealthy banner without touching its rendered colour, count, or tooltip; per-service scope, not per-edge. **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). Phases 4, 5 not started. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file, [ADR 0031](decisions/0031-edge-outcome-and-port-capture.md) — **phases 1 and 3 shipped with no ADR.** One is still owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
+| **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 2 SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)) — outcome (success/failure/timeout) and port now captured by all three producers; `service_dependencies` splits rows by port and carries outcome counters. **The Health-weighted graph UI payoff also shipped the same day** (`docs/SERVICE_DEPENDENCIES.md`'s "How it is coloured" section) — edges reuse the existing crit/warn status tokens, silent below 3 classified observations; **P24 remains explicitly deferred, not a current priority.** **Phase 2b SHIPPED 2026-09-13** ([ADR 0032](decisions/0032-expected-failure-annotation-for-dependency-health.md)) — a `agentify.io/expected-failure` Service annotation, read by Discovery's live scan and joined in at read time, excludes a destination's edges from the unhealthy banner without touching its rendered colour, count, or tooltip; per-service scope, not per-edge. **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). **Phase 4's path/operation-class sub-item SHIPPED 2026-10-04** ([ADR 0034](decisions/0034-path-operation-class-capture.md)) — normalized path (`/orders/12345` → `/orders/:id`) captured by all three producers, `service_dependencies` splits rows by path on top of port, passive UI exposure (table column + capture-rate line); this is the named hard prerequisite for ROADMAP P29 half (1), now met at the data layer — **the interactive path-filtered diagram itself is still not built.** Phase 4's other three sub-items (provenance, caller cardinality, bucketed evidence) and phase 5 remain not started. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file, [ADR 0031](decisions/0031-edge-outcome-and-port-capture.md), [ADR 0034](decisions/0034-path-operation-class-capture.md) — **phases 1 and 3 shipped with no ADR.** One is still owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 | **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
-| **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | Proposed (2026-09-12) — **two complementary halves: a path-filtered view of the mined graph (needs P27 phase 4, achievable), and an on-demand raw-log search keyed by trace ID/URL text (buildable on the existing Glue/Athena store; bounded by whether onboarded services already log a trace ID — not audited)** | this file — ADR at implementation |
+| **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | Proposed (2026-09-12) — **two complementary halves: half (2), on-demand raw-log search keyed by trace ID/URL text, SHIPPED 2026-09-15; half (1), a path-filtered view of the mined graph, had its hard prerequisite (P27 phase 4) SHIP 2026-10-04 — the filter UI itself remains not started** | this file — ADR at implementation |
 | **P30** | **Deployment Security Posture, staged toward active verification** — Phase 1 assesses the OWN cluster's security posture (NetworkPolicy coverage, pod securityContext, Ingress TLS) from what Discovery already reads, read-only, same evidence-based framing as P21; Phases 2-4 (named future direction) add engagement-gated active verification, exploitability checks, and eventually full pentest orchestration | **Phase 1 SHIPPED 2026-09-14** ([ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md)) — three checks (`namespace-has-networkpolicy`, `pod-security-context`, `ingress-missing-tls`), `security_findings` table with RLS from its first migration, `POST`/`GET /api/security-findings`, and a new "Security Posture" panel. **Promotes [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)'s use case #8**, flagged 2026-08-02. RBAC-surface scanning and CI/CD-visible findings (mutable ECR tags, no scan gate, EKS admin exposure) explicitly deferred, not part of Phase 1. Phases 2-4 intentionally not scheduled | [ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md) |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
@@ -2159,11 +2159,15 @@ being dangerous. One model call per namespace, not per rule.
 
 ### Phasing
 
-- **Phase 1 — NetworkPolicy.** Highest value, highest risk. **Blocked on P27
-  phase 2**: the graph stores no port, so a generated policy could only say
-  "allow all ports" — which is not least privilege, and would make the feature
-  a compliance checkbox rather than a control. "All inputs exist" was written
-  here on 2026-09-01 and was wrong.
+- **Phase 1 — NetworkPolicy.** Highest value, highest risk. Was **blocked on
+  P27 phase 2** (the graph stored no port, so a generated policy could only
+  say "allow all ports" — not least privilege, a compliance checkbox rather
+  than a control); phase 2 **shipped 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)),
+  so the port input now exists. Still not started — remains deliberately
+  deferred (see P27's own ladder entry: "P24 remains explicitly deferred,
+  not a current priority") and still needs P21's coverage floor as its
+  second prerequisite. "All inputs exist" was written here on 2026-09-01 and
+  was wrong at the time; corrected 2026-10-04 once phase 2 actually shipped.
 - **Phase 2 — PodDisruptionBudgets**, weighted by *transitive dependents*
   (`reach()` already computes this), so criticality is derived rather than
   guessed.
@@ -2429,16 +2433,29 @@ only reliable guard is checking a candidate against a real object.
 - **Provenance** — which miner found the edge (live, Glue, agent skill; three
   producers write to one table and are currently indistinguishable) and
   whether it matched a qualified FQDN or a bare name. Bare matches are weaker
-  evidence and should be weightable as such.
+  evidence and should be weightable as such. **Not started.**
 - **Caller cardinality** — how many distinct pods made the call. "1 of 5
   replicas" versus "all 5" is a large semantic difference (leader-only,
-  sharded, mid-canary) that is currently aggregated away.
+  sharded, mid-canary) that is currently aggregated away. **Not started.**
 - **Bucketed evidence** instead of a running total — a single counter cannot
   separate steady traffic from a 02:00 daily burst, and it would have made the
-  decline above visible directly rather than by arithmetic.
+  decline above visible directly rather than by arithmetic. **Not started.**
 - **Path / operation class** — `/health` versus `/charge`. A probe-only edge is
   a far weaker dependency, and both P24 and any SPOF analysis will over-weight
-  probes without this.
+  probes without this. **SHIPPED 2026-10-04** ([ADR 0034](decisions/0034-path-operation-class-capture.md)):
+  a normalized path (`/orders/12345` → `/orders/:id` — segment-level
+  templating, no OpenAPI inference) is captured by all three producers from
+  immediately after the matched host, same shape port already used
+  (`scheme://host[:port][/path]`), and joins the row's `UNIQUE` key the same
+  way port did — two paths on the same (pair, port) are two rows, not one.
+  Bundled in: the qualified-FQDN branch never looked past its own match at
+  all before this, so it now also picks up port where phase 2 missed it (a
+  line with both right there previously captured neither). Passive UI only —
+  a Path column on the edge table and a capture-rate line ("Path known for
+  N% of edges"), honoring P27's own rule that every added field needs a
+  visible capture-rate signal. **The interactive path-filtered diagram this
+  unblocks (ROADMAP P29 half 1) is a separate, not-yet-built follow-up** —
+  this shipped the data layer, not the filter UI.
 
 ### Phase 5 — deferred
 
@@ -2707,7 +2724,8 @@ resolves to (1); "trace `<trace-id>`" resolves to (2).
 
 **What it needs first:**
 - P27 phase 4 (path/operation-class capture) — hard prerequisite for (1),
-  still not started.
+  **SHIPPED 2026-10-04** ([ADR 0034](decisions/0034-path-operation-class-capture.md)).
+  The data layer exists; the filter UI itself is the remaining work for (1).
 - For (2): confirming which onboarded services actually log a
   request/trace ID today (unknown — not audited), since the feature's
   value is bounded by that, not by anything this item can build.
@@ -2771,8 +2789,11 @@ full existing suite green, `tsc`/production build clean. **Not yet done:
 a live browser check** — no browser-automation tool is available in this
 environment, so the layout/panel was verified via type-checking and a
 production build only, not by actually looking at it render. **Half (1) —
-the path-filtered view of the mined graph — remains blocked on P27 phase 4
-and is not started.**
+the path-filtered view of the mined graph — was blocked on P27 phase 4;
+phase 4's path capture shipped 2026-10-04 ([ADR 0034](decisions/0034-path-operation-class-capture.md)),
+so the prerequisite is met. The filter UI itself — narrowing
+`DependencyFlow` to edges whose path matches a requested URL, composed with
+focus's existing hop-distance traversal — is still not started.**
 
 ---
 

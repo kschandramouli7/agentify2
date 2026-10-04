@@ -663,6 +663,22 @@ export function TopologyPanel() {
                 />
               </div>
 
+              {/* ROADMAP P27 phase 4's own stated requirement: every added
+                * field ships with its own capture-rate counter, visible in
+                * the UI, or a mostly-empty one gets silently trusted as
+                * complete. Quiet by design (adm-muted, no Alert/warn
+                * styling) — a low rate isn't itself a problem the way an
+                * unhealthy edge is; plenty of real calls genuinely carry no
+                * path (non-HTTP protocols, a qualified mention with nothing
+                * trailing it). */}
+              {graph.edges.length > 0 && (
+                <p className="adm-muted topo-path-coverage">
+                  Path known for {Math.round(
+                    (graph.edges.filter(e => e.path).length / graph.edges.length) * 100
+                  )}% of edges.
+                </p>
+              )}
+
               {unhealthy.length > 0 && (
                 <Alert
                   tone={unhealthy.some(e => edgeHealth(e).key === "failing") ? "crit" : "warn"}
@@ -788,7 +804,7 @@ export function TopologyPanel() {
                 <table className="adm-table">
                   <thead>
                     <tr>
-                      <th>From</th><th></th><th>To</th><th>Port</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
+                      <th>From</th><th></th><th>To</th><th>Port</th><th>Path</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -801,6 +817,7 @@ export function TopologyPanel() {
                           <td className="adm-muted">→</td>
                           <td><button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button></td>
                           <td className="adm-muted">{e.port ? e.port : "—"}</td>
+                          <td className="adm-muted" title={e.path || undefined}>{e.path || "—"}</td>
                           <td><EvidenceBar edge={e} /></td>
                           <td><HealthCell edge={e} /></td>
                           <td><Freshness lastSeen={e.last_seen} /></td>

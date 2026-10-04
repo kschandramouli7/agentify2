@@ -105,8 +105,9 @@ class CallObservation:
     """One validated service mention, plus what could be learned about that
     specific call from the same log line it appeared on."""
     service: str
-    port: Optional[int] = None      # known only for the bare `host:port` form
+    port: Optional[int] = None      # known only when a :<port> immediately follows the host
     outcome: Optional[str] = None   # "success" | "failure" | "timeout" | None (unknown)
+    path: str = ""                  # normalized operation class, "" when not captured (ROADMAP P27 phase 4)
 
 
 # Trigger words/symbols that make a following 3-digit number a plausible HTTP
@@ -143,9 +144,63 @@ def _infer_outcome(line: str) -> Optional[str]:
     return None
 
 
+# ── Path / operation class (ROADMAP P27 phase 4) ──────────────────────────────
+#
+# A raw path has unbounded cardinality (/orders/12345 vs /orders/67890), unlike
+# port — storing it as-is would fragment evidence across effectively-infinite
+# rows. Normalizing first turns it into a bounded "operation class":
+# /orders/12345 -> /orders/:id. Deliberately simple and conservative, same
+# spirit as the rest of this pipeline (no OpenAPI inference, no ML) — a
+# segment becomes :id only when it is unambiguously an identifier shape.
+_NUMERIC_SEGMENT_RE = re.compile(r"^\d+$")
+_UUID_SEGMENT_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+_HEX_SEGMENT_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+
+# Matches immediately after a validated hostname (via re.match(line, pos), so
+# no leading ^): an optional :<port>, then an optional /<path>. The path stops
+# at the first whitespace/quote/bracket/comma/?, which keeps a query string or
+# trailing log prose (" -> 200", attempt 3/3)") out of the capture entirely —
+# there is no separate strip-the-query-string step because there is nothing to
+# strip; it was never captured.
+_PATH_SUFFIX_RE = re.compile(r"(?::(\d{2,5}))?(/[^\s\"'()<>,?]*)?")
+_MAX_RAW_PATH_LEN = 200  # a longer capture is more likely log prose than a real path
+
+
+def _normalize_path(raw: str) -> str:
+    """/orders/12345 -> /orders/:id. Empty or unparseable input -> "" (the
+    "not captured" sentinel everywhere else in this pipeline uses)."""
+    if not raw or len(raw) > _MAX_RAW_PATH_LEN:
+        return ""
+    segments = raw.split("/")
+    normalized = []
+    for seg in segments:
+        if seg and (
+            _NUMERIC_SEGMENT_RE.match(seg)
+            or _UUID_SEGMENT_RE.match(seg)
+            or _HEX_SEGMENT_RE.match(seg)
+        ):
+            normalized.append(":id")
+        else:
+            normalized.append(seg)
+    return "/".join(normalized)
+
+
+def _peek_port_and_path(line: str, pos: int) -> "Tuple[Optional[int], str]":
+    """Looks immediately after a validated hostname match for an optional
+    `:<port>` and an optional `/<path>` — the shape a URL takes right after
+    its host (`http://host:port/path`). Best-effort: a line with neither
+    yields (None, "") rather than failing anything.
+    """
+    m = _PATH_SUFFIX_RE.match(line, pos)
+    port = int(m.group(1)) if m.group(1) else None
+    return port, _normalize_path(m.group(2) or "")
+
+
 def extract_service_calls(log_text: str, namespace: str, known_services: Set[str]) -> List[CallObservation]:
-    """Like extract_service_mentions, but keeps the port (bare host:port form
-    only) and infers an outcome from the same line each mention appeared on.
+    """Like extract_service_mentions, but keeps the port, the normalized path,
+    and infers an outcome from the same line each mention appeared on.
 
     Iterates line-by-line — unlike extract_service_mentions, which scans the
     whole blob at once — because outcome context is local to one line; see
@@ -162,19 +217,31 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
     for line in log_text.split("\n"):
         outcome = _infer_outcome(line)
 
-        for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(line):
+        for m in _HOSTNAME_RE.finditer(line):
+            service_candidate, namespace_candidate = m.group(1), m.group(2)
             if namespace_candidate == namespace and service_candidate in known_services:
-                observations.append(CallObservation(service=service_candidate, port=None, outcome=outcome))
+                port, path = _peek_port_and_path(line, m.end())
+                observations.append(
+                    CallObservation(service=service_candidate, port=port, outcome=outcome, path=path)
+                )
 
-        for host in _URL_HOST_RE.findall(line):
+        for m in _URL_HOST_RE.finditer(line):
+            host = m.group(1)
             if "." in host:
                 continue
             if host in known_services:
-                observations.append(CallObservation(service=host, port=None, outcome=outcome))
+                port, path = _peek_port_and_path(line, m.end())
+                observations.append(CallObservation(service=host, port=port, outcome=outcome, path=path))
 
-        for name, port_str in _HOST_PORT_RE.findall(line):
+        for m in _HOST_PORT_RE.finditer(line):
+            name, port_str = m.group(1), m.group(2)
             if name in known_services:
-                observations.append(CallObservation(service=name, port=int(port_str), outcome=outcome))
+                # Port is already known from this match itself; only the path
+                # half of the peek is used here.
+                _, path = _peek_port_and_path(line, m.end())
+                observations.append(
+                    CallObservation(service=name, port=int(port_str), outcome=outcome, path=path)
+                )
 
     return observations
 
@@ -336,15 +403,16 @@ async def upsert_service_dependency(
     backend_url: str,
     port: Optional[int] = None,
     outcome: Optional[str] = None,
+    path: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge. Best-effort: any
     failure is logged and swallowed — losing one piece of evidence never
     surfaces as a diagnosis error.
 
-    port/outcome (ROADMAP P27 phase 2) are sent as 0/"" when unknown, not
-    omitted — the Hub's schema uses 0 as port's "not captured" sentinel
-    (NULL would break the UNIQUE constraint that accumulates evidence per
-    port) and "" the same way for outcome.
+    port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
+    unknown, not omitted — the Hub's schema uses those as the "not captured"
+    sentinels (NULL would break the UNIQUE constraint that accumulates
+    evidence per port/path).
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -356,6 +424,7 @@ async def upsert_service_dependency(
                     "to_service": to_service,
                     "port": port or 0,
                     "outcome": outcome or "",
+                    "path": path or "",
                 },
             )
             resp.raise_for_status()
@@ -411,18 +480,24 @@ async def mine_service_dependencies(namespace: str, from_service: str, log_text:
     if not known_services:
         return
 
-    # Last KNOWN outcome per (to_service, port) wins within this one log_text
-    # (ROADMAP P27 phase 2) — extract_service_calls returns observations in
-    # line order, so a later one reflects more recent state than an earlier
-    # one for the same target. A line that mentions the target again without
-    # a classifiable outcome must not erase an earlier confident one.
-    last_outcome: Dict[Tuple[str, int], Optional[str]] = {}
+    # Last KNOWN outcome per (to_service, port, path) wins within this one
+    # log_text (ROADMAP P27 phase 2; path joined the key in phase 4, since two
+    # distinct paths on the same (service, port) are now two distinct rows,
+    # not one — collapsing them here would silently discard one path's
+    # evidence instead of accumulating it). extract_service_calls returns
+    # observations in line order, so a later one reflects more recent state
+    # than an earlier one for the same target. A line that mentions the
+    # target again without a classifiable outcome must not erase an earlier
+    # confident one.
+    last_outcome: Dict[Tuple[str, int, str], Optional[str]] = {}
     for obs in extract_service_calls(log_text, namespace, known_services):
         if obs.service == from_service:
             continue  # not a dependency, just the service mentioning itself
-        key = (obs.service, obs.port or 0)
+        key = (obs.service, obs.port or 0, obs.path)
         if key not in last_outcome or obs.outcome is not None:
             last_outcome[key] = obs.outcome
 
-    for (to_service, port), outcome in last_outcome.items():
-        await upsert_service_dependency(namespace, from_service, to_service, backend_url, port=port, outcome=outcome)
+    for (to_service, port, path), outcome in last_outcome.items():
+        await upsert_service_dependency(
+            namespace, from_service, to_service, backend_url, port=port, outcome=outcome, path=path,
+        )

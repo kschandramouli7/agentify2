@@ -97,8 +97,9 @@ class CallObservation:
     """One validated service mention, plus what could be learned about that
     specific call from the same log line it appeared on."""
     service: str
-    port: Optional[int] = None      # known only for the bare `host:port` form
+    port: Optional[int] = None      # known only when a :<port> immediately follows the host
     outcome: Optional[str] = None   # "success" | "failure" | "timeout" | None (unknown)
+    path: str = ""                  # normalized operation class, "" when not captured (ROADMAP P27 phase 4)
 
 
 # Trigger words/symbols that make a following 3-digit number a plausible HTTP
@@ -135,9 +136,63 @@ def _infer_outcome(line: str) -> Optional[str]:
     return None
 
 
+# ── Path / operation class (ROADMAP P27 phase 4) ──────────────────────────────
+#
+# A raw path has unbounded cardinality (/orders/12345 vs /orders/67890), unlike
+# port — storing it as-is would fragment evidence across effectively-infinite
+# rows. Normalizing first turns it into a bounded "operation class":
+# /orders/12345 -> /orders/:id. Deliberately simple and conservative, same
+# spirit as the rest of this pipeline (no OpenAPI inference, no ML) — a
+# segment becomes :id only when it is unambiguously an identifier shape.
+_NUMERIC_SEGMENT_RE = re.compile(r"^\d+$")
+_UUID_SEGMENT_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+_HEX_SEGMENT_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+
+# Matches immediately after a validated hostname (via re.match(line, pos), so
+# no leading ^): an optional :<port>, then an optional /<path>. The path stops
+# at the first whitespace/quote/bracket/comma/?, which keeps a query string or
+# trailing log prose (" -> 200", attempt 3/3)") out of the capture entirely —
+# there is no separate strip-the-query-string step because there is nothing to
+# strip; it was never captured.
+_PATH_SUFFIX_RE = re.compile(r"(?::(\d{2,5}))?(/[^\s\"'()<>,?]*)?")
+_MAX_RAW_PATH_LEN = 200  # a longer capture is more likely log prose than a real path
+
+
+def _normalize_path(raw: str) -> str:
+    """/orders/12345 -> /orders/:id. Empty or unparseable input -> "" (the
+    "not captured" sentinel everywhere else in this pipeline uses)."""
+    if not raw or len(raw) > _MAX_RAW_PATH_LEN:
+        return ""
+    segments = raw.split("/")
+    normalized = []
+    for seg in segments:
+        if seg and (
+            _NUMERIC_SEGMENT_RE.match(seg)
+            or _UUID_SEGMENT_RE.match(seg)
+            or _HEX_SEGMENT_RE.match(seg)
+        ):
+            normalized.append(":id")
+        else:
+            normalized.append(seg)
+    return "/".join(normalized)
+
+
+def _peek_port_and_path(line: str, pos: int) -> "Tuple[Optional[int], str]":
+    """Looks immediately after a validated hostname match for an optional
+    `:<port>` and an optional `/<path>` — the shape a URL takes right after
+    its host (`http://host:port/path`). Best-effort: a line with neither
+    yields (None, "") rather than failing anything.
+    """
+    m = _PATH_SUFFIX_RE.match(line, pos)
+    port = int(m.group(1)) if m.group(1) else None
+    return port, _normalize_path(m.group(2) or "")
+
+
 def extract_service_calls(log_text: str, namespace: str, known_services: Set[str]) -> List[CallObservation]:
-    """Like extract_service_mentions, but keeps the port (bare host:port form
-    only) and infers an outcome from the same line each mention appeared on.
+    """Like extract_service_mentions, but keeps the port, the normalized path,
+    and infers an outcome from the same line each mention appeared on.
 
     Iterates line-by-line — unlike extract_service_mentions, which scans the
     whole blob at once — because outcome context is local to one line; see
@@ -154,19 +209,31 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
     for line in log_text.split("\n"):
         outcome = _infer_outcome(line)
 
-        for service_candidate, namespace_candidate in _HOSTNAME_RE.findall(line):
+        for m in _HOSTNAME_RE.finditer(line):
+            service_candidate, namespace_candidate = m.group(1), m.group(2)
             if namespace_candidate == namespace and service_candidate in known_services:
-                observations.append(CallObservation(service=service_candidate, port=None, outcome=outcome))
+                port, path = _peek_port_and_path(line, m.end())
+                observations.append(
+                    CallObservation(service=service_candidate, port=port, outcome=outcome, path=path)
+                )
 
-        for host in _URL_HOST_RE.findall(line):
+        for m in _URL_HOST_RE.finditer(line):
+            host = m.group(1)
             if "." in host:
                 continue
             if host in known_services:
-                observations.append(CallObservation(service=host, port=None, outcome=outcome))
+                port, path = _peek_port_and_path(line, m.end())
+                observations.append(CallObservation(service=host, port=port, outcome=outcome, path=path))
 
-        for name, port_str in _HOST_PORT_RE.findall(line):
+        for m in _HOST_PORT_RE.finditer(line):
+            name, port_str = m.group(1), m.group(2)
             if name in known_services:
-                observations.append(CallObservation(service=name, port=int(port_str), outcome=outcome))
+                # Port is already known from this match itself; only the path
+                # half of the peek is used here.
+                _, path = _peek_port_and_path(line, m.end())
+                observations.append(
+                    CallObservation(service=name, port=int(port_str), outcome=outcome, path=path)
+                )
 
     return observations
 
@@ -326,14 +393,15 @@ async def push_dependency(
     target_kind: str = "service",
     port: Optional[int] = None,
     outcome: Optional[str] = None,
+    path: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge via the tenant-scoped
     ingest endpoint. Best-effort: any failure is logged and swallowed — one
     dropped scan cycle never blocks the next.
 
-    port/outcome (ROADMAP P27 phase 2) are sent as 0/"" when unknown — see
-    upsert_service_dependency's identical note (agent's service_topology.py)
-    for why 0/"" rather than omitting the fields.
+    port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
+    unknown — see upsert_service_dependency's identical note (agent's
+    service_topology.py) for why those rather than omitting the fields.
     """
     # Omit the header entirely when unset — see push_inventory's identical
     # comment (inventory.py) for why.
@@ -353,6 +421,7 @@ async def push_dependency(
                     "target_kind": target_kind,
                     "port": port or 0,
                     "outcome": outcome or "",
+                    "path": path or "",
                 },
                 headers=headers,
             )

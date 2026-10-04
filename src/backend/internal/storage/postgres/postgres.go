@@ -403,6 +403,13 @@ func (c *Client) initSchema(ctx context.Context) error {
 	-- total relational+kv unavailability, not just this table). The two
 	-- migrations must each recognize the OTHER's target name as an
 	-- acceptable already-done state, not just their own.
+	-- ROADMAP P27 phase 4 added a fourth acceptable name
+	-- (service_dependencies_tenant_cluster_ns_svc_port_path_key) below — listed
+	-- here too, for the same reason port's name was added alongside this
+	-- block's own: on every restart this block re-runs, and without every
+	-- LATER stage's name in this exclusion list, it would see a name it
+	-- doesn't recognize, drop it, and recreate ITS OWN narrower constraint —
+	-- silently undoing whichever later migration had already run.
 	DO $$
 	DECLARE
 		old_constraint_name TEXT;
@@ -413,7 +420,8 @@ func (c *Client) initSchema(ctx context.Context) error {
 		  AND contype = 'u'
 		  AND conname NOT IN (
 		      'service_dependencies_tenant_cluster_ns_svc_key',
-		      'service_dependencies_tenant_cluster_ns_svc_port_key'
+		      'service_dependencies_tenant_cluster_ns_svc_port_key',
+		      'service_dependencies_tenant_cluster_ns_svc_port_path_key'
 		  );
 		IF old_constraint_name IS NOT NULL THEN
 			EXECUTE format('ALTER TABLE service_dependencies DROP CONSTRAINT %I', old_constraint_name);
@@ -421,7 +429,8 @@ func (c *Client) initSchema(ctx context.Context) error {
 		IF NOT EXISTS (
 			SELECT 1 FROM pg_constraint WHERE conname IN (
 			    'service_dependencies_tenant_cluster_ns_svc_key',
-			    'service_dependencies_tenant_cluster_ns_svc_port_key'
+			    'service_dependencies_tenant_cluster_ns_svc_port_key',
+			    'service_dependencies_tenant_cluster_ns_svc_port_path_key'
 			)
 		) THEN
 			ALTER TABLE service_dependencies ADD CONSTRAINT service_dependencies_tenant_cluster_ns_svc_key
@@ -471,6 +480,12 @@ func (c *Client) initSchema(ctx context.Context) error {
 	-- unique constraint currently exists on this table and replace it, so
 	-- this runs correctly whether it follows the migration above or (on a
 	-- fresh database) runs right after CREATE TABLE.
+	--
+	-- ROADMAP P27 phase 4 added path alongside port below -- the exclusion
+	-- here also lists that later stage's name, same reason and same bug class
+	-- as the block above (BUG FOUND LIVE 2026-09-12): without it, this block
+	-- re-running after phase 4 has migrated would see an unrecognized name,
+	-- drop it, and recreate the narrower port-only constraint.
 	DO $$
 	DECLARE
 		old_constraint_name TEXT;
@@ -479,15 +494,53 @@ func (c *Client) initSchema(ctx context.Context) error {
 		FROM pg_constraint
 		WHERE conrelid = 'service_dependencies'::regclass
 		  AND contype = 'u'
-		  AND conname != 'service_dependencies_tenant_cluster_ns_svc_port_key';
+		  AND conname NOT IN (
+		      'service_dependencies_tenant_cluster_ns_svc_port_key',
+		      'service_dependencies_tenant_cluster_ns_svc_port_path_key'
+		  );
 		IF old_constraint_name IS NOT NULL THEN
 			EXECUTE format('ALTER TABLE service_dependencies DROP CONSTRAINT %I', old_constraint_name);
 		END IF;
 		IF NOT EXISTS (
-			SELECT 1 FROM pg_constraint WHERE conname = 'service_dependencies_tenant_cluster_ns_svc_port_key'
+			SELECT 1 FROM pg_constraint WHERE conname IN (
+			    'service_dependencies_tenant_cluster_ns_svc_port_key',
+			    'service_dependencies_tenant_cluster_ns_svc_port_path_key'
+			)
 		) THEN
 			ALTER TABLE service_dependencies ADD CONSTRAINT service_dependencies_tenant_cluster_ns_svc_port_key
 				UNIQUE (tenant_id, cluster_id, namespace, from_service, to_service, port);
+		END IF;
+	END $$;
+
+	-- ROADMAP P27 phase 4: path (normalized operation class, see
+	-- k8fy/service_topology.py's _normalize_path -- /orders/12345 becomes
+	-- /orders/:id before it ever reaches here, so this is a bounded dimension
+	-- like port, not raw unbounded text). '' is the sentinel for "not
+	-- captured", never NULL, same reason as port and outcome above.
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS path TEXT NOT NULL DEFAULT '';
+
+	-- Splitting rows by path too, same argument as port's: aggregating every
+	-- path into one edge would lose exactly the dimension the "API surface"
+	-- diagram (ROADMAP P27 phase 4's own table of what it unlocks) needs --
+	-- which endpoints does this edge actually cover. Same self-healing
+	-- drop-and-recreate pattern as both blocks above.
+	DO $$
+	DECLARE
+		old_constraint_name TEXT;
+	BEGIN
+		SELECT conname INTO old_constraint_name
+		FROM pg_constraint
+		WHERE conrelid = 'service_dependencies'::regclass
+		  AND contype = 'u'
+		  AND conname != 'service_dependencies_tenant_cluster_ns_svc_port_path_key';
+		IF old_constraint_name IS NOT NULL THEN
+			EXECUTE format('ALTER TABLE service_dependencies DROP CONSTRAINT %I', old_constraint_name);
+		END IF;
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'service_dependencies_tenant_cluster_ns_svc_port_path_key'
+		) THEN
+			ALTER TABLE service_dependencies ADD CONSTRAINT service_dependencies_tenant_cluster_ns_svc_port_path_key
+				UNIQUE (tenant_id, cluster_id, namespace, from_service, to_service, port, path);
 		END IF;
 	END $$;
 
@@ -2151,6 +2204,12 @@ type ServiceDependency struct {
 	// since first_seen; there is no separate "unknown" counter because it is
 	// EvidenceCount minus the sum of the three below.
 	Port                 int `json:"port"`
+	// ROADMAP P27 phase 4. "" when never captured — a row is now also split
+	// by path, so two paths on the same (from, to, port) are two distinct
+	// rows. Already normalized before it reaches here (see
+	// k8fy/service_topology.py's _normalize_path): /orders/12345 arrives as
+	// /orders/:id, never the raw, unboundedly-cardinal original.
+	Path                 string `json:"path"`
 	OutcomeSuccessCount  int `json:"outcome_success_count"`
 	OutcomeFailureCount  int `json:"outcome_failure_count"`
 	OutcomeTimeoutCount  int `json:"outcome_timeout_count"`
@@ -2181,14 +2240,15 @@ func setTenantContext(ctx context.Context, tx *sql.Tx, tenantID string) error {
 // scoped to (tenantID, clusterID) — ADR 0022. Runs inside a transaction so
 // the tenant scoping above only ever applies to this one call.
 //
-// port/outcome (ROADMAP P27 phase 2, ADR 0031): port is 0 when the caller
-// never captured one (the unique key includes port, so a row is per-port —
-// see the schema migration's comment for why 0, not NULL); outcome is one
-// of "success"/"failure"/"timeout"/"" (unknown, e.g. an older collector that
-// predates this phase). The CASE expressions below increment at most one
+// port/outcome (ROADMAP P27 phase 2, ADR 0031) and path (phase 4): port/path
+// are 0/"" when the caller never captured them (the unique key includes
+// both, so a row is per-port-per-path — see the schema migration's comment
+// for why 0/"" rather than NULL); outcome is one of
+// "success"/"failure"/"timeout"/"" (unknown, e.g. an older collector that
+// predates phase 2). The CASE expressions below increment at most one
 // outcome counter per call, never more than one, since a single observation
 // has exactly one outcome or none.
-func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome string) error {
+func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path string) error {
 	if targetKind == "" {
 		targetKind = "service" // an older collector reports only validated edges
 	}
@@ -2202,25 +2262,25 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 		return fmt.Errorf("set tenant context: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, port,
+		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, port, path,
 		                                   evidence_count, outcome_success_count, outcome_failure_count, outcome_timeout_count,
 		                                   first_seen, last_seen)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1,
-		        CASE WHEN $9 = 'success' THEN 1 ELSE 0 END,
-		        CASE WHEN $9 = 'failure' THEN 1 ELSE 0 END,
-		        CASE WHEN $9 = 'timeout' THEN 1 ELSE 0 END,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1,
+		        CASE WHEN $10 = 'success' THEN 1 ELSE 0 END,
+		        CASE WHEN $10 = 'failure' THEN 1 ELSE 0 END,
+		        CASE WHEN $10 = 'timeout' THEN 1 ELSE 0 END,
 		        NOW(), NOW())
-		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port) DO UPDATE SET
+		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path) DO UPDATE SET
 		  evidence_count         = service_dependencies.evidence_count + 1,
-		  outcome_success_count  = service_dependencies.outcome_success_count + CASE WHEN $9 = 'success' THEN 1 ELSE 0 END,
-		  outcome_failure_count  = service_dependencies.outcome_failure_count + CASE WHEN $9 = 'failure' THEN 1 ELSE 0 END,
-		  outcome_timeout_count  = service_dependencies.outcome_timeout_count + CASE WHEN $9 = 'timeout' THEN 1 ELSE 0 END,
+		  outcome_success_count  = service_dependencies.outcome_success_count + CASE WHEN $10 = 'success' THEN 1 ELSE 0 END,
+		  outcome_failure_count  = service_dependencies.outcome_failure_count + CASE WHEN $10 = 'failure' THEN 1 ELSE 0 END,
+		  outcome_timeout_count  = service_dependencies.outcome_timeout_count + CASE WHEN $10 = 'timeout' THEN 1 ELSE 0 END,
 		  -- Kind can be corrected on a later sighting (a host first seen as
 		  -- external, later resolved as cross-namespace once its namespace is
 		  -- tracked) but never downgraded to the default by an older caller.
 		  target_kind    = COALESCE(NULLIF(EXCLUDED.target_kind, ''), service_dependencies.target_kind),
 		  last_seen      = NOW()`,
-		id, namespace, fromService, toService, tenantID, clusterID, targetKind, port, outcome)
+		id, namespace, fromService, toService, tenantID, clusterID, targetKind, port, path, outcome)
 	if err != nil {
 		return err
 	}
@@ -2341,7 +2401,7 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	rows, err := tx.QueryContext(ctx, `
 		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
 		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
-		       sd.port, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
+		       sd.port, sd.path, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
 		       COALESCE(cs.expected_failure_reason, '')
 		FROM service_dependencies sd
 		LEFT JOIN cluster_services cs
@@ -2358,7 +2418,7 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		var d ServiceDependency
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
 			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind,
-			&d.Port, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
+			&d.Port, &d.Path, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
 			&d.ExpectedFailureReason); err != nil {
 			return nil, err
 		}

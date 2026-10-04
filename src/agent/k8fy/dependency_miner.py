@@ -192,6 +192,7 @@ async def _push_edge(
     to_service: str,
     port: Optional[int] = None,
     outcome: Optional[str] = None,
+    path: str = "",
 ) -> None:
     """Push one discovered edge — no bearer token (ADR 0029's trusted-
     internal-caller path; this miner is the Agent, on the same trusted,
@@ -199,9 +200,10 @@ async def _push_edge(
     Best-effort: log-and-swallow on failure, same as every other push_* in
     this codebase — one dropped edge never blocks the rest of the cycle.
 
-    port/outcome (ROADMAP P27 phase 2) are sent as 0/"" when unknown — see
-    service_topology.py's upsert_service_dependency for why 0/"" rather than
-    omitting the fields (0/"" are the Hub schema's "not captured" sentinels).
+    port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
+    unknown — see service_topology.py's upsert_service_dependency for why
+    those rather than omitting the fields (they're the Hub schema's "not
+    captured" sentinels).
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -214,6 +216,7 @@ async def _push_edge(
                     "cluster_id": cluster_id,
                     "port": port or 0,
                     "outcome": outcome or "",
+                    "path": path or "",
                 },
             )
             resp.raise_for_status()
@@ -228,13 +231,13 @@ async def _mine_namespace(
     backend_url: str, athena_config: Dict[str, str], cluster_id: str, namespace: str, hours_back: int,
 ) -> None:
     """Mine one (cluster, namespace)'s recently-landed log partition for
-    service-dependency edges, pushing each discovered (from, to, port) at
-    most once per cycle (evidence_count already accumulates cluster-side
-    across cycles — no need to push a duplicate within one). port is part of
-    the dedup key as of ROADMAP P27 phase 2, since a row is now split by
-    port; the outcome pushed for that one push is the last KNOWN outcome
-    seen for that (to, port) within this pod's own log window — a later
-    unclassifiable line never erases an earlier confident one."""
+    service-dependency edges, pushing each discovered (from, to, port, path)
+    at most once per cycle (evidence_count already accumulates cluster-side
+    across cycles — no need to push a duplicate within one). port (phase 2)
+    and path (phase 4) are both part of the dedup key, since a row is now
+    split by both; the outcome pushed for that one push is the last KNOWN
+    outcome seen for that (to, port, path) within this pod's own log window —
+    a later unclassifiable line never erases an earlier confident one."""
     selectors = await _fetch_selectors(backend_url, cluster_id, namespace)
     if not selectors:
         return  # no known services (or the fetch failed) — nothing to attribute logs to
@@ -266,33 +269,39 @@ async def _mine_namespace(
         pod_labels.setdefault(pod_name, _parse_athena_map(row["labels"]))
         by_pod.setdefault(pod_name, []).append(_parse_cri_message(row["log"]))
 
-    pushed: Set[Tuple[str, str, int]] = set()
+    pushed: Set[Tuple[str, str, int, str]] = set()
     for pod_name, lines in by_pod.items():
         from_service = _service_for_labels(pod_labels.get(pod_name, {}), selectors)
         if not from_service:
             continue
         log_text = "\n".join(lines)
 
-        # Last KNOWN outcome per (to_service, port) wins within this pod's
-        # own log window (ROADMAP P27 phase 2) — extract_service_calls
-        # returns observations in line order, so a later one reflects more
-        # recent state than an earlier one for the same target. A line that
+        # Last KNOWN outcome per (to_service, port, path) wins within this
+        # pod's own log window (ROADMAP P27 phase 2; path joined the key in
+        # phase 4 — two distinct paths on the same (service, port) are two
+        # distinct rows, not one, so collapsing them here would silently
+        # discard one path's evidence). extract_service_calls returns
+        # observations in line order, so a later one reflects more recent
+        # state than an earlier one for the same target. A line that
         # mentions the target again without a classifiable outcome must not
         # erase an earlier confident one.
-        last_outcome: Dict[Tuple[str, int], Optional[str]] = {}
+        last_outcome: Dict[Tuple[str, int, str], Optional[str]] = {}
         for obs in extract_service_calls(log_text, namespace, known_services):
             if obs.service == from_service:
                 continue
-            key = (obs.service, obs.port or 0)
+            key = (obs.service, obs.port or 0, obs.path)
             if key not in last_outcome or obs.outcome is not None:
                 last_outcome[key] = obs.outcome
 
-        for (to_service, port), outcome in last_outcome.items():
-            edge = (from_service, to_service, port)
+        for (to_service, port, path), outcome in last_outcome.items():
+            edge = (from_service, to_service, port, path)
             if edge in pushed:
                 continue
             pushed.add(edge)
-            await _push_edge(backend_url, cluster_id, namespace, from_service, to_service, port=port, outcome=outcome)
+            await _push_edge(
+                backend_url, cluster_id, namespace, from_service, to_service,
+                port=port, outcome=outcome, path=path,
+            )
 
 
 async def run_once(backend_url: str, athena_config: Dict[str, str], hours_back: int = 2) -> None:

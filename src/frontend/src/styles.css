@@ -2864,6 +2864,10 @@ code {
 }
 .topo-link:hover { color: var(--accent-light); }
 
+/* ROADMAP P27 phase 4's capture-rate line — quiet, between the stat row and
+   any alert banners, same margin rhythm as the stat row's own bottom margin. */
+.topo-path-coverage { margin: -12px 0 20px; font-size: 12px; }
+
 /* evidence_count: one hue, more-is-wider, number always printed beside it. */
 .topo-evidence { display: inline-flex; align-items: center; gap: 6px; }
 .topo-evidence__track {
