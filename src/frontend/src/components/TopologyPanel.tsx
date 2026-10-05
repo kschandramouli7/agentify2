@@ -68,6 +68,46 @@ function absTime(iso: string): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+// ROADMAP P29 half (1) — path-filtered diagram view, on top of ROADMAP P27
+// phase 4's mined path capture.
+
+const PATH_NUMERIC_SEGMENT_RE = /^\d+$/;
+const PATH_UUID_SEGMENT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PATH_HEX_SEGMENT_RE = /^[0-9a-f]{16,}$/i;
+const PATH_MAX_RAW_LEN = 200;
+const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]);
+
+// Mirrors k8fy/service_topology.py's _normalize_path exactly (same rules,
+// same length cap) — kept here as a small, deliberate duplication rather
+// than a shared package, same convention this codebase already accepts for
+// the Python extraction logic itself (ADR 0029). Without this, an operator
+// would have to already know a stored edge's normalized template
+// ("/orders/:id") to find it, rather than typing a real example they saw.
+function normalizePathForFilter(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > PATH_MAX_RAW_LEN) return "";
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash
+    .split("/")
+    .map(seg =>
+      seg && (PATH_NUMERIC_SEGMENT_RE.test(seg) || PATH_UUID_SEGMENT_RE.test(seg) || PATH_HEX_SEGMENT_RE.test(seg))
+        ? ":id"
+        : seg,
+    )
+    .join("/");
+}
+
+// A typed "POST /charge" means the same thing as "/charge" here — method
+// isn't part of what's stored (the mined path has no method), so stripping
+// it is the difference between a filter that works the way an operator
+// pasting a request line expects and one that silently never matches.
+function stripLeadingHttpMethod(raw: string): string {
+  const trimmed = raw.trim();
+  const spaceIdx = trimmed.indexOf(" ");
+  if (spaceIdx === -1) return trimmed;
+  return HTTP_METHODS.has(trimmed.slice(0, spaceIdx).toUpperCase()) ? trimmed.slice(spaceIdx + 1) : trimmed;
+}
+
 type Graph = {
   edges: ServiceDependency[];
   services: string[];
@@ -277,6 +317,10 @@ export function TopologyPanel() {
   const [applied, setApplied] = useState("");
   const [typed, setTyped] = useState("");
   const [focus, setFocus] = useState<string | null>(null);
+  // ROADMAP P29 half (1). Live-filtered as the operator types — unlike the
+  // namespace box, this never triggers a fetch, so there's no apply step to
+  // wait for.
+  const [pathFilterInput, setPathFilterInput] = useState("");
   const [showMermaid, setShowMermaid] = useState(false);
 
   // Drag-to-resize the chat rail (`.topo-side`) against the diagram
@@ -357,6 +401,29 @@ export function TopologyPanel() {
     enabled: applied.length > 0,
   });
 
+  // ROADMAP P29 half (1). Normalized once per keystroke, not per edge, and
+  // fed straight into `graph`/`arch` below rather than threaded through
+  // DependencyFlow as a second filter prop — every downstream consumer
+  // (stats, table, chips, diagram) already reads from one of those two, so
+  // filtering upstream of both means neither has to know this feature
+  // exists. "" (nothing typed, or everything strips to "/") means no filter.
+  const activePathFilter = useMemo(
+    () => normalizePathForFilter(stripLeadingHttpMethod(pathFilterInput)),
+    [pathFilterInput],
+  );
+  const pathFilteredData = useMemo(() => {
+    if (!activePathFilter || !data) return data;
+    return data.filter(e => e.path === activePathFilter);
+  }, [data, activePathFilter]);
+  // For the datalist below — always the FULL unfiltered set of known paths,
+  // not pathFilteredData's (which would shrink to just the active filter
+  // once one is typed, defeating the point of suggesting alternatives).
+  const knownPaths = useMemo(
+    () => [...new Set((data ?? []).map(e => e.path).filter((p): p is string => !!p))].sort(),
+    [data],
+  );
+  const pathFilterHasNoMatches = Boolean(activePathFilter) && (pathFilteredData?.length ?? 0) === 0;
+
   // The three sources that turn a call graph into an architecture view. All
   // best-effort: each degrades to empty rather than blanking the panel, because
   // the mined graph on its own is still worth showing.
@@ -402,7 +469,7 @@ export function TopologyPanel() {
     enabled: applied.length > 0,
   });
 
-  const graph = useMemo(() => buildGraph(data ?? []), [data]);
+  const graph = useMemo(() => buildGraph(pathFilteredData ?? []), [pathFilteredData]);
 
   // Declared entry points become synthetic nodes and edges. Their ids are
   // prefixed so they can never collide with a real service name.
@@ -411,7 +478,7 @@ export function TopologyPanel() {
   const knownNamespaceSet = useMemo(() => new Set(namespaces), [namespaces]);
 
   const arch = useMemo(() => {
-    const edges: FlowEdge[] = [...(data ?? [])];
+    const edges: FlowEdge[] = [...(pathFilteredData ?? [])];
     const meta = new Map<string, NodeMeta>();
     const now = new Date().toISOString();
 
@@ -421,7 +488,7 @@ export function TopologyPanel() {
     // in any inventory by definition, so the edge is the only source. Kind
     // comes from target_kind rather than being guessed from the string, so a
     // log-format change cannot silently reclassify them.
-    for (const e of data ?? []) {
+    for (const e of pathFilteredData ?? []) {
       // Classify by target_kind when the backend supplies it, and FALL BACK TO
       // SHAPE when it does not.
       //
@@ -535,7 +602,7 @@ export function TopologyPanel() {
     // mentions them, so they are always referenced by definition.
     const standalone = [...known].filter(s => !referenced.has(s)).sort();
     return { edges, meta, standalone, known, newestLive };
-  }, [data, ingress, coverage, inventory, profiles, health, applied, knownNamespaceSet]);
+  }, [pathFilteredData, ingress, coverage, inventory, profiles, health, applied, knownNamespaceSet]);
   // Surfaced, not just styled: an edge the miner rarely catches implies the
   // graph is missing edges it never catches at all.
   const rare = useMemo(() => rarelyObserved(graph.edges), [graph.edges]);
@@ -594,6 +661,32 @@ export function TopologyPanel() {
               </button>
             </>
           )}
+          {/* ROADMAP P29 half (1). A datalist, not a dropdown — native browser
+            * autocomplete over the paths this namespace actually has evidence
+            * for, while still accepting free text (a raw example path, which
+            * gets normalized on match) rather than requiring the operator to
+            * already know a stored template. */}
+          <input
+            className="adm-date-input"
+            value={pathFilterInput}
+            onChange={e => setPathFilterInput(e.target.value)}
+            placeholder="filter by path (e.g. /charge)"
+            aria-label="Filter by path"
+            list="topo-known-paths"
+          />
+          <datalist id="topo-known-paths">
+            {knownPaths.map(p => <option key={p} value={p} />)}
+          </datalist>
+          {pathFilterInput && (
+            <button
+              className="adm-btn adm-btn--ghost"
+              type="button"
+              onClick={() => setPathFilterInput("")}
+              aria-label="Clear path filter"
+            >
+              Clear
+            </button>
+          )}
           <button className="adm-btn adm-btn--ghost" type="button" onClick={() => refetch()}>
             {isFetching ? "Refreshing…" : "Refresh"}
           </button>
@@ -607,7 +700,27 @@ export function TopologyPanel() {
             <p className="adm-error">{error instanceof Error ? error.message : "Failed to load dependencies."}</p>
           )}
 
-          {!isLoading && !isError && graph.edges.length === 0 && arch.standalone.length === 0 && (
+          {/* A path filter matching nothing is a different root cause from an
+            * empty namespace — "this specific path has no evidence" versus
+            * "nothing here at all" — and takes priority over both the
+            * generic empty state and the normal render (which would
+            * otherwise show a sparse diagram of now-"standalone" services
+            * with no explanation of why there are no edges). */}
+          {!isLoading && !isError && pathFilterHasNoMatches && (
+            <div className="adm-empty">
+              <p>
+                No observed calls match path <code>{activePathFilter}</code> in{" "}
+                <strong>{applied}</strong>.
+              </p>
+              <p className="adm-muted">
+                {knownPaths.length > 0
+                  ? "Known paths for this namespace are suggested as you type."
+                  : "This namespace has no path evidence at all yet — see the capture-rate line above."}
+              </p>
+            </div>
+          )}
+
+          {!isLoading && !isError && !pathFilterHasNoMatches && graph.edges.length === 0 && arch.standalone.length === 0 && (
             <div className="adm-empty">
               <p>
                 No dependency evidence for <strong>{applied}</strong>
@@ -623,7 +736,7 @@ export function TopologyPanel() {
             </div>
           )}
 
-          {(graph.edges.length > 0 || arch.standalone.length > 0) && (
+          {!pathFilterHasNoMatches && (graph.edges.length > 0 || arch.standalone.length > 0) && (
             <>
               <div className="adm-stats-row">
                 <StatCard
@@ -640,7 +753,13 @@ export function TopologyPanel() {
                   icon="⇄"
                   label="Observed calls"
                   value={String(graph.edges.length)}
-                  sub={ingress.length > 0 ? `+ ${ingress.length} declared route${ingress.length === 1 ? "" : "s"}` : undefined}
+                  sub={
+                    activePathFilter
+                      ? `on ${activePathFilter}`
+                      : ingress.length > 0
+                        ? `+ ${ingress.length} declared route${ingress.length === 1 ? "" : "s"}`
+                        : undefined
+                  }
                 />
                 <StatCard
                   icon="→"
@@ -670,8 +789,10 @@ export function TopologyPanel() {
                 * styling) — a low rate isn't itself a problem the way an
                 * unhealthy edge is; plenty of real calls genuinely carry no
                 * path (non-HTTP protocols, a qualified mention with nothing
-                * trailing it). */}
-              {graph.edges.length > 0 && (
+                * trailing it). Hidden while a path filter is active — every
+                * shown edge has that exact path by construction then, so the
+                * figure is trivially 100% and says nothing. */}
+              {!activePathFilter && graph.edges.length > 0 && (
                 <p className="adm-muted topo-path-coverage">
                   Path known for {Math.round(
                     (graph.edges.filter(e => e.path).length / graph.edges.length) * 100

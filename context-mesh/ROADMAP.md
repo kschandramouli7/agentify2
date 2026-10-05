@@ -53,7 +53,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P26** | **Incident Narrative** — reconstruct an incident's timeline from traces, events, changes and the graph, and write the input a human post-incident review starts from | Proposed (2026-09-01) | this file — ADR at implementation |
 | **P27** | **Edge Enrichment** — capture what the log line already contains and we discard: outcome, port, path, latency, provenance, caller cardinality, and the scan denominator. A healthy call and a failed one are currently identical rows | **Phase 1 SHIPPED** (`c3e93c7`, `scan_coverage`). **Phase 2 SHIPPED 2026-09-12** ([ADR 0031](decisions/0031-edge-outcome-and-port-capture.md)) — outcome (success/failure/timeout) and port now captured by all three producers; `service_dependencies` splits rows by port and carries outcome counters. **The Health-weighted graph UI payoff also shipped the same day** (`docs/SERVICE_DEPENDENCIES.md`'s "How it is coloured" section) — edges reuse the existing crit/warn status tokens, silent below 3 classified observations; **P24 remains explicitly deferred, not a current priority.** **Phase 2b SHIPPED 2026-09-13** ([ADR 0032](decisions/0032-expected-failure-annotation-for-dependency-health.md)) — a `agentify.io/expected-failure` Service annotation, read by Discovery's live scan and joined in at read time, excludes a destination's edges from the unhealthy banner without touching its rendered colour, count, or tooltip; per-service scope, not per-edge. **Phase 3 partly shipped:** cross-namespace is live and hardened to validate both segments (`17c324e`, `552791b`), external egress shipped and was **disabled the same day** for fabricating dependencies (`3372d45`). **Phase 4's path/operation-class sub-item SHIPPED 2026-10-04** ([ADR 0034](decisions/0034-path-operation-class-capture.md)) — normalized path (`/orders/12345` → `/orders/:id`) captured by all three producers, `service_dependencies` splits rows by path on top of port, passive UI exposure (table column + capture-rate line); this is the named hard prerequisite for ROADMAP P29 half (1), now met at the data layer — **the interactive path-filtered diagram itself is still not built.** Phase 4's other three sub-items (provenance, caller cardinality, bucketed evidence) and phase 5 remain not started. **Phases 6 (typed non-pod destinations: DB/cache/queue/SaaS/secrets) and 7 (contract attributes: protocol, sync/async, auth/trust-boundary, circuit-breaker state) proposed 2026-09-12, not started** — phase 6 is rated the more fundamental of the two gaps raised that day | this file, [ADR 0031](decisions/0031-edge-outcome-and-port-capture.md), [ADR 0034](decisions/0034-path-operation-class-capture.md) — **phases 1 and 3 shipped with no ADR.** One is still owed for the trust-tier rule, since disabling the external tier is the kind of reversal an ADR exists to stop us repeating; `docs/SERVICE_DEPENDENCIES.md` holds the reasoning meanwhile |
 | **P28** | **Ad-hoc log upload & diagnostic agent** — an operator pastes/uploads a log excerpt outside the normal collector pipeline and a dedicated skill diagnoses it: which service, what's failing, which upstream/downstream services are on the affected path | Proposed (2026-09-12) — sketch only, not a design | this file — ADR at implementation |
-| **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | Proposed (2026-09-12) — **two complementary halves: half (2), on-demand raw-log search keyed by trace ID/URL text, SHIPPED 2026-09-15; half (1), a path-filtered view of the mined graph, had its hard prerequisite (P27 phase 4) SHIP 2026-10-04 — the filter UI itself remains not started** | this file — ADR at implementation |
+| **P29** | **API/URL-scoped request traceability** — given a URL/path or a trace ID, show upstream/downstream microservices for that specific call as a filtered diagram or sequence view | **Both halves SHIPPED.** Half (2), on-demand raw-log search keyed by trace ID/URL text, 2026-09-15. Half (1), a path-filtered view of the mined graph, 2026-10-05 — pure frontend, composes with existing service focus, no `DependencyFlow` changes needed | this file — ADR at implementation |
 | **P30** | **Deployment Security Posture, staged toward active verification** — Phase 1 assesses the OWN cluster's security posture (NetworkPolicy coverage, pod securityContext, Ingress TLS) from what Discovery already reads, read-only, same evidence-based framing as P21; Phases 2-4 (named future direction) add engagement-gated active verification, exploitability checks, and eventually full pentest orchestration | **Phase 1 SHIPPED 2026-09-14** ([ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md)) — three checks (`namespace-has-networkpolicy`, `pod-security-context`, `ingress-missing-tls`), `security_findings` table with RLS from its first migration, `POST`/`GET /api/security-findings`, and a new "Security Posture" panel. **Promotes [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)'s use case #8**, flagged 2026-08-02. RBAC-surface scanning and CI/CD-visible findings (mutable ECR tags, no scan gate, EKS admin exposure) explicitly deferred, not part of Phase 1. Phases 2-4 intentionally not scheduled | [ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md) |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
@@ -2720,12 +2720,20 @@ the "impossible without a mesh" framing this item first carried.
 
 **Delivery vehicle, per the request:** the chat entry point already
 placeholdered in P22 ("Ask about dependencies") — "trace `POST /charge`"
-resolves to (1); "trace `<trace-id>`" resolves to (2).
+resolves to (1); "trace `<trace-id>`" resolves to (2). **Revised on build:**
+when the "trace" trigger actually shipped (half 2, below), it classifies
+*any* input — trace ID or `METHOD /path` alike — as the on-demand raw-log
+search; it does not distinguish and hand `METHOD /path` off to (1). Half
+(1) shipped instead as a direct UI filter control on the Dependencies
+panel itself (see its own entry below), not a chat phrasing — a deliberate
+divergence from this original note, not an oversight: a path filter on an
+already-open diagram is a narrower, more immediate interaction than typing
+a sentence to get one, and nothing here required the two to share an entry
+point.
 
 **What it needs first:**
 - P27 phase 4 (path/operation-class capture) — hard prerequisite for (1),
   **SHIPPED 2026-10-04** ([ADR 0034](decisions/0034-path-operation-class-capture.md)).
-  The data layer exists; the filter UI itself is the remaining work for (1).
 - For (2): confirming which onboarded services actually log a
   request/trace ID today (unknown — not audited), since the feature's
   value is bounded by that, not by anything this item can build.
@@ -2788,12 +2796,35 @@ new/updated tests (30 in `test_trace_search.py`, 13 in `test_chat_trace.py`),
 full existing suite green, `tsc`/production build clean. **Not yet done:
 a live browser check** — no browser-automation tool is available in this
 environment, so the layout/panel was verified via type-checking and a
-production build only, not by actually looking at it render. **Half (1) —
-the path-filtered view of the mined graph — was blocked on P27 phase 4;
-phase 4's path capture shipped 2026-10-04 ([ADR 0034](decisions/0034-path-operation-class-capture.md)),
-so the prerequisite is met. The filter UI itself — narrowing
-`DependencyFlow` to edges whose path matches a requested URL, composed with
-focus's existing hop-distance traversal — is still not started.**
+production build only, not by actually looking at it render.
+
+**Half (1) SHIPPED 2026-10-05** — the path-filtered view of the mined
+graph. A pure frontend feature: the backend already returns `path` on
+every edge (P27 phase 4), so no schema/API change was needed. A free-text
+input next to the namespace picker (native `<datalist>` autocomplete over
+this namespace's actually-observed paths, not a hardcoded list) filters
+`TopologyPanel`'s edge data once, upstream of both the diagram and the
+stats/table/chips that already derive from it — so every existing consumer
+narrows automatically with no changes to `DependencyFlow` itself, and
+composes for free with the existing service-`focus` hop-distance traversal
+(order-independent: path-filter first, then focus narrows further). Typed
+input is normalized client-side by a small TS port of
+`_normalize_path` (kept duplicated rather than shared, same convention ADR
+0029 already accepts for the Python extraction logic), so "/orders/48213",
+"/orders/:id", and "POST /orders/48213" all resolve to the same match — an
+operator pastes a real example, not a template they'd have to already know.
+A leading HTTP verb is stripped before normalizing, since method was never
+part of what phase 4 captured. A path filter matching nothing renders a
+distinct empty state ("no observed calls match this path") rather than
+falling through to the generic empty-namespace message or a confusing
+sparse diagram of now-apparently-standalone services. The capture-rate line
+phase 4 added hides itself while a filter is active, since every shown edge
+trivially has that exact path by construction then. Verified: `tsc`/
+production build clean, plus a standalone Node check of the normalize/
+strip-method pipeline against 11 cases (numeric, UUID, hex, no-leading-
+slash, method-prefixed, empty, oversized) — no unit-test harness exists for
+this file, so this is the available-equivalent verification, not a
+substitute offered in place of one that could have run.
 
 ---
 
