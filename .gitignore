@@ -51,6 +51,9 @@ tfplan*
 # Locally-downloaded CLI binaries — never commit
 *.exe
 
+# Local scratch/temp files — never commit
+temp/
+
 # Claude Code internal files (settings, memory) — do not commit
 .claude/
 # ...but project-level skills are shared config and should be versioned
