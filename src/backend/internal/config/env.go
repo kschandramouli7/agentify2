@@ -38,6 +38,14 @@ type Config struct {
 	EventsRetentionDays            int
 	EventsRetentionIntervalMinutes int
 
+	// service_dependency_callers retention (ROADMAP P27 phase 4, caller
+	// cardinality). Own dedicated config, not shared with events' — pod
+	// names churn on redeploy, so this table's growth profile and the
+	// tradeoff of how much history to keep are unrelated to events'. Days=0
+	// disables the janitor, same convention as above.
+	ServiceDependencyCallersRetentionDays            int
+	ServiceDependencyCallersRetentionIntervalMinutes int
+
 	// Proactive investigation loop (ADR 0016 / spec 009). Opt-in: disabled by default.
 	InvestigationEnabled              bool
 	InvestigationWebhookURL           string
@@ -97,6 +105,9 @@ func LoadFromEnv() (*Config, error) {
 
 		EventsRetentionDays:            getEnvInt("EVENTS_RETENTION_DAYS", 30),
 		EventsRetentionIntervalMinutes: getEnvInt("EVENTS_RETENTION_INTERVAL_MINUTES", 60),
+
+		ServiceDependencyCallersRetentionDays:            getEnvInt("SERVICE_DEPENDENCY_CALLERS_RETENTION_DAYS", 30),
+		ServiceDependencyCallersRetentionIntervalMinutes: getEnvInt("SERVICE_DEPENDENCY_CALLERS_RETENTION_INTERVAL_MINUTES", 60),
 
 		InvestigationEnabled:              getEnvBool("INVESTIGATION_ENABLED", false),
 		InvestigationWebhookURL:           getEnv("INVESTIGATION_WEBHOOK_URL", ""),

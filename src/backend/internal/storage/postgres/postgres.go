@@ -544,6 +544,49 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- ROADMAP P27 phase 4: caller cardinality. One row per (edge, pod_name)
+	-- ever seen -- deliberately a CHILD table, not a column on
+	-- service_dependencies, because this is a SET relationship ("which pods
+	-- have called this"), not a per-observation scalar fact the way
+	-- port/outcome/path are: a simple counter column could never correctly
+	-- answer "is this a pod we've already counted" without the set itself.
+	-- COUNT(DISTINCT pod_name) is computed at READ time (see
+	-- ListServiceDependencies' join below), same "derive, don't store the
+	-- aggregate" posture evidence_count's own unknown-outcome count already
+	-- uses. No separate id column -- the composite primary key already
+	-- uniquely identifies a row. Pod names churn on every redeploy, so this
+	-- table needs its own retention janitor (below) to stay bounded, unlike
+	-- service_dependencies itself which is naturally bounded by distinct
+	-- (from, to, port, path) tuples.
+	CREATE TABLE IF NOT EXISTS service_dependency_callers (
+		tenant_id    TEXT NOT NULL,
+		cluster_id   TEXT NOT NULL DEFAULT '',
+		namespace    TEXT NOT NULL,
+		from_service TEXT NOT NULL,
+		to_service   TEXT NOT NULL,
+		port         INT NOT NULL DEFAULT 0,
+		path         TEXT NOT NULL DEFAULT '',
+		pod_name     TEXT NOT NULL,
+		first_seen   TIMESTAMP DEFAULT NOW(),
+		last_seen    TIMESTAMP DEFAULT NOW(),
+		PRIMARY KEY (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name)
+	);
+	CREATE INDEX IF NOT EXISTS idx_service_dep_callers_edge
+		ON service_dependency_callers(tenant_id, cluster_id, namespace, from_service, to_service, port, path);
+
+	ALTER TABLE IF EXISTS service_dependency_callers ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS service_dependency_callers FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'service_dependency_callers' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON service_dependency_callers
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
 	-- Service->cluster registry (ROADMAP P16 / ADR 0023): which cluster(s)
 	-- run a given (namespace, service), populated deterministically by
 	-- agentify-discovery's inventory push (POST /api/cluster-inventory) —
@@ -2219,6 +2262,13 @@ type ServiceDependency struct {
 	// exactly one writer. Empty means no annotation — the edge is a normal
 	// candidate for the unhealthy banner.
 	ExpectedFailureReason string `json:"expected_failure_reason,omitempty"`
+	// ROADMAP P27 phase 4 (caller cardinality). Distinct pod count computed
+	// at read time from service_dependency_callers, never stored on this
+	// row — same "derive, don't store the aggregate" posture ExpectedFailureReason
+	// above already uses. 0 means "no caller-pod evidence yet", not
+	// "confirmed zero callers" — same honesty convention every other 0/""
+	// sentinel on this struct already follows.
+	CallerPodCount int `json:"caller_pod_count"`
 }
 
 // UpsertServiceDependency records one piece of evidence for a from->to edge —
@@ -2248,7 +2298,16 @@ func setTenantContext(ctx context.Context, tx *sql.Tx, tenantID string) error {
 // predates phase 2). The CASE expressions below increment at most one
 // outcome counter per call, never more than one, since a single observation
 // has exactly one outcome or none.
-func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path string) error {
+//
+// callerPod (phase 4, caller cardinality): when non-empty, also upserts a
+// row into service_dependency_callers in this SAME transaction, so the edge
+// row and the caller-pod sighting can never land half-written relative to
+// each other. Empty means "this producer has no pod identity to report" (an
+// older collector, or mine_service_dependencies before it threaded pod_id
+// through) — deliberately SKIPPED, not inserted as pod_name='', because an
+// empty pod name is not a real caller identity and would silently inflate
+// every affected edge's distinct-caller count by one.
+func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod string) error {
 	if targetKind == "" {
 		targetKind = "service" // an older collector reports only validated edges
 	}
@@ -2284,7 +2343,37 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 	if err != nil {
 		return err
 	}
+	if callerPod != "" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO service_dependency_callers (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name,
+			                                          first_seen, last_seen)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+			ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name) DO UPDATE SET
+			  last_seen = NOW()`,
+			tenantID, clusterID, namespace, fromService, toService, port, path, callerPod)
+		if err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+// PurgeServiceDependencyCallersOlderThan deletes caller-pod sightings whose
+// last_seen predates cutoff (ROADMAP P27 phase 4's caller-cardinality
+// retention janitor) and returns the number of rows removed. Pod names churn
+// on every redeploy, so without this the table grows without bound — unlike
+// service_dependencies itself, which is naturally bounded by distinct
+// (from, to, port, path) tuples. Not scoped to one tenant: a maintenance
+// sweep across all tenants' stale rows, same posture as PurgeOlderThan
+// (events, ADR 0015) above.
+func (c *Client) PurgeServiceDependencyCallersOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := c.db.ExecContext(ctx,
+		`DELETE FROM service_dependency_callers WHERE last_seen < $1`, cutoff.UTC())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ScanCoverage is one service's scan accounting — the denominator for
@@ -2398,15 +2487,30 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	// Service. Joined on cluster_id too (not just namespace+service) so the
 	// same service name in two different clusters for this tenant can't
 	// fan out this query into duplicate rows.
+	//
+	// LEFT JOIN a pre-aggregated subquery over service_dependency_callers
+	// (ROADMAP P27 phase 4): COUNT(DISTINCT pod_name) per edge, computed
+	// once per edge key rather than per row, same reason the aggregation
+	// happens in the subquery and not the outer SELECT — joining the raw
+	// per-pod rows directly would multiply every edge row by however many
+	// distinct pods it has.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
 		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
 		       sd.port, sd.path, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
-		       COALESCE(cs.expected_failure_reason, '')
+		       COALESCE(cs.expected_failure_reason, ''), COALESCE(cpc.caller_pod_count, 0)
 		FROM service_dependencies sd
 		LEFT JOIN cluster_services cs
 		  ON cs.tenant_id = sd.tenant_id AND cs.cluster_id = sd.cluster_id
 		 AND cs.namespace = sd.namespace AND cs.service = sd.to_service
+		LEFT JOIN (
+		    SELECT tenant_id, cluster_id, namespace, from_service, to_service, port, path,
+		           COUNT(DISTINCT pod_name) AS caller_pod_count
+		    FROM service_dependency_callers
+		    GROUP BY tenant_id, cluster_id, namespace, from_service, to_service, port, path
+		) cpc ON cpc.tenant_id = sd.tenant_id AND cpc.cluster_id = sd.cluster_id
+		     AND cpc.namespace = sd.namespace AND cpc.from_service = sd.from_service
+		     AND cpc.to_service = sd.to_service AND cpc.port = sd.port AND cpc.path = sd.path
 		WHERE sd.namespace = $1 ORDER BY sd.evidence_count DESC`, namespace)
 	if err != nil {
 		return nil, err
@@ -2419,7 +2523,7 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
 			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind,
 			&d.Port, &d.Path, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
-			&d.ExpectedFailureReason); err != nil {
+			&d.ExpectedFailureReason, &d.CallerPodCount); err != nil {
 			return nil, err
 		}
 		result = append(result, d)

@@ -404,6 +404,7 @@ async def upsert_service_dependency(
     port: Optional[int] = None,
     outcome: Optional[str] = None,
     path: str = "",
+    caller_pod: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge. Best-effort: any
     failure is logged and swallowed — losing one piece of evidence never
@@ -413,6 +414,13 @@ async def upsert_service_dependency(
     unknown, not omitted — the Hub's schema uses those as the "not captured"
     sentinels (NULL would break the UNIQUE constraint that accumulates
     evidence per port/path).
+
+    caller_pod (phase 4, caller cardinality) is likewise sent explicitly as
+    "" when this call has no pod identity to report — never omitted — but
+    unlike port/outcome/path it is NOT a value the Hub stores as a sentinel
+    on the edge row itself; an empty caller_pod means "nothing to upsert
+    into service_dependency_callers this time," skipped there entirely
+    rather than counted as a phantom caller.
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -425,6 +433,7 @@ async def upsert_service_dependency(
                     "port": port or 0,
                     "outcome": outcome or "",
                     "path": path or "",
+                    "caller_pod": caller_pod or "",
                 },
             )
             resp.raise_for_status()
@@ -470,11 +479,22 @@ async def resolve_service_clusters(namespace: str, service: str, backend_url: st
         return []
 
 
-async def mine_service_dependencies(namespace: str, from_service: str, log_text: str, backend_url: str) -> None:
+async def mine_service_dependencies(
+    namespace: str, from_service: str, log_text: str, backend_url: str, pod_id: str = "",
+) -> None:
     """Extract validated service mentions from `log_text` and record each as
     an edge `from_service -> mentioned_service`. Best-effort end-to-end —
     never raises; a failed mining pass just means the graph doesn't improve
     this time.
+
+    pod_id (ROADMAP P27 phase 4, caller cardinality): the caller's own pod,
+    when known. `log_text` here is already one pod's own log tail (DiagnoseSkill's
+    _prefetch calls this once per sampled pod_id — see its own docstring), so
+    unlike the per-cycle dedup above, no per-pod disambiguation is needed
+    within this function; pod_id just rides straight through to every push.
+    Defaults to "" for callers (tests, or any future caller) that don't have
+    one — upsert_service_dependency already treats that as "nothing to
+    report," not a phantom caller.
     """
     known_services = await get_known_services(namespace, backend_url)
     if not known_services:
@@ -499,5 +519,6 @@ async def mine_service_dependencies(namespace: str, from_service: str, log_text:
 
     for (to_service, port, path), outcome in last_outcome.items():
         await upsert_service_dependency(
-            namespace, from_service, to_service, backend_url, port=port, outcome=outcome, path=path,
+            namespace, from_service, to_service, backend_url,
+            port=port, outcome=outcome, path=path, caller_pod=pod_id,
         )

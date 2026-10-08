@@ -23,6 +23,24 @@ import (
 	"github.com/chan/agentify/backend/internal/telemetry"
 )
 
+// serviceDependencyCallersPurger adapts the relational backend's
+// PurgeServiceDependencyCallersOlderThan (named distinctly from
+// PurgeOlderThan since one Client can't implement that method twice under
+// two names) to retention.Purger's expected PurgeOlderThan shape. Defined
+// here, not in the postgres package, so this file keeps duck-typing against
+// the relational backend via an anonymous interface rather than importing
+// postgres directly — the same posture the events janitor wiring already
+// uses just above.
+type serviceDependencyCallersPurger struct {
+	inner interface {
+		PurgeServiceDependencyCallersOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+	}
+}
+
+func (p serviceDependencyCallersPurger) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	return p.inner.PurgeServiceDependencyCallersOlderThan(ctx, cutoff)
+}
+
 // Package main: entry point for the agentify backend service.
 func main() {
 	// Setup logging
@@ -79,13 +97,33 @@ func main() {
 	// relational backend doesn't support purging (e.g. unprovisioned).
 	janitorCtx, stopJanitor := context.WithCancel(context.Background())
 	defer stopJanitor()
-	if relational, err := orch.GetBackendFactory().GetBackend("relational"); err == nil {
-		if purger, ok := relational.(retention.Purger); ok {
-			if j := retention.New(purger, cfg.EventsRetentionDays, cfg.EventsRetentionIntervalMinutes, logger); j != nil {
+	relationalBackend, relationalErr := orch.GetBackendFactory().GetBackend("relational")
+	if relationalErr == nil {
+		if purger, ok := relationalBackend.(retention.Purger); ok {
+			if j := retention.New(purger, cfg.EventsRetentionDays, cfg.EventsRetentionIntervalMinutes, logger,
+				"events", telemetry.EventsPurgedTotal); j != nil {
 				go j.Run(janitorCtx)
 			}
 		} else {
 			logger.Warn("relational backend does not support retention; janitor disabled")
+		}
+	}
+
+	// service_dependency_callers retention janitor (ROADMAP P27 phase 4,
+	// caller cardinality). *postgres.Client already implements
+	// retention.Purger for events via PurgeOlderThan, so this second table
+	// gets its own differently-named method wrapped in a small adapter
+	// (serviceDependencyCallersPurger) — Go doesn't allow a second
+	// PurgeOlderThan on the same receiver.
+	if relationalErr == nil {
+		if purger, ok := relationalBackend.(interface {
+			PurgeServiceDependencyCallersOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+		}); ok {
+			if j := retention.New(serviceDependencyCallersPurger{purger}, cfg.ServiceDependencyCallersRetentionDays,
+				cfg.ServiceDependencyCallersRetentionIntervalMinutes, logger, "service_dependency_callers",
+				telemetry.ServiceDependencyCallersPurgedTotal); j != nil {
+				go j.Run(janitorCtx)
+			}
 		}
 	}
 

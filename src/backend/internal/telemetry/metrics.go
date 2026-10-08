@@ -58,6 +58,13 @@ var (
 		Help: "Events deleted by the retention janitor.",
 	})
 
+	// ServiceDependencyCallersPurgedTotal counts caller-pod sightings deleted
+	// by their own retention janitor (ROADMAP P27 phase 4, caller cardinality).
+	ServiceDependencyCallersPurgedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agentify_service_dependency_callers_purged_total",
+		Help: "service_dependency_callers rows deleted by the retention janitor.",
+	})
+
 	// HTTPRequestsTotal / HTTPRequestDuration are generic HTTP metrics. `path`
 	// is safe to label on because our routes carry no path-param ids.
 	HTTPRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

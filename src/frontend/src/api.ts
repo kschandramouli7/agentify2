@@ -471,6 +471,11 @@ export type ServiceDependency = {
    *  from the unhealthy banner, but must NEVER change its rendered color or
    *  counts — those still reflect the real evidence. */
   expected_failure_reason?: string;
+  /** ROADMAP P27 phase 4 (caller cardinality). Distinct pod count computed
+   *  server-side at read time from service_dependency_callers, never stored
+   *  on this row. 0/absent means "no caller-pod evidence yet", not
+   *  "confirmed zero callers" — same honesty convention as port/path above. */
+  caller_pod_count?: number;
 };
 
 /** One entry point into the cluster from outside — an Ingress, Gateway

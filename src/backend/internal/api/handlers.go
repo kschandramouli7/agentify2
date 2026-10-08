@@ -1982,6 +1982,11 @@ type serviceDependencyUpsertRequest struct {
 	// port/outcome above — already normalized by the producer (see
 	// k8fy/service_topology.py's _normalize_path) before it ever reaches here.
 	Path string `json:"path"`
+	// ROADMAP P27 phase 4 (caller cardinality). "" means this producer has no
+	// pod identity to report for this observation — deliberately never
+	// upserted as a caller sighting (see UpsertServiceDependency's own
+	// comment on why an empty pod name must not become a phantom caller).
+	CallerPod string `json:"caller_pod"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
@@ -2259,7 +2264,7 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 	// The kind is taken from the body rather than inferred: only the miner
 	// knows which tier produced the edge, and guessing from the string shape
 	// here would silently reclassify edges on a format change.
-	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome, req.Path); err != nil {
+	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome, req.Path, req.CallerPod); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

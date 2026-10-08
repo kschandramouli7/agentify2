@@ -925,7 +925,7 @@ export function TopologyPanel() {
                 <table className="adm-table">
                   <thead>
                     <tr>
-                      <th>From</th><th></th><th>To</th><th>Port</th><th>Path</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
+                      <th>From</th><th></th><th>To</th><th>Port</th><th>Path</th><th>Callers</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -939,6 +939,28 @@ export function TopologyPanel() {
                           <td><button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button></td>
                           <td className="adm-muted">{e.port ? e.port : "—"}</td>
                           <td className="adm-muted" title={e.path || undefined}>{e.path || "—"}</td>
+                          <td className="adm-muted">
+                            {(() => {
+                              // ROADMAP P27 phase 4 (caller cardinality). 0/absent
+                              // means "no caller-pod evidence yet", never shown as
+                              // a blank cell — same "always print a word" rule the
+                              // Health column already follows. Framed as "N of M
+                              // replicas" when the FROM service's own replica
+                              // count is known (from its service profile), since
+                              // "1 of 5" vs "5 of 5" is the entire point of this
+                              // field — but the bare count stands on its own when
+                              // that context isn't available.
+                              const count = e.caller_pod_count ?? 0;
+                              if (count === 0) return "—";
+                              const fromMeta = arch.meta.get(e.from_service);
+                              const desired = fromMeta?.replicasDesired;
+                              return (
+                                <span title={desired ? `${count} of ${desired} known replicas of ${e.from_service}` : undefined}>
+                                  {desired ? `${count} of ${desired}` : String(count)}
+                                </span>
+                              );
+                            })()}
+                          </td>
                           <td><EvidenceBar edge={e} /></td>
                           <td><HealthCell edge={e} /></td>
                           <td><Freshness lastSeen={e.last_seen} /></td>

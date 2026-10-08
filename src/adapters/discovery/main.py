@@ -136,7 +136,7 @@ async def _scan_namespace(
         for (to_service, port, path), outcome in last_outcome.items():
             await push_dependency(
                 ns, from_service, to_service, cfg.backend_url, cfg.collector_token,
-                port=port, outcome=outcome, path=path,
+                port=port, outcome=outcome, path=path, caller_pod=pod["name"],
             )
 
         # Beyond the namespace boundary (ROADMAP P27 phase 3): the calls that
@@ -159,6 +159,7 @@ async def _scan_namespace(
                 continue
             await push_dependency(
                 ns, from_service, target, cfg.backend_url, cfg.collector_token, target_kind=kind,
+                caller_pod=pod["name"],
             )
 
     await push_scan_coverage(ns, coverage, cfg.backend_url, cfg.collector_token)

@@ -156,10 +156,10 @@ async def test_push_edge_sends_no_bearer_token_and_includes_cluster_id(monkeypat
     assert captured["body"] == {
         "namespace": "payments", "from_service": "payment-worker",
         "to_service": "payment-api", "cluster_id": "cluster-a",
-        # 0/""/"" are the "not captured" sentinels (ROADMAP P27 phases 2 and
-        # 4) — sent explicitly when port/outcome/path aren't passed, never
-        # omitted.
-        "port": 0, "outcome": "", "path": "",
+        # 0/""/""/"" are the "not captured" sentinels (ROADMAP P27 phases 2
+        # and 4) — sent explicitly when port/outcome/path/caller_pod aren't
+        # passed, never omitted.
+        "port": 0, "outcome": "", "path": "", "caller_pod": "",
     }
 
 
@@ -192,8 +192,8 @@ async def test_mine_namespace_end_to_end(monkeypatch):
     pushed = []
 
     async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
-                              port=None, outcome=None, path=""):
-        pushed.append((cluster_id, namespace, from_service, to_service, port, outcome, path))
+                              port=None, outcome=None, path="", caller_pod=""):
+        pushed.append((cluster_id, namespace, from_service, to_service, port, outcome, path, caller_pod))
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
 
@@ -204,7 +204,8 @@ async def test_mine_namespace_end_to_end(monkeypatch):
     # The FQDN form carries no port, and "GET payment-api...svc.cluster.local"
     # has no classifiable outcome — both correctly land as unknown (0/None).
     # Nothing trails the hostname match, so path is also "not captured" ("").
-    assert pushed == [("cluster-a", "payments", "payment-worker", "payment-api", 0, None, "")]
+    # caller_pod is the Athena row's own pod_name (ROADMAP P27 phase 4).
+    assert pushed == [("cluster-a", "payments", "payment-worker", "payment-api", 0, None, "", "payment-worker-abc")]
     assert "cluster_id = 'cluster-a'" in fake_client.started_with["query"]
 
 
@@ -213,8 +214,10 @@ async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatc
     async def fake_fetch_selectors(backend_url, cluster_id, namespace):
         return {"payment-worker": {"app": "payment-worker"}, "payment-api": {"app": "payment-api"}}
 
-    # Two log lines from the same pod both mention payment-api — should
-    # only push the edge once (evidence_count accumulates Hub-side already).
+    # Two log lines from the SAME pod both mention payment-api — should only
+    # push the edge once (evidence_count accumulates Hub-side already). This
+    # is distinct from two DIFFERENT pods confirming the same edge, which
+    # must each still push their own — see the caller-cardinality test below.
     fake_client = _FakeAthenaClient(rows=[
         ["payment-worker-abc", "{app=payment-worker}", "2026-07-24T22:22:26Z stdout F GET payment-api.payments.svc.cluster.local"],
         ["payment-worker-abc", "{app=payment-worker}", "2026-07-24T22:22:27Z stdout F GET payment-api.payments.svc.cluster.local"],
@@ -225,7 +228,7 @@ async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatc
     pushed = []
 
     async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
-                              port=None, outcome=None, path=""):
+                              port=None, outcome=None, path="", caller_pod=""):
         pushed.append((from_service, to_service))
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
@@ -233,6 +236,38 @@ async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatc
     await dm._mine_namespace("http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2)
 
     assert pushed == [("payment-worker", "payment-api")]
+
+
+@pytest.mark.asyncio
+async def test_mine_namespace_pushes_once_per_distinct_contributing_pod(monkeypatch):
+    """ROADMAP P27 phase 4 (caller cardinality) regression: the cross-pod
+    `pushed` dedup set predates caller cardinality and was keyed only on
+    (from, to, port, path) — correct when all that mattered was "don't push
+    a duplicate for evidence_count", wrong now, since it would silently
+    suppress every pod after the first to confirm the same edge in one
+    cycle. Two DIFFERENT pods confirming the same edge must each push,
+    carrying their own pod identity."""
+    async def fake_fetch_selectors(backend_url, cluster_id, namespace):
+        return {"payment-worker": {"app": "payment-worker"}, "payment-api": {"app": "payment-api"}}
+
+    fake_client = _FakeAthenaClient(rows=[
+        ["payment-worker-abc", "{app=payment-worker}", "GET payment-api.payments.svc.cluster.local"],
+        ["payment-worker-xyz", "{app=payment-worker}", "GET payment-api.payments.svc.cluster.local"],
+    ])
+    monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
+
+    pushed_pods = []
+
+    async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
+                              port=None, outcome=None, path="", caller_pod=""):
+        pushed_pods.append(caller_pod)
+
+    monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
+
+    await dm._mine_namespace("http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2)
+
+    assert sorted(pushed_pods) == ["payment-worker-abc", "payment-worker-xyz"]
 
 
 @pytest.mark.asyncio

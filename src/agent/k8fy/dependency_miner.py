@@ -193,6 +193,7 @@ async def _push_edge(
     port: Optional[int] = None,
     outcome: Optional[str] = None,
     path: str = "",
+    caller_pod: str = "",
 ) -> None:
     """Push one discovered edge — no bearer token (ADR 0029's trusted-
     internal-caller path; this miner is the Agent, on the same trusted,
@@ -203,7 +204,10 @@ async def _push_edge(
     port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
     unknown — see service_topology.py's upsert_service_dependency for why
     those rather than omitting the fields (they're the Hub schema's "not
-    captured" sentinels).
+    captured" sentinels). caller_pod (phase 4, caller cardinality) follows
+    the identical "send explicit empty string, never omit" convention, but
+    see upsert_service_dependency's own note on why an empty one is skipped
+    Hub-side rather than stored as a sentinel.
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -217,6 +221,7 @@ async def _push_edge(
                     "port": port or 0,
                     "outcome": outcome or "",
                     "path": path or "",
+                    "caller_pod": caller_pod or "",
                 },
             )
             resp.raise_for_status()
@@ -232,12 +237,22 @@ async def _mine_namespace(
 ) -> None:
     """Mine one (cluster, namespace)'s recently-landed log partition for
     service-dependency edges, pushing each discovered (from, to, port, path)
-    at most once per cycle (evidence_count already accumulates cluster-side
-    across cycles — no need to push a duplicate within one). port (phase 2)
-    and path (phase 4) are both part of the dedup key, since a row is now
-    split by both; the outcome pushed for that one push is the last KNOWN
-    outcome seen for that (to, port, path) within this pod's own log window —
-    a later unclassifiable line never erases an earlier confident one."""
+    at most once PER CONTRIBUTING POD per cycle (evidence_count already
+    accumulates cluster-side across cycles — no need to push a duplicate
+    within one *pod's* own observations). port (phase 2) and path (phase 4)
+    are both part of the per-pod dedup key, since a row is now split by both;
+    the outcome pushed for that one push is the last KNOWN outcome seen for
+    that (to, port, path) within this pod's own log window — a later
+    unclassifiable line never erases an earlier confident one.
+
+    pod_name is now ALSO part of the cross-pod `pushed` key (ROADMAP P27
+    phase 4, caller cardinality) — deliberately changed from the original
+    (from, to, port, path)-only key. That narrower key predates caller
+    cardinality and was correct for its own purpose (evidence_count doesn't
+    care which pod confirmed an edge), but it would silently suppress every
+    pod after the first to confirm the same edge in one cycle, which is
+    exactly the signal caller cardinality exists to capture. Each distinct
+    contributing pod now gets its own push."""
     selectors = await _fetch_selectors(backend_url, cluster_id, namespace)
     if not selectors:
         return  # no known services (or the fetch failed) — nothing to attribute logs to
@@ -269,7 +284,7 @@ async def _mine_namespace(
         pod_labels.setdefault(pod_name, _parse_athena_map(row["labels"]))
         by_pod.setdefault(pod_name, []).append(_parse_cri_message(row["log"]))
 
-    pushed: Set[Tuple[str, str, int, str]] = set()
+    pushed: Set[Tuple[str, str, int, str, str]] = set()
     for pod_name, lines in by_pod.items():
         from_service = _service_for_labels(pod_labels.get(pod_name, {}), selectors)
         if not from_service:
@@ -294,13 +309,13 @@ async def _mine_namespace(
                 last_outcome[key] = obs.outcome
 
         for (to_service, port, path), outcome in last_outcome.items():
-            edge = (from_service, to_service, port, path)
+            edge = (from_service, to_service, port, path, pod_name)
             if edge in pushed:
                 continue
             pushed.add(edge)
             await _push_edge(
                 backend_url, cluster_id, namespace, from_service, to_service,
-                port=port, outcome=outcome, path=path,
+                port=port, outcome=outcome, path=path, caller_pod=pod_name,
             )
 
 

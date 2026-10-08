@@ -222,7 +222,9 @@ class DiagnoseSkill(K8fyAgent):
                 log_result = prefetched.get(f"topology_logs.{pod_id}")
                 log_text = log_result.get("logs", "") if isinstance(log_result, dict) else ""
                 if log_text:
-                    await mine_service_dependencies(namespace, service_name, log_text, self.backend_url)
+                    await mine_service_dependencies(
+                        namespace, service_name, log_text, self.backend_url, pod_id=pod_id,
+                    )
 
         return prefetched
 

@@ -393,21 +393,22 @@ async def test_mine_service_dependencies_upserts_validated_edges(monkeypatch):
         known_services_calls.append(namespace)
         return {"payment-backend", "payment-ui"}
 
-    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None, path=""):
-        upserted.append((namespace, from_service, to_service, port, outcome, path))
+    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None, path="", caller_pod=""):
+        upserted.append((namespace, from_service, to_service, port, outcome, path, caller_pod))
 
     monkeypatch.setattr(st, "get_known_services", fake_get_known_services)
     monkeypatch.setattr(st, "upsert_service_dependency", fake_upsert)
 
     log_text = "calling payment-backend.payments.svc.cluster.local now"
-    await st.mine_service_dependencies("payments", "payment-ui", log_text, "http://backend")
+    await st.mine_service_dependencies("payments", "payment-ui", log_text, "http://backend", pod_id="payment-ui-abc")
 
     assert known_services_calls == ["payments"]
     # Qualified FQDN form carries no port, and the line has no classifiable
     # outcome — both correctly land as unknown (0/None) (ROADMAP P27 phase 2).
     # Nothing trails the hostname match ("now", not a port/path), so path is
-    # also the "not captured" sentinel (ROADMAP P27 phase 4).
-    assert upserted == [("payments", "payment-ui", "payment-backend", 0, None, "")]
+    # also the "not captured" sentinel (ROADMAP P27 phase 4). pod_id rides
+    # straight through as caller_pod (also phase 4, caller cardinality).
+    assert upserted == [("payments", "payment-ui", "payment-backend", 0, None, "", "payment-ui-abc")]
 
 
 @pytest.mark.asyncio

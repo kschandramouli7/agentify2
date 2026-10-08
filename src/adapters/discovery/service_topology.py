@@ -394,6 +394,7 @@ async def push_dependency(
     port: Optional[int] = None,
     outcome: Optional[str] = None,
     path: str = "",
+    caller_pod: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge via the tenant-scoped
     ingest endpoint. Best-effort: any failure is logged and swallowed — one
@@ -402,6 +403,9 @@ async def push_dependency(
     port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
     unknown — see upsert_service_dependency's identical note (agent's
     service_topology.py) for why those rather than omitting the fields.
+    caller_pod (phase 4, caller cardinality) follows the same convention;
+    see that same note for why an empty one is skipped Hub-side rather than
+    stored as a sentinel.
     """
     # Omit the header entirely when unset — see push_inventory's identical
     # comment (inventory.py) for why.
@@ -422,6 +426,7 @@ async def push_dependency(
                     "port": port or 0,
                     "outcome": outcome or "",
                     "path": path or "",
+                    "caller_pod": caller_pod or "",
                 },
                 headers=headers,
             )

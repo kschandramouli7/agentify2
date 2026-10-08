@@ -182,8 +182,8 @@ async def test_scan_namespace_pushes_port_and_last_known_outcome(monkeypatch, ca
     pushed = []
 
     async def fake_push_dependency(ns, from_service, to_service, backend_url, token, target_kind="service",
-                                    port=None, outcome=None, path=""):
-        pushed.append((from_service, to_service, port, outcome, path))
+                                    port=None, outcome=None, path="", caller_pod=""):
+        pushed.append((from_service, to_service, port, outcome, path, caller_pod))
 
     monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
 
@@ -201,6 +201,8 @@ async def test_scan_namespace_pushes_port_and_last_known_outcome(monkeypatch, ca
 
     # Neither line has a trailing path, so path stays "" (ROADMAP P27 phase 4)
     # for both — it doesn't further split these two already-distinct (port)
-    # dedup keys.
-    assert ("batch", "api", 8443, "failure", "") in pushed
-    assert ("batch", "api", 0, None, "") in pushed
+    # dedup keys. caller_pod is the sampled pod's own name (also phase 4,
+    # caller cardinality) — same for every push here, since only one pod
+    # was sampled.
+    assert ("batch", "api", 8443, "failure", "", "batch-1") in pushed
+    assert ("batch", "api", 0, None, "", "batch-1") in pushed

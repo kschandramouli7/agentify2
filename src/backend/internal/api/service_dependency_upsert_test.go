@@ -24,7 +24,8 @@ type fakeServiceDependencyStore struct {
 	lastPort    int
 	lastOutcome string
 	// ROADMAP P27 phase 4.
-	lastPath string
+	lastPath      string
+	lastCallerPod string
 
 	// Scan-coverage calls, recorded so the coverage tests can assert on them
 	// (ROADMAP P27 phase 1).
@@ -55,7 +56,7 @@ func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenan
 	return f.coverageRows, nil
 }
 
-func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path string) error {
+func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod string) error {
 	f.upsertCalled = true
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
@@ -66,6 +67,7 @@ func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context
 	f.lastPort = port
 	f.lastOutcome = outcome
 	f.lastPath = path
+	f.lastCallerPod = callerPod
 	return nil
 }
 
@@ -248,6 +250,48 @@ func TestHandleServiceDependencyUpsert_Path(t *testing.T) {
 		}
 		if store.lastPath != "" {
 			t.Errorf("path: want empty (unknown sentinel), got %q", store.lastPath)
+		}
+	})
+}
+
+// TestHandleServiceDependencyUpsert_CallerPod pins ROADMAP P27 phase 4
+// (caller cardinality): caller_pod passes through from the request body to
+// the store unchanged, including the "absent from the body" case, where
+// Go's JSON decoder leaves it at the zero value ("") — the same "not
+// captured" sentinel every other optional field on this request already
+// uses, so no special-casing is needed in the handler here either.
+func TestHandleServiceDependencyUpsert_CallerPod(t *testing.T) {
+	t.Run("caller_pod present in the body is passed through as-is", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api","caller_pod":"payment-worker-abc123"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastCallerPod != "payment-worker-abc123" {
+			t.Errorf("caller_pod: want %q, got %q", "payment-worker-abc123", store.lastCallerPod)
+		}
+	})
+
+	t.Run("caller_pod absent from the body — an older collector — defaults to the empty sentinel", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastCallerPod != "" {
+			t.Errorf("caller_pod: want empty (unknown sentinel), got %q", store.lastCallerPod)
 		}
 	})
 }
