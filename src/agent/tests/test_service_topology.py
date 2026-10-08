@@ -167,19 +167,23 @@ def test_infer_outcome_status_code_wins_over_a_stray_keyword_elsewhere():
 def test_extract_service_calls_captures_port_for_bare_form_only():
     log_text = "dialing agentify-agent:8001 for reasoning"
     calls = st.extract_service_calls(log_text, "agentify", {"agentify-agent"})
-    assert calls == [st.CallObservation(service="agentify-agent", port=8001, outcome=None)]
+    assert calls == [st.CallObservation(service="agentify-agent", port=8001, outcome=None, match_kind="bare")]
 
 
 def test_extract_service_calls_qualified_form_has_no_port():
     log_text = "calling payment-backend.payments now"
     calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
-    assert calls == [st.CallObservation(service="payment-backend", port=None, outcome=None)]
+    assert calls == [
+        st.CallObservation(service="payment-backend", port=None, outcome=None, match_kind="qualified")
+    ]
 
 
 def test_extract_service_calls_attaches_outcome_from_the_same_line():
     log_text = "upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3)"
     calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
-    assert calls == [st.CallObservation(service="payment-api", port=8443, outcome="failure")]
+    assert calls == [
+        st.CallObservation(service="payment-api", port=8443, outcome="failure", match_kind="bare")
+    ]
 
 
 def test_extract_service_calls_outcome_is_local_to_its_own_line():
@@ -278,6 +282,26 @@ def test_normalize_path_rejects_an_implausibly_long_capture():
     """A long unbroken run is more likely log prose that happened to start
     with '/' than a real path — treated as not captured, not trusted as-is."""
     assert st._normalize_path("/" + "x" * 300) == ""
+
+
+# ── match_kind / provenance (ROADMAP P27 phase 4) ──────────────────────────────
+
+def test_match_kind_qualified_for_the_fqdn_form():
+    log_text = "calling payment-backend.payments now"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
+    assert [c.match_kind for c in calls] == ["qualified"]
+
+
+def test_match_kind_bare_for_the_url_host_form():
+    log_text = "POST http://agentify-backend:8080/api/query"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-backend"})
+    assert all(c.match_kind == "bare" for c in calls)
+
+
+def test_match_kind_bare_for_the_host_port_form():
+    log_text = "dialing agentify-agent:8001 for reasoning"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-agent"})
+    assert [c.match_kind for c in calls] == ["bare"]
 
 
 # ── get_known_services ────────────────────────────────────────────────────────
@@ -393,8 +417,9 @@ async def test_mine_service_dependencies_upserts_validated_edges(monkeypatch):
         known_services_calls.append(namespace)
         return {"payment-backend", "payment-ui"}
 
-    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None, path="", caller_pod=""):
-        upserted.append((namespace, from_service, to_service, port, outcome, path, caller_pod))
+    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None, path="",
+                           caller_pod="", match_kind="", source=""):
+        upserted.append((namespace, from_service, to_service, port, outcome, path, caller_pod, match_kind, source))
 
     monkeypatch.setattr(st, "get_known_services", fake_get_known_services)
     monkeypatch.setattr(st, "upsert_service_dependency", fake_upsert)
@@ -408,7 +433,41 @@ async def test_mine_service_dependencies_upserts_validated_edges(monkeypatch):
     # Nothing trails the hostname match ("now", not a port/path), so path is
     # also the "not captured" sentinel (ROADMAP P27 phase 4). pod_id rides
     # straight through as caller_pod (also phase 4, caller cardinality).
-    assert upserted == [("payments", "payment-ui", "payment-backend", 0, None, "", "payment-ui-abc")]
+    # The qualified FQDN form is the strongest match kind, and this miner's
+    # own source identity is always "agent_skill" (also phase 4, provenance).
+    assert upserted == [
+        ("payments", "payment-ui", "payment-backend", 0, None, "", "payment-ui-abc", "qualified", "agent_skill")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mine_service_dependencies_qualified_match_kind_is_sticky(monkeypatch):
+    """ROADMAP P27 phase 4 (provenance): a later bare-form line for the SAME
+    (service, port, path) key already seen via the qualified FQDN form must
+    not downgrade match_kind back to "bare" — the strongest evidence seen
+    wins. Both lines are engineered to collide on the same key: neither has
+    a trailing port/path, so both normalize to port=0, path=""."""
+    upserted = []
+
+    async def fake_get_known_services(namespace, backend_url):
+        return {"payment-backend"}
+
+    async def fake_upsert(namespace, from_service, to_service, backend_url, port=None, outcome=None, path="",
+                           caller_pod="", match_kind="", source=""):
+        upserted.append((port, path, match_kind))
+
+    monkeypatch.setattr(st, "get_known_services", fake_get_known_services)
+    monkeypatch.setattr(st, "upsert_service_dependency", fake_upsert)
+
+    log_text = "\n".join([
+        "calling payment-backend.payments.svc.cluster.local now",  # qualified, port=0
+        "calling http://payment-backend now",  # bare, SAME key, later line
+    ])
+    await st.mine_service_dependencies("payments", "payment-ui", log_text, "http://backend")
+
+    # Exactly one upsert — both lines collapsed to the same key — and its
+    # match_kind is still "qualified", not downgraded by the later bare line.
+    assert upserted == [(0, "", "qualified")]
 
 
 @pytest.mark.asyncio

@@ -194,6 +194,8 @@ async def _push_edge(
     outcome: Optional[str] = None,
     path: str = "",
     caller_pod: str = "",
+    match_kind: str = "",
+    source: str = "",
 ) -> None:
     """Push one discovered edge — no bearer token (ADR 0029's trusted-
     internal-caller path; this miner is the Agent, on the same trusted,
@@ -204,10 +206,11 @@ async def _push_edge(
     port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
     unknown — see service_topology.py's upsert_service_dependency for why
     those rather than omitting the fields (they're the Hub schema's "not
-    captured" sentinels). caller_pod (phase 4, caller cardinality) follows
-    the identical "send explicit empty string, never omit" convention, but
-    see upsert_service_dependency's own note on why an empty one is skipped
-    Hub-side rather than stored as a sentinel.
+    captured" sentinels). caller_pod/match_kind/source (phase 4, caller
+    cardinality and provenance) follow the identical "send explicit empty
+    string, never omit" convention — see upsert_service_dependency's own
+    note on why an empty caller_pod/source is skipped Hub-side rather than
+    stored as a sentinel.
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -222,6 +225,8 @@ async def _push_edge(
                     "outcome": outcome or "",
                     "path": path or "",
                     "caller_pod": caller_pod or "",
+                    "match_kind": match_kind or "",
+                    "source": source or "",
                 },
             )
             resp.raise_for_status()
@@ -300,15 +305,23 @@ async def _mine_namespace(
         # state than an earlier one for the same target. A line that
         # mentions the target again without a classifiable outcome must not
         # erase an earlier confident one.
-        last_outcome: Dict[Tuple[str, int, str], Optional[str]] = {}
+        #
+        # match_kind (ROADMAP P27 phase 4, provenance) follows a DIFFERENT
+        # rule, deliberately: once a key has been seen via the qualified
+        # FQDN form, it stays "qualified" for the rest of this pod's window
+        # even if a later line only matched the weaker bare form — the
+        # strongest evidence seen wins, not whichever line came last.
+        last_state: Dict[Tuple[str, int, str], Tuple[Optional[str], str]] = {}
         for obs in extract_service_calls(log_text, namespace, known_services):
             if obs.service == from_service:
                 continue
             key = (obs.service, obs.port or 0, obs.path)
-            if key not in last_outcome or obs.outcome is not None:
-                last_outcome[key] = obs.outcome
+            prev_outcome, prev_match_kind = last_state.get(key, (None, ""))
+            outcome = obs.outcome if obs.outcome is not None else prev_outcome
+            match_kind = "qualified" if "qualified" in (prev_match_kind, obs.match_kind) else obs.match_kind
+            last_state[key] = (outcome, match_kind)
 
-        for (to_service, port, path), outcome in last_outcome.items():
+        for (to_service, port, path), (outcome, match_kind) in last_state.items():
             edge = (from_service, to_service, port, path, pod_name)
             if edge in pushed:
                 continue
@@ -316,6 +329,7 @@ async def _mine_namespace(
             await _push_edge(
                 backend_url, cluster_id, namespace, from_service, to_service,
                 port=port, outcome=outcome, path=path, caller_pod=pod_name,
+                match_kind=match_kind, source="glue",
             )
 
 

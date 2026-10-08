@@ -156,10 +156,10 @@ async def test_push_edge_sends_no_bearer_token_and_includes_cluster_id(monkeypat
     assert captured["body"] == {
         "namespace": "payments", "from_service": "payment-worker",
         "to_service": "payment-api", "cluster_id": "cluster-a",
-        # 0/""/""/"" are the "not captured" sentinels (ROADMAP P27 phases 2
-        # and 4) — sent explicitly when port/outcome/path/caller_pod aren't
-        # passed, never omitted.
-        "port": 0, "outcome": "", "path": "", "caller_pod": "",
+        # 0/""/""/""/""/"" are the "not captured" sentinels (ROADMAP P27
+        # phases 2 and 4) — sent explicitly when none of these are passed,
+        # never omitted.
+        "port": 0, "outcome": "", "path": "", "caller_pod": "", "match_kind": "", "source": "",
     }
 
 
@@ -192,8 +192,9 @@ async def test_mine_namespace_end_to_end(monkeypatch):
     pushed = []
 
     async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
-                              port=None, outcome=None, path="", caller_pod=""):
-        pushed.append((cluster_id, namespace, from_service, to_service, port, outcome, path, caller_pod))
+                              port=None, outcome=None, path="", caller_pod="", match_kind="", source=""):
+        pushed.append((cluster_id, namespace, from_service, to_service, port, outcome, path, caller_pod,
+                        match_kind, source))
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
 
@@ -204,8 +205,13 @@ async def test_mine_namespace_end_to_end(monkeypatch):
     # The FQDN form carries no port, and "GET payment-api...svc.cluster.local"
     # has no classifiable outcome — both correctly land as unknown (0/None).
     # Nothing trails the hostname match, so path is also "not captured" ("").
-    # caller_pod is the Athena row's own pod_name (ROADMAP P27 phase 4).
-    assert pushed == [("cluster-a", "payments", "payment-worker", "payment-api", 0, None, "", "payment-worker-abc")]
+    # caller_pod is the Athena row's own pod_name (ROADMAP P27 phase 4,
+    # caller cardinality); match_kind is "qualified" (the FQDN form) and
+    # source is this miner's own fixed identity (phase 4, provenance).
+    assert pushed == [
+        ("cluster-a", "payments", "payment-worker", "payment-api", 0, None, "", "payment-worker-abc",
+         "qualified", "glue")
+    ]
     assert "cluster_id = 'cluster-a'" in fake_client.started_with["query"]
 
 
@@ -228,7 +234,7 @@ async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatc
     pushed = []
 
     async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
-                              port=None, outcome=None, path="", caller_pod=""):
+                              port=None, outcome=None, path="", caller_pod="", match_kind="", source=""):
         pushed.append((from_service, to_service))
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
@@ -260,7 +266,7 @@ async def test_mine_namespace_pushes_once_per_distinct_contributing_pod(monkeypa
     pushed_pods = []
 
     async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
-                              port=None, outcome=None, path="", caller_pod=""):
+                              port=None, outcome=None, path="", caller_pod="", match_kind="", source=""):
         pushed_pods.append(caller_pod)
 
     monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
@@ -268,6 +274,46 @@ async def test_mine_namespace_pushes_once_per_distinct_contributing_pod(monkeypa
     await dm._mine_namespace("http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2)
 
     assert sorted(pushed_pods) == ["payment-worker-abc", "payment-worker-xyz"]
+
+
+@pytest.mark.asyncio
+async def test_mine_namespace_qualified_match_kind_is_sticky(monkeypatch):
+    """ROADMAP P27 phase 4 (provenance): match_kind follows a DIFFERENT merge
+    rule from outcome. A later bare-form line for the SAME (service, port,
+    path) key already seen via the qualified FQDN form must not downgrade it
+    back to "bare" — the strongest evidence seen in the window wins, not
+    whichever line came last.
+
+    Both lines are engineered to collide on the same key: neither has a
+    trailing port/path, so both normalize to port=0, path="" for
+    payment-api — the qualified FQDN form (no dot in the bare //host form
+    excludes it from being mistaken for this one) and the bare //host form.
+    """
+    async def fake_fetch_selectors(backend_url, cluster_id, namespace):
+        return {"payment-worker": {"app": "payment-worker"}, "payment-api": {"app": "payment-api"}}
+
+    fake_client = _FakeAthenaClient(rows=[
+        ["payment-worker-abc", "{app=payment-worker}", "GET payment-api.payments.svc.cluster.local"],  # qualified, port=0
+        ["payment-worker-abc", "{app=payment-worker}", "calling http://payment-api now"],  # bare, SAME key, later line
+    ])
+    monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
+
+    pushed = []
+
+    async def fake_push_edge(backend_url, cluster_id, namespace, from_service, to_service,
+                              port=None, outcome=None, path="", caller_pod="", match_kind="", source=""):
+        pushed.append((port, path, match_kind))
+
+    monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
+
+    await dm._mine_namespace("http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2)
+
+    # Exactly one push — both lines collapsed to the same (service, port,
+    # path) key, same as outcome's own dedup already proved elsewhere — and
+    # its match_kind is still "qualified", not downgraded by the later bare
+    # line that shares its key.
+    assert pushed == [(0, "", "qualified")]
 
 
 @pytest.mark.asyncio

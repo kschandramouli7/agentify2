@@ -544,6 +544,16 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- ROADMAP P27 phase 4 (provenance): qualified-vs-bare match strength.
+	-- Two counters, same CASE-WHEN-increment shape the three outcome
+	-- counters already use — this is evidence QUALITY about the same edge,
+	-- not a different edge, so no row-splitting the way port/path needed.
+	-- Both are "" is impossible for a real observation (extract_service_calls
+	-- always sets one), but the columns themselves default to 0 like every
+	-- other counter here, for a collector that predates this phase.
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS qualified_match_count INT NOT NULL DEFAULT 0;
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS bare_match_count INT NOT NULL DEFAULT 0;
+
 	-- ROADMAP P27 phase 4: caller cardinality. One row per (edge, pod_name)
 	-- ever seen -- deliberately a CHILD table, not a column on
 	-- service_dependencies, because this is a SET relationship ("which pods
@@ -584,6 +594,43 @@ func (c *Client) initSchema(ctx context.Context) error {
 		) THEN
 			EXECUTE 'CREATE POLICY tenant_isolation ON service_dependency_callers
 				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
+	-- ROADMAP P27 phase 4 (provenance): which producer(s) confirmed an
+	-- edge. Extends service_dependency_callers rather than a new table —
+	-- each caller-pod sighting already comes from exactly one producer at
+	-- push time, so this reuses the table, its RLS policy, and its
+	-- retention janitor as-is. COUNT(DISTINCT pod_name) (caller
+	-- cardinality) is unaffected by widening the key; COUNT(DISTINCT
+	-- source) / a list of sources (see ListServiceDependencies below) comes
+	-- from the same table for free. '' is the same "not reported" sentinel
+	-- every other column on this table already uses.
+	ALTER TABLE IF EXISTS service_dependency_callers ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';
+
+	-- Widen the primary key to include source, same self-healing
+	-- drop-and-recreate pattern service_dependencies' own constraint
+	-- migrations use (ADR 0022/0031/0034) — find whatever the current PK
+	-- constraint is and replace it, so this runs correctly whether it
+	-- follows ADR 0035's original PK or, on a fresh database, right after
+	-- this table's own CREATE TABLE above.
+	DO $$
+	DECLARE
+		old_constraint_name TEXT;
+	BEGIN
+		SELECT conname INTO old_constraint_name
+		FROM pg_constraint
+		WHERE conrelid = 'service_dependency_callers'::regclass
+		  AND contype = 'p'
+		  AND conname != 'service_dependency_callers_pkey_with_source';
+		IF old_constraint_name IS NOT NULL THEN
+			EXECUTE format('ALTER TABLE service_dependency_callers DROP CONSTRAINT %I', old_constraint_name);
+		END IF;
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'service_dependency_callers_pkey_with_source'
+		) THEN
+			ALTER TABLE service_dependency_callers ADD CONSTRAINT service_dependency_callers_pkey_with_source
+				PRIMARY KEY (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name, source);
 		END IF;
 	END $$;
 
@@ -2256,6 +2303,14 @@ type ServiceDependency struct {
 	OutcomeSuccessCount  int `json:"outcome_success_count"`
 	OutcomeFailureCount  int `json:"outcome_failure_count"`
 	OutcomeTimeoutCount  int `json:"outcome_timeout_count"`
+	// ROADMAP P27 phase 4 (provenance). Cumulative since first_seen, same
+	// shape as the three outcome counters above — evidence QUALITY about
+	// this edge, not a different edge, so no row-splitting the way
+	// port/path needed. Both 0 means "predates this phase", not "no
+	// evidence" — EvidenceCount is still the authority on whether the edge
+	// has evidence at all.
+	QualifiedMatchCount int `json:"qualified_match_count"`
+	BareMatchCount      int `json:"bare_match_count"`
 	// ADR 0032: to_service's agentify.io/expected-failure annotation value,
 	// looked up from cluster_services at read time (never stored on this row)
 	// so it's always current with the Service's live annotation state and has
@@ -2269,6 +2324,13 @@ type ServiceDependency struct {
 	// "confirmed zero callers" — same honesty convention every other 0/""
 	// sentinel on this struct already follows.
 	CallerPodCount int `json:"caller_pod_count"`
+	// ROADMAP P27 phase 4 (provenance). Which producer(s) — "live" | "glue"
+	// | "agent_skill" — have confirmed this edge, from the same
+	// service_dependency_callers join as CallerPodCount above (now also
+	// carrying source). Never nil in the JSON response: an edge with no
+	// source evidence yet serializes as [], not null, so the frontend never
+	// has to special-case "missing" vs "known empty".
+	Sources []string `json:"sources"`
 }
 
 // UpsertServiceDependency records one piece of evidence for a from->to edge —
@@ -2307,7 +2369,12 @@ func setTenantContext(ctx context.Context, tx *sql.Tx, tenantID string) error {
 // through) — deliberately SKIPPED, not inserted as pod_name='', because an
 // empty pod name is not a real caller identity and would silently inflate
 // every affected edge's distinct-caller count by one.
-func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod string) error {
+// matchKind/source (ROADMAP P27 phase 4, provenance): matchKind
+// ("qualified" | "bare" | "") increments one of the two match-strength
+// counters below, same sentinel convention as outcome. source rides
+// alongside callerPod into service_dependency_callers — like callerPod, an
+// empty source means nothing to record there, never a phantom entry.
+func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod, matchKind, source string) error {
 	if targetKind == "" {
 		targetKind = "service" // an older collector reports only validated edges
 	}
@@ -2323,34 +2390,38 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, port, path,
 		                                   evidence_count, outcome_success_count, outcome_failure_count, outcome_timeout_count,
-		                                   first_seen, last_seen)
+		                                   qualified_match_count, bare_match_count, first_seen, last_seen)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1,
 		        CASE WHEN $10 = 'success' THEN 1 ELSE 0 END,
 		        CASE WHEN $10 = 'failure' THEN 1 ELSE 0 END,
 		        CASE WHEN $10 = 'timeout' THEN 1 ELSE 0 END,
+		        CASE WHEN $11 = 'qualified' THEN 1 ELSE 0 END,
+		        CASE WHEN $11 = 'bare' THEN 1 ELSE 0 END,
 		        NOW(), NOW())
 		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path) DO UPDATE SET
 		  evidence_count         = service_dependencies.evidence_count + 1,
 		  outcome_success_count  = service_dependencies.outcome_success_count + CASE WHEN $10 = 'success' THEN 1 ELSE 0 END,
 		  outcome_failure_count  = service_dependencies.outcome_failure_count + CASE WHEN $10 = 'failure' THEN 1 ELSE 0 END,
 		  outcome_timeout_count  = service_dependencies.outcome_timeout_count + CASE WHEN $10 = 'timeout' THEN 1 ELSE 0 END,
+		  qualified_match_count  = service_dependencies.qualified_match_count + CASE WHEN $11 = 'qualified' THEN 1 ELSE 0 END,
+		  bare_match_count       = service_dependencies.bare_match_count + CASE WHEN $11 = 'bare' THEN 1 ELSE 0 END,
 		  -- Kind can be corrected on a later sighting (a host first seen as
 		  -- external, later resolved as cross-namespace once its namespace is
 		  -- tracked) but never downgraded to the default by an older caller.
 		  target_kind    = COALESCE(NULLIF(EXCLUDED.target_kind, ''), service_dependencies.target_kind),
 		  last_seen      = NOW()`,
-		id, namespace, fromService, toService, tenantID, clusterID, targetKind, port, path, outcome)
+		id, namespace, fromService, toService, tenantID, clusterID, targetKind, port, path, outcome, matchKind)
 	if err != nil {
 		return err
 	}
 	if callerPod != "" {
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO service_dependency_callers (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name,
+			INSERT INTO service_dependency_callers (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name, source,
 			                                          first_seen, last_seen)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-			ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name) DO UPDATE SET
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+			ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name, source) DO UPDATE SET
 			  last_seen = NOW()`,
-			tenantID, clusterID, namespace, fromService, toService, port, path, callerPod)
+			tenantID, clusterID, namespace, fromService, toService, port, path, callerPod, source)
 		if err != nil {
 			return err
 		}
@@ -2489,23 +2560,33 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	// fan out this query into duplicate rows.
 	//
 	// LEFT JOIN a pre-aggregated subquery over service_dependency_callers
-	// (ROADMAP P27 phase 4): COUNT(DISTINCT pod_name) per edge, computed
-	// once per edge key rather than per row, same reason the aggregation
-	// happens in the subquery and not the outer SELECT — joining the raw
-	// per-pod rows directly would multiply every edge row by however many
-	// distinct pods it has.
+	// (ROADMAP P27 phase 4): COUNT(DISTINCT pod_name) for caller
+	// cardinality AND jsonb_agg(DISTINCT source) for provenance, both from
+	// the SAME subquery/table — provenance (ADR after ADR 0035) extended
+	// this table with a source column rather than adding a second one,
+	// since a caller-pod sighting always comes from exactly one producer.
+	// Computed once per edge key rather than per row, same reason the
+	// aggregation happens in the subquery and not the outer SELECT —
+	// joining the raw per-pod rows directly would multiply every edge row
+	// by however many distinct (pod, source) pairs it has. jsonb_agg, not a
+	// native Postgres array, matching this codebase's existing convention
+	// for list-shaped data reaching Go (see ServiceProfile.Ports/portsJSON
+	// below) rather than introducing pq.Array as a second pattern.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
 		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
 		       sd.port, sd.path, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
-		       COALESCE(cs.expected_failure_reason, ''), COALESCE(cpc.caller_pod_count, 0)
+		       sd.qualified_match_count, sd.bare_match_count,
+		       COALESCE(cs.expected_failure_reason, ''), COALESCE(cpc.caller_pod_count, 0),
+		       COALESCE(cpc.sources, '[]'::jsonb)
 		FROM service_dependencies sd
 		LEFT JOIN cluster_services cs
 		  ON cs.tenant_id = sd.tenant_id AND cs.cluster_id = sd.cluster_id
 		 AND cs.namespace = sd.namespace AND cs.service = sd.to_service
 		LEFT JOIN (
 		    SELECT tenant_id, cluster_id, namespace, from_service, to_service, port, path,
-		           COUNT(DISTINCT pod_name) AS caller_pod_count
+		           COUNT(DISTINCT pod_name) AS caller_pod_count,
+		           jsonb_agg(DISTINCT source) FILTER (WHERE source != '') AS sources
 		    FROM service_dependency_callers
 		    GROUP BY tenant_id, cluster_id, namespace, from_service, to_service, port, path
 		) cpc ON cpc.tenant_id = sd.tenant_id AND cpc.cluster_id = sd.cluster_id
@@ -2520,11 +2601,26 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	var result []ServiceDependency
 	for rows.Next() {
 		var d ServiceDependency
+		var sourcesJSON []byte
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
 			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind,
 			&d.Port, &d.Path, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
-			&d.ExpectedFailureReason, &d.CallerPodCount); err != nil {
+			&d.QualifiedMatchCount, &d.BareMatchCount,
+			&d.ExpectedFailureReason, &d.CallerPodCount, &sourcesJSON); err != nil {
 			return nil, err
+		}
+		// A malformed sources blob must not fail the whole namespace — the
+		// rest of the edge is still useful. Same tolerant-fallback shape
+		// ListServiceProfiles' own portsJSON handling already uses.
+		if len(sourcesJSON) > 0 {
+			if err := json.Unmarshal(sourcesJSON, &d.Sources); err != nil {
+				c.logger.Warn("bad sources JSON on service_dependencies row",
+					"namespace", d.Namespace, "from_service", d.FromService, "to_service", d.ToService, "error", err)
+				d.Sources = nil
+			}
+		}
+		if d.Sources == nil {
+			d.Sources = []string{}
 		}
 		result = append(result, d)
 	}

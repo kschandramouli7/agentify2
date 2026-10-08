@@ -126,17 +126,26 @@ async def _scan_namespace(
         # the target again without a classifiable outcome must not erase an
         # earlier confident one. Per-pod push granularity is unchanged: each
         # sampled pod still pushes independently, same as before this phase.
-        last_outcome: Dict[Tuple[str, int, str], Optional[str]] = {}
+        #
+        # match_kind (ROADMAP P27 phase 4, provenance) follows a DIFFERENT
+        # rule, deliberately: once a key has been seen via the qualified
+        # FQDN form, it stays "qualified" for the rest of this pod's tail
+        # even if a later line only matched the weaker bare form — the
+        # strongest evidence seen wins, not whichever line came last.
+        last_state: Dict[Tuple[str, int, str], Tuple[Optional[str], str]] = {}
         for obs in extract_service_calls(logs, ns, known):
             if obs.service == from_service:
                 continue  # self-mention, not a dependency
             key = (obs.service, obs.port or 0, obs.path)
-            if key not in last_outcome or obs.outcome is not None:
-                last_outcome[key] = obs.outcome
-        for (to_service, port, path), outcome in last_outcome.items():
+            prev_outcome, prev_match_kind = last_state.get(key, (None, ""))
+            outcome = obs.outcome if obs.outcome is not None else prev_outcome
+            match_kind = "qualified" if "qualified" in (prev_match_kind, obs.match_kind) else obs.match_kind
+            last_state[key] = (outcome, match_kind)
+        for (to_service, port, path), (outcome, match_kind) in last_state.items():
             await push_dependency(
                 ns, from_service, to_service, cfg.backend_url, cfg.collector_token,
                 port=port, outcome=outcome, path=path, caller_pod=pod["name"],
+                match_kind=match_kind, source="live",
             )
 
         # Beyond the namespace boundary (ROADMAP P27 phase 3): the calls that
@@ -159,7 +168,7 @@ async def _scan_namespace(
                 continue
             await push_dependency(
                 ns, from_service, target, cfg.backend_url, cfg.collector_token, target_kind=kind,
-                caller_pod=pod["name"],
+                caller_pod=pod["name"], source="live",
             )
 
     await push_scan_coverage(ns, coverage, cfg.backend_url, cfg.collector_token)

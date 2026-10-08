@@ -182,8 +182,8 @@ async def test_scan_namespace_pushes_port_and_last_known_outcome(monkeypatch, ca
     pushed = []
 
     async def fake_push_dependency(ns, from_service, to_service, backend_url, token, target_kind="service",
-                                    port=None, outcome=None, path="", caller_pod=""):
-        pushed.append((from_service, to_service, port, outcome, path, caller_pod))
+                                    port=None, outcome=None, path="", caller_pod="", match_kind="", source=""):
+        pushed.append((from_service, to_service, port, outcome, path, caller_pod, match_kind, source))
 
     monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
 
@@ -203,6 +203,10 @@ async def test_scan_namespace_pushes_port_and_last_known_outcome(monkeypatch, ca
     # for both — it doesn't further split these two already-distinct (port)
     # dedup keys. caller_pod is the sampled pod's own name (also phase 4,
     # caller cardinality) — same for every push here, since only one pod
-    # was sampled.
-    assert ("batch", "api", 8443, "failure", "", "batch-1") in pushed
-    assert ("batch", "api", 0, None, "", "batch-1") in pushed
+    # was sampled. match_kind/source (also phase 4, provenance): the two
+    # "api:8443" lines are both the bare host:port form; "live" is this
+    # producer's own fixed source identity.
+    assert ("batch", "api", 8443, "failure", "", "batch-1", "bare", "live") in pushed
+    # The qualified FQDN form ("api.payments.svc.cluster.local") is a
+    # separate (port=0) key, so it keeps its own distinct match_kind.
+    assert ("batch", "api", 0, None, "", "batch-1", "qualified", "live") in pushed

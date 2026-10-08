@@ -262,15 +262,27 @@ function EvidenceBar({ edge }: { edge: ServiceDependency }) {
   // ambiguous without a duration — 318 over 299 scans and 17 over 350 scans are
   // both "large", and only one of them means the call is consistently confirmed.
   const pct = c.coverage === null ? 0 : Math.max(4, Math.round(c.coverage * 100));
+  // ROADMAP P27 phase 4 (provenance). Folded into the existing evidence
+  // tooltip rather than a new column — match strength is a property of
+  // this same evidence, not a different fact the way port/path/caller
+  // cardinality each were. Silent when neither counter has anything yet
+  // (an edge from before this phase, or one seen only via a non-hostname
+  // extraction path), same "say nothing until there's something to say" as
+  // the path-coverage line above.
+  const qualified = edge.qualified_match_count ?? 0;
+  const bare = edge.bare_match_count ?? 0;
+  const matchStrength = qualified + bare > 0
+    ? ` Match strength: ${qualified} qualified, ${bare} bare.`
+    : "";
   return (
     <span
       className={`topo-evidence topo-evidence--${c.key}`}
       title={
-        c.scans === null
+        (c.scans === null
           ? `Seen ${edge.evidence_count}x, but too new to judge how consistently.`
           : `Seen in ${edge.evidence_count} of ~${c.scans} scans since first observed ` +
             `(${Math.round((c.coverage ?? 0) * 100)}%) — ${c.label}. ` +
-            `Sightings in logs, not requests.`
+            `Sightings in logs, not requests.`) + matchStrength
       }
     >
       <span className="topo-evidence__track">
@@ -954,8 +966,17 @@ export function TopologyPanel() {
                               if (count === 0) return "—";
                               const fromMeta = arch.meta.get(e.from_service);
                               const desired = fromMeta?.replicasDesired;
+                              // ROADMAP P27 phase 4 (provenance). "Which
+                              // miner(s)" shares this cell rather than its
+                              // own column — it's metadata ABOUT the same
+                              // caller-pod evidence this cell already shows,
+                              // not a distinct fact like port/path were.
+                              const sources = e.sources ?? [];
+                              const replicaPart = desired ? `${count} of ${desired} known replicas of ${e.from_service}` : "";
+                              const sourcesPart = sources.length > 0 ? `Confirmed by: ${sources.join(", ")}.` : "";
+                              const title = [replicaPart, sourcesPart].filter(Boolean).join(" ") || undefined;
                               return (
-                                <span title={desired ? `${count} of ${desired} known replicas of ${e.from_service}` : undefined}>
+                                <span title={title}>
                                   {desired ? `${count} of ${desired}` : String(count)}
                                 </span>
                               );

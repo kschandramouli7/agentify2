@@ -166,19 +166,23 @@ def test_infer_outcome_status_code_wins_over_a_stray_keyword_elsewhere():
 def test_extract_service_calls_captures_port_for_bare_form_only():
     log_text = "dialing agentify-agent:8001 for reasoning"
     calls = st.extract_service_calls(log_text, "agentify", {"agentify-agent"})
-    assert calls == [st.CallObservation(service="agentify-agent", port=8001, outcome=None)]
+    assert calls == [st.CallObservation(service="agentify-agent", port=8001, outcome=None, match_kind="bare")]
 
 
 def test_extract_service_calls_qualified_form_has_no_port():
     log_text = "calling payment-backend.payments now"
     calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
-    assert calls == [st.CallObservation(service="payment-backend", port=None, outcome=None)]
+    assert calls == [
+        st.CallObservation(service="payment-backend", port=None, outcome=None, match_kind="qualified")
+    ]
 
 
 def test_extract_service_calls_attaches_outcome_from_the_same_line():
     log_text = "upstream payment-api:8443 responded 503 after 4812ms (attempt 3/3)"
     calls = st.extract_service_calls(log_text, "payments", {"payment-api"})
-    assert calls == [st.CallObservation(service="payment-api", port=8443, outcome="failure")]
+    assert calls == [
+        st.CallObservation(service="payment-api", port=8443, outcome="failure", match_kind="bare")
+    ]
 
 
 def test_extract_service_calls_outcome_is_local_to_its_own_line():
@@ -283,6 +287,26 @@ def test_normalize_path_rejects_an_implausibly_long_capture():
     assert st._normalize_path("/" + "x" * 300) == ""
 
 
+# ── match_kind / provenance (ROADMAP P27 phase 4) ──────────────────────────────
+
+def test_match_kind_qualified_for_the_fqdn_form():
+    log_text = "calling payment-backend.payments now"
+    calls = st.extract_service_calls(log_text, "payments", {"payment-backend"})
+    assert [c.match_kind for c in calls] == ["qualified"]
+
+
+def test_match_kind_bare_for_the_url_host_form():
+    log_text = "POST http://agentify-backend:8080/api/query"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-backend"})
+    assert all(c.match_kind == "bare" for c in calls)
+
+
+def test_match_kind_bare_for_the_host_port_form():
+    log_text = "dialing agentify-agent:8001 for reasoning"
+    calls = st.extract_service_calls(log_text, "agentify", {"agentify-agent"})
+    assert [c.match_kind for c in calls] == ["bare"]
+
+
 # ── push_dependency ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -320,6 +344,9 @@ async def test_push_dependency_sends_port_and_outcome_sentinels_when_unknown(mon
     assert captured["body"]["port"] == 0
     assert captured["body"]["outcome"] == ""
     assert captured["body"]["path"] == ""  # ROADMAP P27 phase 4's "not captured" sentinel
+    assert captured["body"]["caller_pod"] == ""
+    assert captured["body"]["match_kind"] == ""
+    assert captured["body"]["source"] == ""
 
 
 @pytest.mark.asyncio

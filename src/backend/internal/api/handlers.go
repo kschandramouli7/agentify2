@@ -1987,6 +1987,12 @@ type serviceDependencyUpsertRequest struct {
 	// upserted as a caller sighting (see UpsertServiceDependency's own
 	// comment on why an empty pod name must not become a phantom caller).
 	CallerPod string `json:"caller_pod"`
+	// ROADMAP P27 phase 4 (provenance). MatchKind ("qualified" | "bare" |
+	// "") increments one of the edge's two match-strength counters. Source
+	// ("live" | "glue" | "agent_skill" | "") follows CallerPod's own "never
+	// a phantom entry when empty" rule.
+	MatchKind string `json:"match_kind"`
+	Source    string `json:"source"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
@@ -2264,7 +2270,7 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 	// The kind is taken from the body rather than inferred: only the miner
 	// knows which tier produced the edge, and guessing from the string shape
 	// here would silently reclassify edges on a format change.
-	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome, req.Path, req.CallerPod); err != nil {
+	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome, req.Path, req.CallerPod, req.MatchKind, req.Source); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

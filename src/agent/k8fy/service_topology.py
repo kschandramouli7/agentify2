@@ -108,6 +108,13 @@ class CallObservation:
     port: Optional[int] = None      # known only when a :<port> immediately follows the host
     outcome: Optional[str] = None   # "success" | "failure" | "timeout" | None (unknown)
     path: str = ""                  # normalized operation class, "" when not captured (ROADMAP P27 phase 4)
+    # ROADMAP P27 phase 4 (provenance). "qualified" | "bare" — which of the
+    # three match loops in extract_service_calls produced this observation.
+    # Not a detection change, just a label on a distinction the matcher
+    # already makes: _HOSTNAME_RE is the qualified FQDN form, _URL_HOST_RE/
+    # _HOST_PORT_RE are both bare-name forms (weaker evidence — a short name
+    # resolved via the pod's own search domain, not a fully-qualified one).
+    match_kind: str = ""
 
 
 # Trigger words/symbols that make a following 3-digit number a plausible HTTP
@@ -222,7 +229,9 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
             if namespace_candidate == namespace and service_candidate in known_services:
                 port, path = _peek_port_and_path(line, m.end())
                 observations.append(
-                    CallObservation(service=service_candidate, port=port, outcome=outcome, path=path)
+                    CallObservation(
+                        service=service_candidate, port=port, outcome=outcome, path=path, match_kind="qualified",
+                    )
                 )
 
         for m in _URL_HOST_RE.finditer(line):
@@ -231,7 +240,9 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
                 continue
             if host in known_services:
                 port, path = _peek_port_and_path(line, m.end())
-                observations.append(CallObservation(service=host, port=port, outcome=outcome, path=path))
+                observations.append(
+                    CallObservation(service=host, port=port, outcome=outcome, path=path, match_kind="bare")
+                )
 
         for m in _HOST_PORT_RE.finditer(line):
             name, port_str = m.group(1), m.group(2)
@@ -240,7 +251,9 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
                 # half of the peek is used here.
                 _, path = _peek_port_and_path(line, m.end())
                 observations.append(
-                    CallObservation(service=name, port=int(port_str), outcome=outcome, path=path)
+                    CallObservation(
+                        service=name, port=int(port_str), outcome=outcome, path=path, match_kind="bare",
+                    )
                 )
 
     return observations
@@ -405,6 +418,8 @@ async def upsert_service_dependency(
     outcome: Optional[str] = None,
     path: str = "",
     caller_pod: str = "",
+    match_kind: str = "",
+    source: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge. Best-effort: any
     failure is logged and swallowed — losing one piece of evidence never
@@ -421,6 +436,13 @@ async def upsert_service_dependency(
     on the edge row itself; an empty caller_pod means "nothing to upsert
     into service_dependency_callers this time," skipped there entirely
     rather than counted as a phantom caller.
+
+    match_kind/source (phase 4, provenance): match_kind ("qualified" |
+    "bare" | "") increments one of the edge row's two match-strength
+    counters, same sentinel convention as outcome. source ("live" | "glue" |
+    "agent_skill" | "") rides alongside caller_pod into
+    service_dependency_callers — like caller_pod, an empty source means
+    nothing to record there, never a phantom entry.
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -434,6 +456,8 @@ async def upsert_service_dependency(
                     "outcome": outcome or "",
                     "path": path or "",
                     "caller_pod": caller_pod or "",
+                    "match_kind": match_kind or "",
+                    "source": source or "",
                 },
             )
             resp.raise_for_status()
@@ -509,16 +533,28 @@ async def mine_service_dependencies(
     # than an earlier one for the same target. A line that mentions the
     # target again without a classifiable outcome must not erase an earlier
     # confident one.
-    last_outcome: Dict[Tuple[str, int, str], Optional[str]] = {}
+    #
+    # match_kind (ROADMAP P27 phase 4, provenance) follows a DIFFERENT rule
+    # from outcome, deliberately: once a key has been seen via the qualified
+    # FQDN form, it stays "qualified" for the rest of this window even if a
+    # later line for the same key only matched the weaker bare form — the
+    # strongest evidence seen wins, not whichever line happened to come
+    # last. match_kind is never None (every real observation sets one), so
+    # the "" default only ever appears before the first observation for a
+    # key is seen.
+    last_state: Dict[Tuple[str, int, str], Tuple[Optional[str], str]] = {}
     for obs in extract_service_calls(log_text, namespace, known_services):
         if obs.service == from_service:
             continue  # not a dependency, just the service mentioning itself
         key = (obs.service, obs.port or 0, obs.path)
-        if key not in last_outcome or obs.outcome is not None:
-            last_outcome[key] = obs.outcome
+        prev_outcome, prev_match_kind = last_state.get(key, (None, ""))
+        outcome = obs.outcome if obs.outcome is not None else prev_outcome
+        match_kind = "qualified" if "qualified" in (prev_match_kind, obs.match_kind) else obs.match_kind
+        last_state[key] = (outcome, match_kind)
 
-    for (to_service, port, path), outcome in last_outcome.items():
+    for (to_service, port, path), (outcome, match_kind) in last_state.items():
         await upsert_service_dependency(
             namespace, from_service, to_service, backend_url,
             port=port, outcome=outcome, path=path, caller_pod=pod_id,
+            match_kind=match_kind, source="agent_skill",
         )

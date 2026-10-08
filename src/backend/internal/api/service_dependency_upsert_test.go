@@ -26,6 +26,8 @@ type fakeServiceDependencyStore struct {
 	// ROADMAP P27 phase 4.
 	lastPath      string
 	lastCallerPod string
+	lastMatchKind string
+	lastSource    string
 
 	// Scan-coverage calls, recorded so the coverage tests can assert on them
 	// (ROADMAP P27 phase 1).
@@ -56,7 +58,7 @@ func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenan
 	return f.coverageRows, nil
 }
 
-func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod string) error {
+func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod, matchKind, source string) error {
 	f.upsertCalled = true
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
@@ -68,6 +70,8 @@ func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context
 	f.lastOutcome = outcome
 	f.lastPath = path
 	f.lastCallerPod = callerPod
+	f.lastMatchKind = matchKind
+	f.lastSource = source
 	return nil
 }
 
@@ -292,6 +296,54 @@ func TestHandleServiceDependencyUpsert_CallerPod(t *testing.T) {
 		}
 		if store.lastCallerPod != "" {
 			t.Errorf("caller_pod: want empty (unknown sentinel), got %q", store.lastCallerPod)
+		}
+	})
+}
+
+// TestHandleServiceDependencyUpsert_MatchKindAndSource pins ROADMAP P27
+// phase 4 (provenance): match_kind and source pass through from the request
+// body to the store unchanged, including the "absent from the body" case —
+// an older collector that predates this phase — where Go's JSON decoder
+// leaves both at the zero value (""), the same "not captured" sentinel
+// every other optional field on this request already uses.
+func TestHandleServiceDependencyUpsert_MatchKindAndSource(t *testing.T) {
+	t.Run("match_kind and source present in the body are passed through as-is", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api","match_kind":"qualified","source":"live"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastMatchKind != "qualified" {
+			t.Errorf("match_kind: want %q, got %q", "qualified", store.lastMatchKind)
+		}
+		if store.lastSource != "live" {
+			t.Errorf("source: want %q, got %q", "live", store.lastSource)
+		}
+	})
+
+	t.Run("match_kind and source absent from the body — an older collector — default to the empty sentinel", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastMatchKind != "" {
+			t.Errorf("match_kind: want empty (unknown sentinel), got %q", store.lastMatchKind)
+		}
+		if store.lastSource != "" {
+			t.Errorf("source: want empty (unknown sentinel), got %q", store.lastSource)
 		}
 	})
 }

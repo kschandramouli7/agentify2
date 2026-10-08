@@ -100,6 +100,13 @@ class CallObservation:
     port: Optional[int] = None      # known only when a :<port> immediately follows the host
     outcome: Optional[str] = None   # "success" | "failure" | "timeout" | None (unknown)
     path: str = ""                  # normalized operation class, "" when not captured (ROADMAP P27 phase 4)
+    # ROADMAP P27 phase 4 (provenance). "qualified" | "bare" — which of the
+    # three match loops in extract_service_calls produced this observation.
+    # Not a detection change, just a label on a distinction the matcher
+    # already makes: _HOSTNAME_RE is the qualified FQDN form, _URL_HOST_RE/
+    # _HOST_PORT_RE are both bare-name forms (weaker evidence — a short name
+    # resolved via the pod's own search domain, not a fully-qualified one).
+    match_kind: str = ""
 
 
 # Trigger words/symbols that make a following 3-digit number a plausible HTTP
@@ -214,7 +221,9 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
             if namespace_candidate == namespace and service_candidate in known_services:
                 port, path = _peek_port_and_path(line, m.end())
                 observations.append(
-                    CallObservation(service=service_candidate, port=port, outcome=outcome, path=path)
+                    CallObservation(
+                        service=service_candidate, port=port, outcome=outcome, path=path, match_kind="qualified",
+                    )
                 )
 
         for m in _URL_HOST_RE.finditer(line):
@@ -223,7 +232,9 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
                 continue
             if host in known_services:
                 port, path = _peek_port_and_path(line, m.end())
-                observations.append(CallObservation(service=host, port=port, outcome=outcome, path=path))
+                observations.append(
+                    CallObservation(service=host, port=port, outcome=outcome, path=path, match_kind="bare")
+                )
 
         for m in _HOST_PORT_RE.finditer(line):
             name, port_str = m.group(1), m.group(2)
@@ -232,7 +243,9 @@ def extract_service_calls(log_text: str, namespace: str, known_services: Set[str
                 # half of the peek is used here.
                 _, path = _peek_port_and_path(line, m.end())
                 observations.append(
-                    CallObservation(service=name, port=int(port_str), outcome=outcome, path=path)
+                    CallObservation(
+                        service=name, port=int(port_str), outcome=outcome, path=path, match_kind="bare",
+                    )
                 )
 
     return observations
@@ -395,6 +408,8 @@ async def push_dependency(
     outcome: Optional[str] = None,
     path: str = "",
     caller_pod: str = "",
+    match_kind: str = "",
+    source: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge via the tenant-scoped
     ingest endpoint. Best-effort: any failure is logged and swallowed — one
@@ -403,9 +418,10 @@ async def push_dependency(
     port/outcome/path (ROADMAP P27 phases 2 and 4) are sent as 0/""/"" when
     unknown — see upsert_service_dependency's identical note (agent's
     service_topology.py) for why those rather than omitting the fields.
-    caller_pod (phase 4, caller cardinality) follows the same convention;
-    see that same note for why an empty one is skipped Hub-side rather than
-    stored as a sentinel.
+    caller_pod/match_kind/source (phase 4, caller cardinality and
+    provenance) follow the same convention; see that same note for why an
+    empty caller_pod/source is skipped Hub-side rather than stored as a
+    sentinel.
     """
     # Omit the header entirely when unset — see push_inventory's identical
     # comment (inventory.py) for why.
@@ -427,6 +443,8 @@ async def push_dependency(
                     "outcome": outcome or "",
                     "path": path or "",
                     "caller_pod": caller_pod or "",
+                    "match_kind": match_kind or "",
+                    "source": source or "",
                 },
                 headers=headers,
             )

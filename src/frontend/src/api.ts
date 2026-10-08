@@ -476,6 +476,20 @@ export type ServiceDependency = {
    *  on this row. 0/absent means "no caller-pod evidence yet", not
    *  "confirmed zero callers" — same honesty convention as port/path above. */
   caller_pod_count?: number;
+  /** ROADMAP P27 phase 4 (provenance). Cumulative since first_seen, split
+   *  the same way the outcome counters are: qualified = matched a full
+   *  service.namespace.svc.cluster.local hostname (strong evidence), bare =
+   *  matched a shorter //service or service:port form (weaker — could be a
+   *  coincidental local-variable name). Both absent/0 means "no evidence
+   *  yet", not "zero of either kind confirmed". */
+  qualified_match_count?: number;
+  bare_match_count?: number;
+  /** ROADMAP P27 phase 4 (provenance). Which miner(s) confirmed this edge —
+   *  "live", "glue", "agent_skill" — computed server-side at read time from
+   *  service_dependency_callers, same as caller_pod_count. Absent/empty
+   *  means no caller-pod evidence has recorded a source yet, not that the
+   *  edge is unconfirmed. */
+  sources?: string[];
 };
 
 /** One entry point into the cluster from outside — an Ingress, Gateway
