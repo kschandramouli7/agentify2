@@ -606,6 +606,17 @@ def test_go_and_python_agree_on_the_routing_rule():
         ("show cpu for payment-api's upstream services", None),
         ("is payment healthy?", None),
         ("list the pods", None),
+        # ROADMAP P31 phase 2 (cold services, ADR 0038) — same cases
+        # asserted verbatim in TestInferIntent_ColdServices (Go).
+        ("which services are cold in this namespace?", "cold_services"),
+        ("what's safe to decommission here?", "cold_services"),
+        ("are there any dead services in payments?", "cold_services"),
+        ("show me unused services", "cold_services"),
+        ("is payment-worker safe to delete?", "cold_services"),
+        ("payment-worker hasn't been called in weeks, can we remove it?", "cold_services"),
+        ("has payment-worker been called recently?", None),
+        ("which services have no callers and are safe to decommission?", "cold_services"),
+        ("why does it look like payment-worker is dead?", None),
     ]
     mismatches = [
         (q, want, _chat_route(_user(q))) for q, want in routes if _chat_route(_user(q)) != want
@@ -697,6 +708,76 @@ def test_the_skill_avoids_310_only_syntax():
     modules are already unimportable there. A new module should not add to that
     pile — it is the difference between this file running locally and not."""
     src = (Path(__file__).resolve().parents[1] / "k8fy" / "skills" / "dependency_graph.py").read_text()
+    assert "Dict[str, Any] | None" not in src
+    assert "Optional[Dict[str, Any]]" in src
+
+
+# ── ColdServicesSkill (ROADMAP P31 phase 2, ADR 0038) ─────────────────────────
+
+COLD = [
+    {"namespace": "payments", "service": "legacy-worker", "last_seen": None, "last_scan": "2026-10-09T00:00:00Z"},
+    {"namespace": "payments", "service": "stale-batch", "last_seen": "2026-08-01T00:00:00Z", "last_scan": "2026-10-09T00:00:00Z"},
+]
+
+
+@pytest.mark.asyncio
+async def test_cold_services_skill_answers_without_a_model_call(monkeypatch):
+    from k8fy.skills.cold_services import ColdServicesSkill
+
+    async def fake_fetch(namespace, backend_url, stale_days=14, scanned_within_days=2):
+        return COLD
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_cold_services", fake_fetch)
+
+    skill = ColdServicesSkill.__new__(ColdServicesSkill)
+    skill.backend_url = "http://backend"
+
+    resp = await ColdServicesSkill.reason(
+        skill, "cold_services", {}, {"namespace": "payments", "question": "which services are cold?"},
+    )
+    assert resp.tier == "tier1"
+    assert resp.estimated_cost_usd == 0.0
+    assert resp.prompt_version is None
+    assert "legacy-worker" in resp.answer
+    assert "stale-batch" in resp.answer
+    assert resp.details["cold_services"] == COLD
+
+
+@pytest.mark.asyncio
+async def test_cold_services_skill_states_an_honest_empty_result(monkeypatch):
+    async def empty(namespace, backend_url, stale_days=14, scanned_within_days=2):
+        return []
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_cold_services", empty)
+
+    from k8fy.skills.cold_services import ColdServicesSkill
+    skill = ColdServicesSkill.__new__(ColdServicesSkill)
+    skill.backend_url = "http://backend"
+    resp = await ColdServicesSkill.reason(
+        skill, "cold_services", {}, {"namespace": "payments", "question": "anything cold?"},
+    )
+    assert resp.tier == "tier1"
+    assert "No services in payments currently look cold" in resp.answer
+
+
+@pytest.mark.asyncio
+async def test_cold_services_skill_needs_a_namespace():
+    from k8fy.skills.cold_services import ColdServicesSkill
+    skill = ColdServicesSkill.__new__(ColdServicesSkill)
+    skill.backend_url = "http://backend"
+    resp = await ColdServicesSkill.reason(skill, "cold_services", {}, {})
+    assert resp.tier == "tier1"
+    assert "Which namespace" in resp.answer
+
+
+def test_the_router_registers_the_cold_services_intent():
+    router_src = (Path(__file__).resolve().parents[1] / "k8fy" / "skills" / "router.py").read_text()
+    assert '"cold_services": ColdServicesSkill()' in router_src
+    assert "from k8fy.skills.cold_services import ColdServicesSkill" in router_src
+
+
+def test_the_cold_services_skill_avoids_310_only_syntax():
+    src = (Path(__file__).resolve().parents[1] / "k8fy" / "skills" / "cold_services.py").read_text()
     assert "Dict[str, Any] | None" not in src
     assert "Optional[Dict[str, Any]]" in src
 

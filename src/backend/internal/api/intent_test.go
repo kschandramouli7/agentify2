@@ -86,6 +86,48 @@ func TestInferIntent_Dependencies(t *testing.T) {
 	}
 }
 
+// TestInferIntent_ColdServices locks the routing rule for ROADMAP P31 phase
+// 2 (ADR 0038) — checked BEFORE the general dependencies branch, so a
+// decommission-flavored question never gets answered as a plain topology
+// report (or falls through to general_query when it never mentions a
+// graph keyword like "caller"/"entry point" at all).
+func TestInferIntent_ColdServices(t *testing.T) {
+	cases := []struct {
+		question string
+		want     string
+	}{
+		{"which services are cold in this namespace?", "cold_services"},
+		{"what's safe to decommission here?", "cold_services"},
+		{"are there any dead services in payments?", "cold_services"},
+		{"show me unused services", "cold_services"},
+		{"is payment-worker safe to delete?", "cold_services"},
+		{"payment-worker hasn't been called in weeks, can we remove it?", "cold_services"},
+
+		// Realistic but keyword-free phrasing legitimately falls through to
+		// general_query rather than forcing the keyword list to guess at
+		// arbitrary word orders — a false negative here is safe (the LLM
+		// path still answers), unlike a false positive.
+		{"has payment-worker been called recently?", "general_query"},
+
+		// Must still win over the general dependencies phrasing, not just
+		// stand alone.
+		{"which services have no callers and are safe to decommission?", "cold_services"},
+
+		// Diagnostic phrasing still wins over this too, same precedence as
+		// every other Tier-1 branch.
+		{"why does it look like payment-worker is dead?", "diagnose"},
+
+		// Not cold-services questions at all.
+		{"is payment healthy?", "health_check"},
+		{"who calls payment-api?", "dependencies"},
+	}
+	for _, c := range cases {
+		if got := inferIntent(c.question); got != c.want {
+			t.Errorf("inferIntent(%q) = %q, want %q", c.question, got, c.want)
+		}
+	}
+}
+
 // TestIsDependencyQuestion_RequiresBothHalves guards the helper directly, so a
 // change that drops either half fails here with a clear message rather than as
 // a confusing intent mismatch.

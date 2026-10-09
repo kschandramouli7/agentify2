@@ -45,6 +45,7 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 
 	// Admin: tracked namespace/service pairs (powers frontend autocomplete)
 	mux.HandleFunc("GET /admin/tracked", h.HandleTrackedEntities)
+	mux.HandleFunc("GET /admin/ingress-lookup", h.HandleIngressLookup)
 
 	// Admin: sync — discover namespaces/services from the adapter (live K8s list)
 	mux.HandleFunc("POST /admin/sync", h.HandleSyncNamespaces)
@@ -77,6 +78,8 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	// a collector's CollectorToken derives (tenant, cluster).
 	mux.HandleFunc("POST /api/scan-coverage", h.HandleScanCoverageUpsert)
 	mux.HandleFunc("GET /api/scan-coverage", h.HandleScanCoverageList)
+	mux.HandleFunc("GET /api/cold-services", h.HandleColdServicesList)
+	mux.HandleFunc("GET /api/cross-cluster-pairs", h.HandleCrossClusterPairsList)
 	mux.HandleFunc("POST /api/security-findings", h.HandleSecurityFindingsUpsert)
 	mux.HandleFunc("GET /api/security-findings", h.HandleSecurityFindingsList)
 

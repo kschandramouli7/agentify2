@@ -453,6 +453,17 @@ _NEEDS_SYNTHESIS_RE = re.compile(
     r"|deploy|rollout|changed|scale|rollback|fix|remediat)"
 )
 
+# ROADMAP P31 phase 2 (cold services, ADR 0038). Kept in sync with
+# coldServicesKeywordRE in src/backend/internal/api/handlers.go — same
+# reasoning as _DEPENDENCY_QUESTION_RE's own sync comment above. Checked
+# before _DEPENDENCY_QUESTION_RE in _chat_route: "which services are safe
+# to decommission" is a more specific question about the same graph.
+_COLD_SERVICES_KEYWORD_RE = re.compile(
+    r"\b(cold service|service.{0,15}\bcold\b|stale service|dead service|unused service"
+    r"|decommission|safe to (delete|remove|decommission)|no longer (used|called|needed)"
+    r"|hasn'?t been called|not been called)"
+)
+
 
 def _latest_user_text(messages: List[Dict[str, Any]]) -> str:
     """The most recent user turn, as text.
@@ -563,9 +574,15 @@ def _chat_route(messages: List[Dict[str, Any]]) -> Optional[str]:
     if _TRACE_TRIGGER_RE.match(latest_raw):
         return "trace"
     lowered = latest_raw.lower()
-    if not _DEPENDENCY_QUESTION_RE.search(lowered):
-        return None
+    # Diagnostic/synthesis phrasing wins over EITHER deterministic route, same
+    # precedence Go's inferIntent gets from checking "diagnose" first: "why
+    # does payment-worker look dead?" is a diagnosis, not a cold-services
+    # report, even though it matches _COLD_SERVICES_KEYWORD_RE too.
     if _NEEDS_SYNTHESIS_RE.search(lowered):
+        return None
+    if _COLD_SERVICES_KEYWORD_RE.search(lowered):
+        return "cold_services"
+    if not _DEPENDENCY_QUESTION_RE.search(lowered):
         return None
     return "dependencies"
 

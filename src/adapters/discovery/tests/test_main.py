@@ -191,14 +191,17 @@ async def test_scan_health_sums_pod_counts_across_namespaces_and_uses_caps_versi
 
     pushed = {}
 
-    async def fake_push(k8s_version, pods_total, pods_ready, backend_url, token):
-        pushed.update(k8s_version=k8s_version, pods_total=pods_total, pods_ready=pods_ready)
+    async def fake_push(k8s_version, pods_total, pods_ready, backend_url, token, platform=""):
+        pushed.update(k8s_version=k8s_version, pods_total=pods_total, pods_ready=pods_ready, platform=platform)
 
     monkeypatch.setattr(main, "push_health", fake_push)
 
     await _scan_health(["payments", "checkout"], _cfg(), {"gitVersion": "v1.30.0"})
 
-    assert pushed == {"k8s_version": "v1.30.0", "pods_total": 8, "pods_ready": 7}
+    # platform is "" here: a plain "v1.30.0" matches neither the EKS nor GKE
+    # vendor suffix and carries no openshift_route key (platform-labeling
+    # extension, 2026-10-09).
+    assert pushed == {"k8s_version": "v1.30.0", "pods_total": 8, "pods_ready": 7, "platform": ""}
 
 
 @pytest.mark.asyncio
@@ -207,12 +210,14 @@ async def test_scan_health_still_pushes_counts_when_caps_is_none(monkeypatch):
 
     pushed = {}
 
-    async def fake_push(k8s_version, pods_total, pods_ready, backend_url, token):
-        pushed.update(k8s_version=k8s_version, pods_total=pods_total, pods_ready=pods_ready)
+    async def fake_push(k8s_version, pods_total, pods_ready, backend_url, token, platform=""):
+        pushed.update(k8s_version=k8s_version, pods_total=pods_total, pods_ready=pods_ready, platform=platform)
 
     monkeypatch.setattr(main, "push_health", fake_push)
 
     await _scan_health(["payments"], _cfg(), None)
+
+    assert pushed["platform"] == ""
 
 
 # ── _scan_metrics / _scan_certificates (ADR 0027, merged from the retired

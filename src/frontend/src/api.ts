@@ -438,9 +438,13 @@ export type ServiceDependency = {
    *    external         a public hostname, validated against NOTHING — there
    *                     is no Service list for the internet, so this tier
    *                     rests on hostname-shape heuristics alone
+   *    cross_cluster    a hostname validated against a REAL Ingress/Route
+   *                     elsewhere in this tenant's fleet (ROADMAP P31 phase
+   *                     1) — as trustworthy as cross_namespace, since it's
+   *                     checked against a real object, not a shape guess
    *
    *  Absent on rows written before the column existed; treat as "service". */
-  target_kind?: "service" | "cross_namespace" | "external";
+  target_kind?: "service" | "cross_namespace" | "external" | "cross_cluster";
   first_seen: string;
   last_seen: string;
   tenant_id: string;
@@ -490,6 +494,21 @@ export type ServiceDependency = {
    *  means no caller-pod evidence has recorded a source yet, not that the
    *  edge is unconfirmed. */
   sources?: string[];
+  /** ROADMAP P31 phase 1 (cross-cluster call capture). The resolved
+   *  cluster_id of to_service's ingress host when target_kind ===
+   *  "cross_cluster". Absent/"" means either not cross-cluster, or the
+   *  host matched more than one cluster's ingress entries and was
+   *  deliberately left unattributed — never guessed. */
+  target_cluster_id?: string;
+  /** Platform-labeling extension (2026-10-09). Which managed K8s platform
+   *  ran each end — "openshift" | "eks" | "gke" | absent (undetected).
+   *  `platform` is the OBSERVING cluster's (sd.cluster_id — every edge has
+   *  one); `target_platform` only populates once target_cluster_id has
+   *  resolved to exactly one cluster. Joined in at read time from
+   *  cluster_health_snapshots, never stored on the edge row. Absent/""
+   *  means undetected, never a guess. */
+  platform?: string;
+  target_platform?: string;
 };
 
 /** One entry point into the cluster from outside — an Ingress, Gateway
@@ -678,6 +697,59 @@ export function rejectSecurityEngagement(id: string): Promise<SecurityEngagement
 export async function listServiceDependencies(namespace: string): Promise<ServiceDependency[]> {
   const res = await fetch(`/api/service-dependencies?namespace=${encodeURIComponent(namespace)}`);
   if (!res.ok) throw new Error(`Failed to load service dependencies (${res.status})`);
+  return res.json();
+}
+
+/** One service whose call-graph evidence has gone quiet while scanning
+ *  stayed healthy (ROADMAP P31 phase 2, ADR 0038) — a decommission
+ *  candidate, not a decommission order: it reflects mined log evidence
+ *  only. `last_seen` absent means the service has NEVER had any edge
+ *  evidence at all, a stronger cold signal than "had some, now stale". */
+export type ColdService = {
+  namespace: string;
+  service: string;
+  last_seen?: string;
+  last_scan: string;
+};
+
+export async function listColdServices(
+  namespace: string, staleDays?: number, scannedWithinDays?: number,
+): Promise<ColdService[]> {
+  const params = new URLSearchParams({ namespace });
+  if (staleDays !== undefined) params.set("stale_days", String(staleDays));
+  if (scannedWithinDays !== undefined) params.set("scanned_within_days", String(scannedWithinDays));
+  const res = await fetch(`/api/cold-services?${params.toString()}`);
+  if (!res.ok) return [];   // best-effort: a failed cold-services check must not blank the panel
+  return res.json();
+}
+
+/** One cluster's state for a CrossClusterPair's service (ROADMAP P31 phase
+ *  3, ADR 0039). `cold` uses the exact same definition ColdService above
+ *  does — scanned recently, not seen recently (or never). */
+export type CrossClusterSide = {
+  cluster_id: string;
+  last_seen?: string;
+  last_scan?: string;
+  cold: boolean;
+};
+
+/** A service present in more than one cluster for this tenant+namespace —
+ *  convention-based pairing only (same name, different cluster_id). Says
+ *  nothing about which side is "old" vs "new", only which side(s) are cold. */
+export type CrossClusterPair = {
+  namespace: string;
+  service: string;
+  sides: CrossClusterSide[];
+};
+
+export async function listCrossClusterPairs(
+  namespace: string, staleDays?: number, scannedWithinDays?: number,
+): Promise<CrossClusterPair[]> {
+  const params = new URLSearchParams({ namespace });
+  if (staleDays !== undefined) params.set("stale_days", String(staleDays));
+  if (scannedWithinDays !== undefined) params.set("scanned_within_days", String(scannedWithinDays));
+  const res = await fetch(`/api/cross-cluster-pairs?${params.toString()}`);
+  if (!res.ok) return [];   // best-effort: a failed pairing check must not blank the panel
   return res.json();
 }
 

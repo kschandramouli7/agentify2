@@ -19,6 +19,7 @@ type fakeClusterHealthStore struct {
 	lastK8sVersion string
 	lastPodsTotal  int
 	lastPodsReady  int
+	lastPlatform   string
 	snapshots      []pgstore.ClusterHealthSnapshot
 	listErr        error
 
@@ -34,12 +35,13 @@ func (f *fakeClusterHealthStore) ListServiceHealth(ctx context.Context, tenantID
 	return f.serviceHealth[namespace], nil
 }
 
-func (f *fakeClusterHealthStore) UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int) error {
+func (f *fakeClusterHealthStore) UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int, platform string) error {
 	f.lastTenantID = tenantID
 	f.lastClusterID = clusterID
 	f.lastK8sVersion = k8sVersion
 	f.lastPodsTotal = podsTotal
 	f.lastPodsReady = podsReady
+	f.lastPlatform = platform
 	return nil
 }
 
@@ -102,7 +104,7 @@ func TestHandleClusterHealthUpsert(t *testing.T) {
 		}
 		chStore := &fakeClusterHealthStore{}
 		h := &Handler{integrationStore: integStore, clusterHealthStore: chStore}
-		body := `{"k8s_version":"v1.30.0","pods_total":10,"pods_ready":8}`
+		body := `{"k8s_version":"v1.28.5-eks-abc123","pods_total":10,"pods_ready":8,"platform":"eks"}`
 		req := httptest.NewRequest(http.MethodPost, "/api/cluster-health", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer real-token")
 		w := httptest.NewRecorder()
@@ -115,8 +117,12 @@ func TestHandleClusterHealthUpsert(t *testing.T) {
 		if chStore.lastTenantID != "tenant-a" || chStore.lastClusterID != "cluster-42" {
 			t.Errorf("UpsertClusterHealthSnapshot called with wrong tenant/cluster: %q/%q", chStore.lastTenantID, chStore.lastClusterID)
 		}
-		if chStore.lastK8sVersion != "v1.30.0" || chStore.lastPodsTotal != 10 || chStore.lastPodsReady != 8 {
+		if chStore.lastK8sVersion != "v1.28.5-eks-abc123" || chStore.lastPodsTotal != 10 || chStore.lastPodsReady != 8 {
 			t.Errorf("UpsertClusterHealthSnapshot values: got version=%q total=%d ready=%d", chStore.lastK8sVersion, chStore.lastPodsTotal, chStore.lastPodsReady)
+		}
+		// Platform-labeling extension (2026-10-09).
+		if chStore.lastPlatform != "eks" {
+			t.Errorf("UpsertClusterHealthSnapshot platform: want %q, got %q", "eks", chStore.lastPlatform)
 		}
 	})
 
@@ -168,8 +174,8 @@ func TestHandleClusterHealthList(t *testing.T) {
 
 	t.Run("returns every cluster's snapshot for the tenant", func(t *testing.T) {
 		chStore := &fakeClusterHealthStore{snapshots: []pgstore.ClusterHealthSnapshot{
-			{ClusterID: "cluster-a", K8sVersion: "v1.29.0", PodsTotal: 10, PodsReady: 8},
-			{ClusterID: "cluster-b", K8sVersion: "v1.30.0", PodsTotal: 5, PodsReady: 5},
+			{ClusterID: "cluster-a", K8sVersion: "v1.29.0-eks-abc123", PodsTotal: 10, PodsReady: 8, Platform: "eks"},
+			{ClusterID: "cluster-b", K8sVersion: "v1.30.0", PodsTotal: 5, PodsReady: 5, Platform: ""},
 		}}
 		h := &Handler{clusterHealthStore: chStore}
 		req := httptest.NewRequest(http.MethodGet, "/api/cluster-health", nil)
@@ -182,6 +188,11 @@ func TestHandleClusterHealthList(t *testing.T) {
 		}
 		if !strings.Contains(w.Body.String(), "cluster-a") || !strings.Contains(w.Body.String(), "cluster-b") {
 			t.Errorf("body: want both clusters, got %s", w.Body.String())
+		}
+		// Platform-labeling extension (2026-10-09): must pass through, not
+		// be dropped by clusterHealthSnapshotEntry's own wire shape.
+		if !strings.Contains(w.Body.String(), `"platform":"eks"`) {
+			t.Errorf("body: want platform=eks for cluster-a, got %s", w.Body.String())
 		}
 	})
 }

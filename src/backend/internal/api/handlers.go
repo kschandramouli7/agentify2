@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -763,6 +764,16 @@ func inferIntent(question string) string {
 			return "metrics_history"
 		}
 	}
+	// Cold services / decommission readiness (ROADMAP P31 phase 2, ADR
+	// 0038). Checked BEFORE the general dependencies branch below: "which
+	// services are safe to decommission" is a more specific question about
+	// the same graph, and would otherwise match dependencyKeywordRE's
+	// "entry point"/"caller"/"callee" style terms too loosely or fall
+	// through to general_query for phrasing that never mentions a graph
+	// keyword at all (e.g. "what's safe to decommission here?").
+	if coldServicesKeywordRE.MatchString(lower) {
+		return "cold_services"
+	}
 	// Service dependencies (ROADMAP P18 use case #2). LAST on purpose: the
 	// deterministic answer can only talk about the mined call graph, so any
 	// question that also touches another domain must go to the branch that owns
@@ -777,6 +788,11 @@ func inferIntent(question string) string {
 	}
 	return "general_query"
 }
+
+// coldServicesKeywordRE: which services have gone cold, kept in sync with
+// COLD_SERVICES_KEYWORD_RE in src/agent/k8fy/agent.py (same reasoning as
+// dependencyKeywordRE's own sync-comment below).
+var coldServicesKeywordRE = regexp.MustCompile(`\b(cold service|service.{0,15}\bcold\b|stale service|dead service|unused service|decommission|safe to (delete|remove|decommission)|no longer (used|called|needed)|hasn'?t been called|not been called)`)
 
 // Keyword sets for isDependencyQuestion, as word-PREFIX matches (`\b` + stem),
 // not bare substring matches.
@@ -1993,6 +2009,11 @@ type serviceDependencyUpsertRequest struct {
 	// a phantom entry when empty" rule.
 	MatchKind string `json:"match_kind"`
 	Source    string `json:"source"`
+	// ROADMAP P31 phase 1 (cross-cluster call capture, ADR 0037). "" when
+	// target_kind != "cross_cluster", or when Discovery's ingress-lookup
+	// found no single resolvable cluster — same explicit-never-omitted
+	// convention every other optional field on this request already follows.
+	TargetClusterID string `json:"target_cluster_id"`
 }
 
 // HandleServiceDependencyUpsert records one piece of mined evidence for a
@@ -2270,7 +2291,12 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 	// The kind is taken from the body rather than inferred: only the miner
 	// knows which tier produced the edge, and guessing from the string shape
 	// here would silently reclassify edges on a format change.
-	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), id, tenantID, clusterID, req.Namespace, req.FromService, req.ToService, req.TargetKind, req.Port, req.Outcome, req.Path, req.CallerPod, req.MatchKind, req.Source); err != nil {
+	if err := h.serviceDepsStore.UpsertServiceDependency(r.Context(), pgstore.ServiceDependencyUpsert{
+		ID: id, TenantID: tenantID, ClusterID: clusterID, Namespace: req.Namespace,
+		FromService: req.FromService, ToService: req.ToService, TargetKind: req.TargetKind,
+		Port: req.Port, Outcome: req.Outcome, Path: req.Path, CallerPod: req.CallerPod,
+		MatchKind: req.MatchKind, Source: req.Source, TargetClusterID: req.TargetClusterID,
+	}); err != nil {
 		h.logger.Warn("failed to upsert service dependency", "namespace", req.Namespace, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -2534,11 +2560,71 @@ func (h *Handler) HandleClusterIngressList(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, clusterIngressListResponse{Entries: entries})
 }
 
+type ingressLookupResponse struct {
+	ClusterIDs []string `json:"cluster_ids"`
+}
+
+// HandleIngressLookup answers "which cluster(s), if any, front this
+// hostname with an Ingress/Route?" — fleet-wide, tenant-scoped (not
+// cluster-scoped), same precedent as HandleTrackedEntities: resolves
+// tenant only and answers across every cluster that tenant owns. Consumed
+// by Discovery's cross-cluster-capture lookup (ROADMAP P31 phase 1, ADR
+// 0037) to promote an "external"-shaped hostname mention to the validated
+// cross_cluster tier.
+//
+// Deliberately excludes the CALLING cluster's own id from the result: a
+// cluster calling its own public ingress hostname is a self-loop, not a
+// cross-cluster migration signal — resolveTenantContext already derives
+// the caller's clusterID from its CollectorToken (ADR 0022), so no
+// client-side identity is trusted from the request itself.
+func (h *Handler) HandleIngressLookup(w http.ResponseWriter, r *http.Request) {
+	host := r.URL.Query().Get("host")
+	if host == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+	if h.clusterIngressStore == nil {
+		writeJSON(w, http.StatusOK, ingressLookupResponse{ClusterIDs: []string{}})
+		return
+	}
+	tenantID, callerClusterID, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	var kinds []string
+	if raw := r.URL.Query().Get("kinds"); raw != "" {
+		kinds = strings.Split(raw, ",")
+	}
+	clusterIDs, err := h.clusterIngressStore.ResolveIngressHost(r.Context(), tenantID, host, kinds)
+	if err != nil {
+		h.logger.Warn("ingress lookup failed", "host", host, "error", err)
+		writeJSON(w, http.StatusOK, ingressLookupResponse{ClusterIDs: []string{}})
+		return
+	}
+	filtered := make([]string, 0, len(clusterIDs))
+	for _, id := range clusterIDs {
+		if id != callerClusterID {
+			filtered = append(filtered, id)
+		}
+	}
+	writeJSON(w, http.StatusOK, ingressLookupResponse{ClusterIDs: filtered})
+}
+
 // clusterHealthUpsertRequest is the body accepted by POST /api/cluster-health.
 type clusterHealthUpsertRequest struct {
 	K8sVersion string `json:"k8s_version"`
 	PodsTotal  int    `json:"pods_total"`
 	PodsReady  int    `json:"pods_ready"`
+	// Platform-labeling extension (2026-10-09): "openshift" | "eks" | "gke"
+	// | "" — see Discovery's k8s_client.py detect_platform. "" means
+	// undetected, never a guess.
+	Platform string `json:"platform"`
 }
 
 // HandleClusterHealthUpsert records the fleet collector's health/version
@@ -2574,7 +2660,7 @@ func (h *Handler) HandleClusterHealthUpsert(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-	if err := h.clusterHealthStore.UpsertClusterHealthSnapshot(r.Context(), tenantID, clusterID, req.K8sVersion, req.PodsTotal, req.PodsReady); err != nil {
+	if err := h.clusterHealthStore.UpsertClusterHealthSnapshot(r.Context(), tenantID, clusterID, req.K8sVersion, req.PodsTotal, req.PodsReady, req.Platform); err != nil {
 		h.logger.Warn("failed to upsert cluster health snapshot", "cluster_id", clusterID, "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -2592,6 +2678,7 @@ type clusterHealthSnapshotEntry struct {
 	PodsTotal  int       `json:"pods_total"`
 	PodsReady  int       `json:"pods_ready"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	Platform   string    `json:"platform"`
 }
 
 // clusterHealthListResponse is the body returned by GET /api/cluster-health.
@@ -2634,6 +2721,7 @@ func (h *Handler) HandleClusterHealthList(w http.ResponseWriter, r *http.Request
 		snapshots = append(snapshots, clusterHealthSnapshotEntry{
 			ClusterID: row.ClusterID, K8sVersion: row.K8sVersion,
 			PodsTotal: row.PodsTotal, PodsReady: row.PodsReady, UpdatedAt: row.UpdatedAt,
+			Platform: row.Platform,
 		})
 	}
 	writeJSON(w, http.StatusOK, clusterHealthListResponse{Snapshots: snapshots})
@@ -2780,6 +2868,48 @@ func (h *Handler) HandleServiceProfileList(w http.ResponseWriter, r *http.Reques
 		profiles = []pgstore.ServiceProfile{}
 	}
 	writeJSON(w, http.StatusOK, profiles)
+}
+
+// HandleCrossClusterPairsList answers "which services in this namespace
+// exist in more than one cluster, and is each side cold or warm" (ROADMAP
+// P31 phase 3, ADR 0039) — convention-based pairing only (same-named
+// service across cluster_id), store-only for this pass: no chat intent
+// consumes this yet, same deliberate scope boundary ClusterIngressStore's
+// own comment already states for its own surface. The only consumer is the
+// cold-services UI toggle, which calls this to annotate a cold service with
+// "also seen in cluster X" when a pair exists.
+func (h *Handler) HandleCrossClusterPairsList(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if h.clusterServiceStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.CrossClusterPair{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	staleDays := intQueryParam(r, "stale_days", 14)
+	scannedWithinDays := intQueryParam(r, "scanned_within_days", 2)
+	pairs, err := h.clusterServiceStore.ListCrossClusterPairs(r.Context(), tenantID, namespace, staleDays, scannedWithinDays)
+	if err != nil {
+		h.logger.Warn("failed to list cross-cluster pairs", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.CrossClusterPair{})
+		return
+	}
+	if pairs == nil {
+		pairs = []pgstore.CrossClusterPair{}
+	}
+	writeJSON(w, http.StatusOK, pairs)
 }
 
 func (h *Handler) HandleClusterServiceSelectors(w http.ResponseWriter, r *http.Request) {
@@ -2947,4 +3077,56 @@ func (h *Handler) HandleServiceDependencyList(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, deps)
+}
+
+// intQueryParam parses an optional integer query param, falling back to
+// def on absence or a malformed value — thresholds here are a tuning knob,
+// never worth failing the whole request over.
+func intQueryParam(r *http.Request, key string, def int) int {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// HandleColdServicesList answers "which services in this namespace have
+// gone quiet, not just unscanned" (ROADMAP P31 phase 2, ADR 0038) — a
+// deterministic read over service_dependencies.last_seen and
+// scan_coverage.last_scan, no schema change needed. Defaults (14 days
+// stale, scanned within 2 days) are tunable via query param, not
+// hardcoded — same empty-list-not-error shape as HandleServiceDependencyList.
+func (h *Handler) HandleColdServicesList(w http.ResponseWriter, r *http.Request) {
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		http.Error(w, "namespace is required", http.StatusBadRequest)
+		return
+	}
+	if h.serviceDepsStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.ColdService{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	staleDays := intQueryParam(r, "stale_days", 14)
+	scannedWithinDays := intQueryParam(r, "scanned_within_days", 2)
+	cold, err := h.serviceDepsStore.ListColdServices(r.Context(), tenantID, namespace, staleDays, scannedWithinDays)
+	if err != nil {
+		h.logger.Warn("failed to list cold services", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.ColdService{})
+		return
+	}
+	writeJSON(w, http.StatusOK, cold)
 }

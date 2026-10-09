@@ -554,6 +554,18 @@ func (c *Client) initSchema(ctx context.Context) error {
 	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS qualified_match_count INT NOT NULL DEFAULT 0;
 	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS bare_match_count INT NOT NULL DEFAULT 0;
 
+	-- ROADMAP P31 phase 1 (cross-cluster call capture): target_cluster_id is
+	-- the resolved cluster_id of to_service's ingress host — distinct from
+	-- cluster_id, which means "the cluster that OBSERVED/pushed this row"
+	-- (the caller's side). Only ever populated when target_kind =
+	-- 'cross_cluster'. '' means either "not a cross-cluster edge" or "host
+	-- matched more than one cluster's ingress entries, deliberately left
+	-- unresolved" — never guessed, same honesty convention as every other
+	-- ''/0 sentinel here. No row-splitting needed (unlike port/path): this
+	-- is evidence ABOUT the edge, same category as qualified_match_count,
+	-- not a different edge.
+	ALTER TABLE IF EXISTS service_dependencies ADD COLUMN IF NOT EXISTS target_cluster_id TEXT NOT NULL DEFAULT '';
+
 	-- ROADMAP P27 phase 4: caller cardinality. One row per (edge, pod_name)
 	-- ever seen -- deliberately a CHILD table, not a column on
 	-- service_dependencies, because this is a SET relationship ("which pods
@@ -721,6 +733,12 @@ func (c *Client) initSchema(ctx context.Context) error {
 		PRIMARY KEY (tenant_id, cluster_id, namespace, kind, name, host, backend_service)
 	);
 	CREATE INDEX IF NOT EXISTS idx_cluster_ingress_lookup ON cluster_ingress_endpoints(tenant_id, namespace, backend_service);
+	-- ROADMAP P31 phase 1 (cross-cluster call capture): the reverse lookup
+	-- direction — "what does this hostname resolve to" — which
+	-- idx_cluster_ingress_lookup above cannot serve (it has no host
+	-- column). Partial (WHERE host != '') since a mapping with only its
+	-- backend_service side known is never a candidate for this lookup.
+	CREATE INDEX IF NOT EXISTS idx_cluster_ingress_host_lookup ON cluster_ingress_endpoints(tenant_id, host) WHERE host != '';
 
 	ALTER TABLE IF EXISTS cluster_ingress_endpoints ENABLE ROW LEVEL SECURITY;
 	ALTER TABLE IF EXISTS cluster_ingress_endpoints FORCE ROW LEVEL SECURITY;
@@ -792,6 +810,18 @@ func (c *Client) initSchema(ctx context.Context) error {
 		updated_at  TIMESTAMP DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_cluster_health_snapshots_tenant ON cluster_health_snapshots(tenant_id);
+
+	-- Platform-labeling extension to ROADMAP P31 phase 1 (ADR 0037): which
+	-- managed K8s platform this cluster runs ("openshift" | "eks" | "gke" |
+	-- ""), detected once per collector-pod lifetime from facts Discovery's
+	-- discover_api_capabilities() already gathers (no new API call, no new
+	-- RBAC — see k8s_client.py's detect_platform). '' means undetected,
+	-- never a guess — same sentinel convention every other optional column
+	-- here follows. Lets a cross-cluster edge join in BOTH ends' platform at
+	-- read time (ListServiceDependencies) so the diagram can show "this call
+	-- leaves an OpenShift cluster for an EKS one" instead of an opaque
+	-- cluster_id.
+	ALTER TABLE IF EXISTS cluster_health_snapshots ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT '';
 
 	ALTER TABLE IF EXISTS cluster_health_snapshots ENABLE ROW LEVEL SECURITY;
 	ALTER TABLE IF EXISTS cluster_health_snapshots FORCE ROW LEVEL SECURITY;
@@ -2274,35 +2304,35 @@ func (c *Client) UpsertModelPricing(ctx context.Context, p *ModelPricing) error 
 // ServiceDependency is one directed edge in the mined service-call graph:
 // from_service was observed (via log text) calling to_service, within namespace.
 type ServiceDependency struct {
-	ID            string    `json:"id"`
-	Namespace     string    `json:"namespace"`
-	FromService   string    `json:"from_service"`
-	ToService     string    `json:"to_service"`
-	EvidenceCount int       `json:"evidence_count"`
+	ID            string `json:"id"`
+	Namespace     string `json:"namespace"`
+	FromService   string `json:"from_service"`
+	ToService     string `json:"to_service"`
+	EvidenceCount int    `json:"evidence_count"`
 	// "service" | "cross_namespace" | "external" — see the schema note. The
 	// UI must keep the tiers visually distinct; the external tier is a
 	// heuristic, not a validated fact.
-	TargetKind    string    `json:"target_kind"`
-	FirstSeen     time.Time `json:"first_seen"`
-	LastSeen      time.Time `json:"last_seen"`
-	TenantID      string    `json:"tenant_id"`
-	ClusterID     string    `json:"cluster_id,omitempty"`
+	TargetKind string    `json:"target_kind"`
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+	TenantID   string    `json:"tenant_id"`
+	ClusterID  string    `json:"cluster_id,omitempty"`
 	// ROADMAP P27 phase 2. Port is 0 when never captured for this edge (only
 	// the bare host:port log form carries one) — a row is now split by port,
 	// so two ports for the same (from, to) pair are two distinct rows, one of
 	// which may be port=0 (unknown). The outcome counters are cumulative
 	// since first_seen; there is no separate "unknown" counter because it is
 	// EvidenceCount minus the sum of the three below.
-	Port                 int `json:"port"`
+	Port int `json:"port"`
 	// ROADMAP P27 phase 4. "" when never captured — a row is now also split
 	// by path, so two paths on the same (from, to, port) are two distinct
 	// rows. Already normalized before it reaches here (see
 	// k8fy/service_topology.py's _normalize_path): /orders/12345 arrives as
 	// /orders/:id, never the raw, unboundedly-cardinal original.
-	Path                 string `json:"path"`
-	OutcomeSuccessCount  int `json:"outcome_success_count"`
-	OutcomeFailureCount  int `json:"outcome_failure_count"`
-	OutcomeTimeoutCount  int `json:"outcome_timeout_count"`
+	Path                string `json:"path"`
+	OutcomeSuccessCount int    `json:"outcome_success_count"`
+	OutcomeFailureCount int    `json:"outcome_failure_count"`
+	OutcomeTimeoutCount int    `json:"outcome_timeout_count"`
 	// ROADMAP P27 phase 4 (provenance). Cumulative since first_seen, same
 	// shape as the three outcome counters above — evidence QUALITY about
 	// this edge, not a different edge, so no row-splitting the way
@@ -2331,6 +2361,24 @@ type ServiceDependency struct {
 	// source evidence yet serializes as [], not null, so the frontend never
 	// has to special-case "missing" vs "known empty".
 	Sources []string `json:"sources"`
+	// ROADMAP P31 phase 1 (cross-cluster call capture). The resolved
+	// cluster_id of ToService's ingress host when TargetKind ==
+	// "cross_cluster" — stored directly on the row (unlike CallerPodCount/
+	// Sources above, which are derived at read time), since it's a
+	// per-observation fact about the edge itself, not an aggregate over a
+	// child table. "" means not cross-cluster, or resolved ambiguously
+	// across more than one cluster and deliberately left unattributed.
+	TargetClusterID string `json:"target_cluster_id,omitempty"`
+	// Platform-labeling extension (2026-10-09): both ends' detected
+	// platform ("openshift" | "eks" | "gke" | ""), joined in at read time
+	// from cluster_health_snapshots (never stored on this row — same
+	// "derive, don't store the aggregate" posture ExpectedFailureReason
+	// above already uses). Platform is the OBSERVING cluster's (every edge
+	// has one); TargetPlatform only populates when TargetClusterID resolved
+	// to exactly one cluster. "" means undetected or not applicable, never
+	// a guess.
+	Platform       string `json:"platform,omitempty"`
+	TargetPlatform string `json:"target_platform,omitempty"`
 }
 
 // UpsertServiceDependency records one piece of evidence for a from->to edge —
@@ -2374,9 +2422,30 @@ func setTenantContext(ctx context.Context, tx *sql.Tx, tenantID string) error {
 // counters below, same sentinel convention as outcome. source rides
 // alongside callerPod into service_dependency_callers — like callerPod, an
 // empty source means nothing to record there, never a phantom entry.
-func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod, matchKind, source string) error {
-	if targetKind == "" {
-		targetKind = "service" // an older collector reports only validated edges
+//
+// ServiceDependencyUpsert is one piece of evidence for a from->to edge —
+// replaces what used to be a 14-positional-parameter call (and was about
+// to grow to 15 with TargetClusterID below) with a struct, so a future
+// field never forces another signature change at every call site again
+// (ROADMAP P31 phase 1 / ADR 0037).
+type ServiceDependencyUpsert struct {
+	ID, TenantID, ClusterID, Namespace string
+	FromService, ToService, TargetKind string
+	Port                               int
+	Outcome, Path, CallerPod           string
+	MatchKind, Source                  string
+	// TargetClusterID is the resolved cluster_id of ToService's ingress
+	// host — distinct from ClusterID (the cluster that OBSERVED this edge,
+	// the caller's side). Only ever populated when TargetKind ==
+	// "cross_cluster". "" means either not a cross-cluster edge, or the
+	// host matched more than one cluster's ingress entries and was
+	// deliberately left unresolved — never guessed.
+	TargetClusterID string
+}
+
+func (c *Client) UpsertServiceDependency(ctx context.Context, in ServiceDependencyUpsert) error {
+	if in.TargetKind == "" {
+		in.TargetKind = "service" // an older collector reports only validated edges
 	}
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2384,19 +2453,20 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
-	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+	if err := setTenantContext(ctx, tx, in.TenantID); err != nil {
 		return fmt.Errorf("set tenant context: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, port, path,
 		                                   evidence_count, outcome_success_count, outcome_failure_count, outcome_timeout_count,
-		                                   qualified_match_count, bare_match_count, first_seen, last_seen)
+		                                   qualified_match_count, bare_match_count, target_cluster_id, first_seen, last_seen)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1,
 		        CASE WHEN $10 = 'success' THEN 1 ELSE 0 END,
 		        CASE WHEN $10 = 'failure' THEN 1 ELSE 0 END,
 		        CASE WHEN $10 = 'timeout' THEN 1 ELSE 0 END,
 		        CASE WHEN $11 = 'qualified' THEN 1 ELSE 0 END,
 		        CASE WHEN $11 = 'bare' THEN 1 ELSE 0 END,
+		        $12,
 		        NOW(), NOW())
 		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path) DO UPDATE SET
 		  evidence_count         = service_dependencies.evidence_count + 1,
@@ -2408,20 +2478,26 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, id, tenantID, clus
 		  -- Kind can be corrected on a later sighting (a host first seen as
 		  -- external, later resolved as cross-namespace once its namespace is
 		  -- tracked) but never downgraded to the default by an older caller.
-		  target_kind    = COALESCE(NULLIF(EXCLUDED.target_kind, ''), service_dependencies.target_kind),
+		  target_kind       = COALESCE(NULLIF(EXCLUDED.target_kind, ''), service_dependencies.target_kind),
+		  -- Same never-downgrade rule (ROADMAP P31 phase 1 / ADR 0037): a
+		  -- resolved cluster_id from one sighting must survive a later
+		  -- sighting that couldn't resolve one (e.g. the ingress-lookup
+		  -- was briefly ambiguous).
+		  target_cluster_id = COALESCE(NULLIF(EXCLUDED.target_cluster_id, ''), service_dependencies.target_cluster_id),
 		  last_seen      = NOW()`,
-		id, namespace, fromService, toService, tenantID, clusterID, targetKind, port, path, outcome, matchKind)
+		in.ID, in.Namespace, in.FromService, in.ToService, in.TenantID, in.ClusterID, in.TargetKind, in.Port, in.Path,
+		in.Outcome, in.MatchKind, in.TargetClusterID)
 	if err != nil {
 		return err
 	}
-	if callerPod != "" {
+	if in.CallerPod != "" {
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO service_dependency_callers (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name, source,
 			                                          first_seen, last_seen)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 			ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path, pod_name, source) DO UPDATE SET
 			  last_seen = NOW()`,
-			tenantID, clusterID, namespace, fromService, toService, port, path, callerPod, source)
+			in.TenantID, in.ClusterID, in.Namespace, in.FromService, in.ToService, in.Port, in.Path, in.CallerPod, in.Source)
 		if err != nil {
 			return err
 		}
@@ -2538,6 +2614,228 @@ func (c *Client) ListScanCoverage(ctx context.Context, tenantID, namespace strin
 	return result, nil
 }
 
+// ColdService is one (namespace, service) whose call-graph evidence has
+// gone quiet while scanning stayed healthy — the "actually decommissioned,
+// not just unobserved" signal ROADMAP P31 phase 2 (ADR 0038) needs. LastSeen
+// is nil when the service has NEVER had any edge evidence at all — a
+// STRONGER cold signal than "had some, now stale" — same "nil means never,
+// not zero" honesty convention this package's other sentinel fields already
+// follow.
+type ColdService struct {
+	Namespace string     `json:"namespace"`
+	Service   string     `json:"service"`
+	LastSeen  *time.Time `json:"last_seen,omitempty"`
+	LastScan  time.Time  `json:"last_scan"`
+}
+
+// coldServiceWhereClause is the single definition of "cold" shared by
+// ListColdServices and ListCrossClusterPairs (ROADMAP P31 phases 2 and 3) —
+// factored out so the two queries' notion of "cold" cannot drift apart
+// independently if one is edited later without the other. Uses explicit
+// argument indices (%[1]d/%[2]d), not positional %d, so each caller's
+// fmt.Sprintf call states unambiguously which SQL parameter number binds to
+// which half: the FIRST Sprintf arg is the parameter number for the
+// "scanned within N days" check (last_scan), the SECOND is the parameter
+// number for the "stale for N days" check (last_seen) — regardless of
+// which $N those happen to be in that caller's own query.
+const coldServiceWhereClause = `last_scan >= NOW() - ($%[1]d || ' days')::interval
+  AND (last_seen IS NULL OR last_seen < NOW() - ($%[2]d || ' days')::interval)`
+
+// ListColdServices answers "which services in this namespace have gone
+// quiet, not just unscanned" (ROADMAP P31 phase 2, ADR 0038) — built
+// entirely from columns that already exist (service_dependencies.last_seen,
+// scan_coverage.last_scan), both already fleet-wide (neither
+// ListServiceDependencies nor ListScanCoverage filters by cluster_id, so
+// neither does this).
+//
+// Starting from scan_coverage (scanned) with a LEFT JOIN onto activity, not
+// the other way around, is the key correctness point: a service that was
+// scanned but has NEVER had any edge evidence at all has no row in
+// activity, and starting from activity would silently drop it — yet "scanned
+// recently, zero edges ever" is the STRONGEST cold signal there is, not an
+// absence to ignore.
+//
+// Deliberately has no target_kind filter at all: a service kept warm only
+// by a cross_cluster edge from elsewhere in the fleet (ROADMAP P31 phase 1)
+// must correctly read as not-cold — the entire reason this migration
+// feature exists is to see that traffic, not special-case it back out.
+func (c *Client) ListColdServices(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]ColdService, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	query := fmt.Sprintf(`
+		WITH last_activity AS (
+		    SELECT namespace, from_service AS service, MAX(last_seen) AS last_seen
+		    FROM service_dependencies WHERE namespace = $1 GROUP BY namespace, from_service
+		    UNION ALL
+		    SELECT namespace, to_service AS service, MAX(last_seen) AS last_seen
+		    FROM service_dependencies WHERE namespace = $1 GROUP BY namespace, to_service
+		),
+		activity AS (
+		    SELECT namespace, service, MAX(last_seen) AS last_seen
+		    FROM last_activity GROUP BY namespace, service
+		),
+		scanned AS (
+		    SELECT namespace, service, MAX(last_scan) AS last_scan
+		    FROM scan_coverage WHERE namespace = $1 GROUP BY namespace, service
+		)
+		SELECT sc.namespace, sc.service, a.last_seen, sc.last_scan
+		FROM scanned sc
+		LEFT JOIN activity a ON a.namespace = sc.namespace AND a.service = sc.service
+		WHERE `+coldServiceWhereClause+`
+		ORDER BY sc.service`,
+		3, // $3 = scannedWithinDays (bound below), the "scanned within" check
+		2, // $2 = staleDays (bound below), the "stale for" check
+	)
+	rows, err := tx.QueryContext(ctx, query, namespace, staleDays, scannedWithinDays)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []ColdService{}
+	for rows.Next() {
+		var s ColdService
+		var lastSeen sql.NullTime
+		if err := rows.Scan(&s.Namespace, &s.Service, &lastSeen, &s.LastScan); err != nil {
+			return nil, err
+		}
+		if lastSeen.Valid {
+			s.LastSeen = &lastSeen.Time
+		}
+		result = append(result, s)
+	}
+	return result, rows.Err()
+}
+
+// CrossClusterPair is one (namespace, service) present in more than one
+// cluster for this tenant (ROADMAP P31 phase 3, ADR 0039) — convention-based
+// only: paired purely on identical (namespace, service) name across
+// cluster_id, nothing here claims which side is "old" vs "new," only which
+// side(s) are cold per ListColdServices' own definition. Label-based pod
+// confirmation, an explicit mapping table, and any propose/confirm UI are
+// explicitly deferred — see ADR 0039's Consequences.
+type CrossClusterPair struct {
+	Namespace string             `json:"namespace"`
+	Service   string             `json:"service"`
+	Sides     []CrossClusterSide `json:"sides"`
+}
+
+// CrossClusterSide is one cluster's state for a CrossClusterPair's service.
+type CrossClusterSide struct {
+	ClusterID string     `json:"cluster_id"`
+	LastSeen  *time.Time `json:"last_seen,omitempty"`
+	LastScan  *time.Time `json:"last_scan,omitempty"`
+	Cold      bool       `json:"cold"`
+}
+
+// ListCrossClusterPairs finds services present in more than one cluster for
+// this tenant+namespace (ROADMAP P31 phase 3, ADR 0039) and reports each
+// side's cold/warm state using the exact same predicate ListColdServices
+// uses (coldServiceWhereClause) — factored into one shared constant so the
+// two queries' notion of "cold" cannot drift apart independently.
+//
+// Ground truth for "does this service exist in this cluster" is
+// cluster_services (the fleet inventory registry, refreshed every scan
+// cycle) rather than service_dependencies, which only proves something was
+// called — exactly the lagging/leading signal this feature layers cold/warm
+// evidence on TOP of, not what decides cluster membership.
+func (c *Client) ListCrossClusterPairs(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]CrossClusterPair, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	query := fmt.Sprintf(`
+		WITH cross_cluster_services AS (
+		    SELECT namespace, service, array_agg(DISTINCT cluster_id) AS cluster_ids
+		    FROM cluster_services
+		    WHERE namespace = $1
+		    GROUP BY namespace, service
+		    HAVING COUNT(DISTINCT cluster_id) > 1
+		),
+		per_cluster_activity_raw AS (
+		    SELECT namespace, cluster_id, from_service AS service, MAX(last_seen) AS last_seen
+		    FROM service_dependencies WHERE namespace = $1 GROUP BY namespace, cluster_id, from_service
+		    UNION ALL
+		    SELECT namespace, cluster_id, to_service AS service, MAX(last_seen) AS last_seen
+		    FROM service_dependencies WHERE namespace = $1 GROUP BY namespace, cluster_id, to_service
+		),
+		per_cluster_activity AS (
+		    SELECT namespace, cluster_id, service, MAX(last_seen) AS last_seen
+		    FROM per_cluster_activity_raw GROUP BY namespace, cluster_id, service
+		),
+		per_cluster_scanned AS (
+		    SELECT namespace, cluster_id, service, MAX(last_scan) AS last_scan
+		    FROM scan_coverage WHERE namespace = $1 GROUP BY namespace, cluster_id, service
+		)
+		SELECT ccs.namespace, ccs.service, pcs.cluster_id, pca.last_seen, pcs.last_scan,
+		       COALESCE(`+coldServiceWhereClause+`, false) AS cold
+		FROM cross_cluster_services ccs
+		JOIN unnest(ccs.cluster_ids) AS side_cluster_id ON true
+		JOIN per_cluster_scanned pcs
+		  ON pcs.namespace = ccs.namespace AND pcs.service = ccs.service AND pcs.cluster_id = side_cluster_id
+		LEFT JOIN per_cluster_activity pca
+		  ON pca.namespace = ccs.namespace AND pca.service = ccs.service AND pca.cluster_id = side_cluster_id
+		ORDER BY ccs.service, pcs.cluster_id`,
+		3, // $3 = scannedWithinDays, the "scanned within" half of coldServiceWhereClause
+		2, // $2 = staleDays, the "stale for" half
+	)
+	// COALESCE(..., false): a side with no scan_coverage row at all (joined
+	// INNER above, so this can't actually happen for a returned row, but the
+	// boolean expression itself is NULL-propagating if last_scan were ever
+	// NULL) must read as "not cold" rather than NULL, since Go's bool scan
+	// target cannot hold NULL.
+	rows, err := tx.QueryContext(ctx, query, namespace, staleDays, scannedWithinDays)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	order := []string{}
+	byService := map[string]*CrossClusterPair{}
+	for rows.Next() {
+		var ns, service, clusterID string
+		var lastSeen, lastScan sql.NullTime
+		var cold bool
+		if err := rows.Scan(&ns, &service, &clusterID, &lastSeen, &lastScan, &cold); err != nil {
+			return nil, err
+		}
+		pair, ok := byService[service]
+		if !ok {
+			pair = &CrossClusterPair{Namespace: ns, Service: service}
+			byService[service] = pair
+			order = append(order, service)
+		}
+		side := CrossClusterSide{ClusterID: clusterID, Cold: cold}
+		if lastSeen.Valid {
+			side.LastSeen = &lastSeen.Time
+		}
+		if lastScan.Valid {
+			side.LastScan = &lastScan.Time
+		}
+		pair.Sides = append(pair.Sides, side)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]CrossClusterPair, 0, len(order))
+	for _, service := range order {
+		result = append(result, *byService[service])
+	}
+	return result, nil
+}
+
 // ListServiceDependencies returns every mined edge for one namespace, across
 // every cluster belonging to tenantID (deliberately not filtered by cluster —
 // a tenant's clusters' edges surfacing together is what enables cross-cluster
@@ -2572,13 +2870,22 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	// native Postgres array, matching this codebase's existing convention
 	// for list-shaped data reaching Go (see ServiceProfile.Ports/portsJSON
 	// below) rather than introducing pq.Array as a second pattern.
+	//
+	// LEFT JOIN cluster_health_snapshots TWICE (platform-labeling extension,
+	// 2026-10-09): once for the OBSERVING cluster (sd.cluster_id — every
+	// edge has one) and once for the resolved TARGET cluster
+	// (sd.target_cluster_id — only cross-cluster edges, ADR 0037). No
+	// tenant_id needed in either ON clause: cluster_health_snapshots' PK is
+	// cluster_id alone (globally unique), and RLS already scopes the read,
+	// same as cluster_ingress_endpoints' own host-reverse lookup.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
 		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
 		       sd.port, sd.path, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
-		       sd.qualified_match_count, sd.bare_match_count,
+		       sd.qualified_match_count, sd.bare_match_count, COALESCE(sd.target_cluster_id, ''),
 		       COALESCE(cs.expected_failure_reason, ''), COALESCE(cpc.caller_pod_count, 0),
-		       COALESCE(cpc.sources, '[]'::jsonb)
+		       COALESCE(cpc.sources, '[]'::jsonb),
+		       COALESCE(ocs.platform, ''), COALESCE(tcs.platform, '')
 		FROM service_dependencies sd
 		LEFT JOIN cluster_services cs
 		  ON cs.tenant_id = sd.tenant_id AND cs.cluster_id = sd.cluster_id
@@ -2592,6 +2899,8 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		) cpc ON cpc.tenant_id = sd.tenant_id AND cpc.cluster_id = sd.cluster_id
 		     AND cpc.namespace = sd.namespace AND cpc.from_service = sd.from_service
 		     AND cpc.to_service = sd.to_service AND cpc.port = sd.port AND cpc.path = sd.path
+		LEFT JOIN cluster_health_snapshots ocs ON ocs.cluster_id = sd.cluster_id
+		LEFT JOIN cluster_health_snapshots tcs ON tcs.cluster_id = sd.target_cluster_id
 		WHERE sd.namespace = $1 ORDER BY sd.evidence_count DESC`, namespace)
 	if err != nil {
 		return nil, err
@@ -2605,8 +2914,9 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		if err := rows.Scan(&d.ID, &d.Namespace, &d.FromService, &d.ToService,
 			&d.EvidenceCount, &d.FirstSeen, &d.LastSeen, &d.TenantID, &d.ClusterID, &d.TargetKind,
 			&d.Port, &d.Path, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
-			&d.QualifiedMatchCount, &d.BareMatchCount,
-			&d.ExpectedFailureReason, &d.CallerPodCount, &sourcesJSON); err != nil {
+			&d.QualifiedMatchCount, &d.BareMatchCount, &d.TargetClusterID,
+			&d.ExpectedFailureReason, &d.CallerPodCount, &sourcesJSON,
+			&d.Platform, &d.TargetPlatform); err != nil {
 			return nil, err
 		}
 		// A malformed sources blob must not fail the whole namespace — the
@@ -2924,6 +3234,12 @@ type IngressEndpoint struct {
 	Name           string
 	Host           string
 	BackendService string
+	// ClusterID: which cluster this mapping came from. Absent from
+	// ListClusterIngress's original single-cluster-per-namespace use case
+	// (P18 #3's own UI never needed to distinguish clusters); added for
+	// ROADMAP P31 phase 1 (cross-cluster call capture), where "which
+	// cluster owns this host" is the entire question being asked.
+	ClusterID string
 }
 
 // UpsertClusterIngress replaces the full entry-point set for one (tenantID,
@@ -2972,7 +3288,7 @@ func (c *Client) ListClusterIngress(ctx context.Context, tenantID, namespace str
 		return nil, fmt.Errorf("set tenant context: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT namespace, kind, name, host, backend_service FROM cluster_ingress_endpoints WHERE namespace = $1`,
+		`SELECT namespace, kind, name, host, backend_service, cluster_id FROM cluster_ingress_endpoints WHERE namespace = $1`,
 		namespace)
 	if err != nil {
 		return nil, err
@@ -2982,12 +3298,79 @@ func (c *Client) ListClusterIngress(ctx context.Context, tenantID, namespace str
 	result := []IngressEndpoint{}
 	for rows.Next() {
 		var e IngressEndpoint
-		if err := rows.Scan(&e.Namespace, &e.Kind, &e.Name, &e.Host, &e.BackendService); err != nil {
+		if err := rows.Scan(&e.Namespace, &e.Kind, &e.Name, &e.Host, &e.BackendService, &e.ClusterID); err != nil {
 			return nil, err
 		}
 		result = append(result, e)
 	}
 	return result, rows.Err()
+}
+
+// ResolveIngressHost answers "which cluster(s), if any, run an
+// Ingress/Route/HTTPRoute fronting this exact host?" fleet-wide across
+// every cluster this tenant owns — RLS (not an explicit tenant_id WHERE
+// clause) enforces the tenant boundary, same convention ListClusterIngress
+// itself already uses. This is the validation ground truth for ROADMAP P31
+// phase 1 (cross-cluster call capture, ADR 0037): a hostname mentioned in
+// one cluster's logs is promoted from the unvalidatable "external" tier to
+// the validated "cross_cluster" tier only if it matches a REAL object here
+// — the same "check against a real object, never a shape heuristic alone"
+// bar this codebase has enforced since the 2026-09-05 trace-UUID incident.
+//
+// kinds filters which entry-point kinds are trusted (e.g. "route" only by
+// default — see discovery's CROSS_CLUSTER_INGRESS_KINDS config knob):
+// OpenShift Route entries are an exact 1:1 host->backend mapping
+// (k8s_client.py's list_routes), while Ingress/HTTPRoute entries are a
+// known-lossy N×M cross product (ingress.py's own docstring) — filtering
+// happens here in Go, not as a SQL array parameter, matching this
+// codebase's existing avoidance of pq.Array as a second array-binding
+// pattern alongside jsonb_agg (see ListServiceDependencies' own comment).
+// An empty kinds slice trusts every kind.
+//
+// Deliberately returns every distinct matching cluster_id rather than
+// picking one: callers (main.py's extraction loop) decide what an
+// ambiguous (len > 1) match means — this method never guesses.
+func (c *Client) ResolveIngressHost(ctx context.Context, tenantID, host string, kinds []string) ([]string, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT DISTINCT cluster_id, kind FROM cluster_ingress_endpoints WHERE host = $1`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	kindOK := func(k string) bool {
+		if len(kinds) == 0 {
+			return true
+		}
+		for _, want := range kinds {
+			if k == want {
+				return true
+			}
+		}
+		return false
+	}
+	seen := map[string]bool{}
+	var clusterIDs []string
+	for rows.Next() {
+		var clusterID, kind string
+		if err := rows.Scan(&clusterID, &kind); err != nil {
+			return nil, err
+		}
+		if kindOK(kind) && !seen[clusterID] {
+			seen[clusterID] = true
+			clusterIDs = append(clusterIDs, clusterID)
+		}
+	}
+	return clusterIDs, rows.Err()
 }
 
 // ── Fleet-wide health/version snapshot (ROADMAP P18 use case #5) ────────────
@@ -3000,6 +3383,9 @@ type ClusterHealthSnapshot struct {
 	PodsTotal  int
 	PodsReady  int
 	UpdatedAt  time.Time
+	// Platform ("openshift" | "eks" | "gke" | "") — see Discovery's
+	// detect_platform. "" means undetected, never a guess.
+	Platform string
 }
 
 // ServiceHealth is the live state of one service's pods, aggregated from the
@@ -3137,12 +3523,12 @@ func (c *Client) ListServiceHealth(ctx context.Context, tenantID, namespace stri
 // (ROADMAP P30 phase 1, ADR 0033). Confidence and VerifiedByEngagementID are
 // Phase 2+ columns, inert in phase 1 (always "config-only"/empty).
 type SecurityFinding struct {
-	Namespace              string    `json:"namespace"`
-	CheckID                string    `json:"check_id"`
-	ResourceKind           string    `json:"resource_kind"`
-	ResourceName           string    `json:"resource_name"`
-	Severity               string    `json:"severity"`
-	Evidence               string    `json:"evidence"`
+	Namespace    string `json:"namespace"`
+	CheckID      string `json:"check_id"`
+	ResourceKind string `json:"resource_kind"`
+	ResourceName string `json:"resource_name"`
+	Severity     string `json:"severity"`
+	Evidence     string `json:"evidence"`
 	// TargetHost (ROADMAP P30 phase 2): the concrete host an active-
 	// verification engagement checks. Empty when the check that produced
 	// this finding has no phase-2 technique mapped to it yet.
@@ -3541,7 +3927,7 @@ func (c *Client) CompleteSecurityEngagement(ctx context.Context, tenantID, id, s
 // single-row overwrite-in-place (ON CONFLICT DO UPDATE), not the
 // delete-then-insert-a-row-set shape UpsertClusterServices/
 // UpsertClusterIngress use for their multi-row registries.
-func (c *Client) UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int) error {
+func (c *Client) UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int, platform string) error {
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -3552,12 +3938,13 @@ func (c *Client) UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clus
 		return fmt.Errorf("set tenant context: %w", err)
 	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO cluster_health_snapshots (cluster_id, tenant_id, k8s_version, pods_total, pods_ready, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, NOW())
+		`INSERT INTO cluster_health_snapshots (cluster_id, tenant_id, k8s_version, pods_total, pods_ready, platform, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW())
 		 ON CONFLICT (cluster_id) DO UPDATE SET
 		   tenant_id = EXCLUDED.tenant_id, k8s_version = EXCLUDED.k8s_version,
-		   pods_total = EXCLUDED.pods_total, pods_ready = EXCLUDED.pods_ready, updated_at = NOW()`,
-		clusterID, tenantID, k8sVersion, podsTotal, podsReady)
+		   pods_total = EXCLUDED.pods_total, pods_ready = EXCLUDED.pods_ready,
+		   platform = EXCLUDED.platform, updated_at = NOW()`,
+		clusterID, tenantID, k8sVersion, podsTotal, podsReady, platform)
 	if err != nil {
 		return fmt.Errorf("upsert cluster health snapshot: %w", err)
 	}
@@ -3580,7 +3967,7 @@ func (c *Client) ListClusterHealthSnapshots(ctx context.Context, tenantID string
 		return nil, fmt.Errorf("set tenant context: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT cluster_id, tenant_id, k8s_version, pods_total, pods_ready, updated_at FROM cluster_health_snapshots ORDER BY cluster_id`)
+		`SELECT cluster_id, tenant_id, k8s_version, pods_total, pods_ready, updated_at, platform FROM cluster_health_snapshots ORDER BY cluster_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -3589,7 +3976,7 @@ func (c *Client) ListClusterHealthSnapshots(ctx context.Context, tenantID string
 	result := []ClusterHealthSnapshot{}
 	for rows.Next() {
 		var s ClusterHealthSnapshot
-		if err := rows.Scan(&s.ClusterID, &s.TenantID, &s.K8sVersion, &s.PodsTotal, &s.PodsReady, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ClusterID, &s.TenantID, &s.K8sVersion, &s.PodsTotal, &s.PodsReady, &s.UpdatedAt, &s.Platform); err != nil {
 			return nil, err
 		}
 		result = append(result, s)

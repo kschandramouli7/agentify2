@@ -22,8 +22,11 @@ export type NodeMeta = {
    *    service          a Kubernetes Service in this namespace
    *    ingress          a declared entry point from outside
    *    cross_namespace  a service in another namespace we were seen calling
-   *    external         a public host we were seen calling — the weakest tier */
-  kind?: "service" | "ingress" | "cross_namespace" | "external";
+   *    external         a public host we were seen calling — the weakest tier
+   *    cross_cluster    a host validated against a real Ingress/Route in
+   *                     another cluster in this tenant's fleet (ROADMAP P31
+   *                     phase 1) — not a shape guess, like cross_namespace */
+  kind?: "service" | "ingress" | "cross_namespace" | "external" | "cross_cluster";
   /** Fraction of scans in which this service's pods were readable, if known. */
   coverage?: number | null;
   /** Pods attributed to it / pods actually sampled, if known. */
@@ -72,7 +75,23 @@ export type NodeMeta = {
   liveAt?: string;
   scanAt?: string;
   unreportedForMs?: number;
+  /** Platform-labeling extension (2026-10-09, ROADMAP P31 phase 1). Which
+   *  managed K8s platform a cross_cluster node's resolved target cluster
+   *  runs — "openshift" | "eks" | "gke". Absent means undetected or not
+   *  applicable (every kind other than cross_cluster), never a guess. */
+  platform?: string;
 };
+
+/** Short display form for a wire-level platform value, for the badge and
+ *  the tooltip — "" (undetected) renders as nothing, never as a label. */
+function platformLabel(platform?: string): string {
+  switch (platform) {
+    case "openshift": return "OCP";
+    case "eks": return "EKS";
+    case "gke": return "GKE";
+    default: return "";
+  }
+}
 
 /** The middle line of a node: what this service IS.
  *
@@ -841,6 +860,7 @@ function roleText(n: Node, m?: NodeMeta): string {
   // useful about them — what matters is that they are external and how
   // strongly the claim is grounded.
   if (m?.kind === "cross_namespace") return "another namespace";
+  if (m?.kind === "cross_cluster") return "another cluster";
   if (m?.kind === "external") return "outside the cluster";
   // in=0 AND out=0 is NOT an entry point — it is a service we have no evidence
   // about in either direction. Calling it "entry · calls 0" implied a finding
@@ -903,7 +923,7 @@ export function DependencyFlow({
     const out = new Set<string>();
     if (!meta) return out;
     for (const [id, m] of meta) {
-      if (m.kind === "external" || m.kind === "cross_namespace") out.add(id);
+      if (m.kind === "external" || m.kind === "cross_namespace" || m.kind === "cross_cluster") out.add(id);
     }
     return out;
   }, [meta]);
@@ -1021,7 +1041,14 @@ export function DependencyFlow({
                           "Service list exists for the internet, so this rests on hostname shape.\n"
                         : e.target_kind === "cross_namespace"
                           ? "Cross-namespace: validated on its namespace segment only.\n"
-                          : "") +
+                          : e.target_kind === "cross_cluster"
+                            ? "Cross-cluster: validated against a real Ingress/Route in another " +
+                              "cluster in this tenant's fleet — " +
+                              (e.target_cluster_id
+                                ? `resolved to cluster ${e.target_cluster_id}.\n`
+                                : "the hostname matched more than one cluster, so the target " +
+                                  "cluster is unresolved rather than guessed.\n")
+                            : "") +
                       (stale ? "STALE: no new evidence in over 15 minutes.\n" : "") +
                       `Last seen ${new Date(e.last_seen).toLocaleString()}`}
                 </title>
@@ -1065,13 +1092,14 @@ export function DependencyFlow({
             const m = meta?.get(n.id);
             const profile = profileText(m);
             const trouble = troubleText(m);
-            const outside = m?.kind === "ingress" || m?.kind === "cross_namespace" || m?.kind === "external";
+            const outside = m?.kind === "ingress" || m?.kind === "cross_namespace" || m?.kind === "external" || m?.kind === "cross_cluster";
             const unobserved = n.inDeg === 0 && n.outDeg === 0 && !outside;
             const cls = [
               "flow__node",
               m?.kind === "ingress" ? "flow__node--ingress" : "",
               m?.kind === "cross_namespace" ? "flow__node--other-ns" : "",
               m?.kind === "external" ? "flow__node--external" : "",
+              m?.kind === "cross_cluster" ? "flow__node--cross-cluster" : "",
               // Dashed outline, not dimmed: an unobserved service is present in
               // the cluster and absent from the evidence. Dimming would read as
               // "less important" rather than "not seen".
@@ -1115,6 +1143,11 @@ export function DependencyFlow({
                      ? `\nports: ${m.ports.map(p => `${p.name ? p.name + " " : ""}${p.port}/${p.protocol ?? "TCP"}`).join(", ")}`
                      : "") +
                    (m?.serviceType ? `\nexposure: ${m.serviceType}` : "") +
+                   // Platform-labeling extension (2026-10-09): full name in
+                   // the tooltip even though the badge shows a short form.
+                   (m?.platform
+                     ? `\nPlatform: ${{ openshift: "OpenShift", eks: "AWS EKS", gke: "GCP GKE" }[m.platform] ?? m.platform}`
+                     : "") +
                    (m?.coverage != null
                      ? `\nObserved in ${Math.round(m.coverage * 100)}% of scans` +
                        (m.podsSeen != null ? ` (${m.podsSampled ?? 0} of ${m.podsSeen} pods sampled)` : "")
@@ -1143,6 +1176,19 @@ export function DependencyFlow({
                 <text x={n.x + NODE_W / 2} y={n.y + 19} textAnchor="middle" className="flow__label">
                   {fit(m?.label ?? n.id, 21)}
                 </text>
+                {/* Platform-labeling extension (2026-10-09, ROADMAP P31
+                  * phase 1): only a cross_cluster node carries a platform
+                  * at all (see NodeMeta's own comment) — a short text
+                  * glyph, not a logo, same "word + colour" convention
+                  * every other status marker on this canvas already uses. */}
+                {m?.kind === "cross_cluster" && m.platform && platformLabel(m.platform) && (
+                  <text
+                    x={n.x + NODE_W - 6} y={n.y + 12} textAnchor="end"
+                    className={`flow__platform-badge flow__platform-badge--${m.platform}`}
+                  >
+                    {platformLabel(m.platform)}
+                  </text>
+                )}
                 {profile && (
                   <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__what">
                     {fit(profile, 26)}

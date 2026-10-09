@@ -2868,6 +2868,22 @@ code {
    any alert banners, same margin rhythm as the stat row's own bottom margin. */
 .topo-path-coverage { margin: -12px 0 20px; font-size: 12px; }
 
+/* ROADMAP P31 phase 2 (cold services, ADR 0038) — a plain checkbox + label,
+   sized and spaced to sit inline with the other filter-bar controls. */
+.topo-cold-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ROADMAP P31 phase 3 (cross-cluster pairing, ADR 0039) — a quiet inline
+   annotation, not a badge: this is supplementary context on an existing
+   table row, never its own finding. */
+.topo-cross-cluster-note { font-size: 11px; color: var(--muted); }
+
 /* evidence_count: one hue, more-is-wider, number always printed beside it. */
 .topo-evidence { display: inline-flex; align-items: center; gap: 6px; }
 .topo-evidence__track {
@@ -3253,8 +3269,26 @@ code {
   fill: transparent;   /* not part of the namespace, so not filled like one */
 }
 .flow__node--external .flow__label { fill: var(--muted); }
+/* Cross-cluster (ROADMAP P31 phase 1): validated against a real Ingress/
+   Route in another cluster in this tenant's fleet, as trustworthy as
+   cross-namespace — drawn with the same dashed-but-filled treatment as
+   .flow__node--other-ns, not the hollow/dim external treatment, since this
+   tier is checked against a real object, not a shape guess. */
+.flow__node--cross-cluster .flow__box { stroke: var(--border-bright); stroke-dasharray: 7 3; }
 /* An edge resting on hostname shape alone reads lighter than a validated one. */
 .flow__line--weak { opacity: 0.55; }
+
+/* Platform-labeling extension (2026-10-09, ROADMAP P31 phase 1) — a short
+   text glyph, not a logo (no icon dependency in this project, confirmed
+   absent from package.json), word + colour same as every other status
+   marker on this canvas. Colours loosely echo each platform's own brand
+   (OpenShift red, AWS orange, GCP blue) for quick recognition, while
+   staying clear of the reserved status colours (crit/warn/ok) used
+   elsewhere on this same canvas. */
+.flow__platform-badge { font-size: 9px; font-weight: 600; letter-spacing: 0.02em; }
+.flow__platform-badge--openshift { fill: #ee3524; }
+.flow__platform-badge--eks { fill: #ff9900; }
+.flow__platform-badge--gke { fill: #4285f4; }
 
 /* Health (ROADMAP P27 phase 2, ADR 0031) — is this dependency WORKING, not
    just does it exist. Same status tokens and idiom the node boxes already

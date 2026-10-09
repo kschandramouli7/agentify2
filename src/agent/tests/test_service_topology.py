@@ -330,6 +330,74 @@ async def test_get_known_services_degrades_to_empty_on_error(monkeypatch):
     assert services == set()
 
 
+# ── resolve_cross_cluster_target (ROADMAP P31 phase 1, ADR 0037) ────────────
+#
+# Mirrored from src/adapters/discovery/service_topology.py per ADR 0029's
+# duplication convention — not currently wired into this module's own
+# mine_service_dependencies, kept in sync for consistency.
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_returns_the_matching_cluster(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["host"] == "shop.example.com"
+        return httpx.Response(200, json={"cluster_ids": ["cluster-b"]})
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], {})
+    assert result == ["cluster-b"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_degrades_to_empty_on_error(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], {})
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_memoizes_per_cycle_cache(monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"cluster_ids": ["cluster-b"]})
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    cache = {}
+    first = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], cache)
+    second = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], cache)
+    assert first == second == ["cluster-b"]
+    assert calls["n"] == 1
+
+
+# ── fetch_cold_services (ROADMAP P31 phase 2, ADR 0038) ──────────────────────
+
+@pytest.mark.asyncio
+async def test_fetch_cold_services_returns_list_and_passes_thresholds(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("namespace") == "payments"
+        assert request.url.params.get("stale_days") == "30"
+        assert request.url.params.get("scanned_within_days") == "5"
+        return httpx.Response(200, json=[{"namespace": "payments", "service": "legacy-worker"}])
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    cold = await st.fetch_cold_services("payments", "http://backend", stale_days=30, scanned_within_days=5)
+    assert cold == [{"namespace": "payments", "service": "legacy-worker"}]
+
+
+@pytest.mark.asyncio
+async def test_fetch_cold_services_degrades_to_empty_on_error(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    cold = await st.fetch_cold_services("payments", "http://backend")
+    assert cold == []
+
+
 # ── fetch_service_dependencies ────────────────────────────────────────────────
 
 @pytest.mark.asyncio

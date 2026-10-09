@@ -359,6 +359,35 @@ def extract_external_mentions(
 
     return found
 
+
+async def resolve_cross_cluster_target(
+    host: str, backend_url: str, kinds: List[str], cache: Dict[str, List[str]],
+) -> List[str]:
+    """Which cluster_id(s), if any, run an ingress/route fronting `host` —
+    the validation that promotes an "external"-shaped hostname mention to
+    the stronger `cross_cluster` tier (ROADMAP P31 phase 1, ADR 0037).
+    Wraps `GET /admin/ingress-lookup`, same best-effort/degrade-to-empty
+    convention as every other Hub call here. `cache` memoizes per scan
+    cycle (keyed by host) so N pods mentioning the same migrating host cost
+    one HTTP call, not N.
+    """
+    if host in cache:
+        return cache[host]
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{backend_url.rstrip('/')}/admin/ingress-lookup",
+                params={"host": host, "kinds": ",".join(kinds)},
+            )
+            resp.raise_for_status()
+            cluster_ids = (resp.json() or {}).get("cluster_ids") or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("resolve_cross_cluster_target failed for host=%s: %s", host, e)
+        cluster_ids = []
+    cache[host] = cluster_ids
+    return cluster_ids
+
+
 async def push_scan_coverage(
     namespace: str,
     stats: Dict[str, Dict[str, int]],
@@ -410,6 +439,7 @@ async def push_dependency(
     caller_pod: str = "",
     match_kind: str = "",
     source: str = "",
+    target_cluster_id: str = "",
 ) -> None:
     """Record one piece of evidence for a from->to edge via the tenant-scoped
     ingest endpoint. Best-effort: any failure is logged and swallowed — one
@@ -421,7 +451,10 @@ async def push_dependency(
     caller_pod/match_kind/source (phase 4, caller cardinality and
     provenance) follow the same convention; see that same note for why an
     empty caller_pod/source is skipped Hub-side rather than stored as a
-    sentinel.
+    sentinel. target_cluster_id (ROADMAP P31 phase 1) is the resolved
+    cluster_id when target_kind="cross_cluster" — "" means either not
+    cross-cluster, or resolved ambiguously across more than one cluster and
+    deliberately left unattributed (see resolve_cross_cluster_target).
     """
     # Omit the header entirely when unset — see push_inventory's identical
     # comment (inventory.py) for why.
@@ -445,6 +478,7 @@ async def push_dependency(
                     "caller_pod": caller_pod or "",
                     "match_kind": match_kind or "",
                     "source": source or "",
+                    "target_cluster_id": target_cluster_id or "",
                 },
                 headers=headers,
             )

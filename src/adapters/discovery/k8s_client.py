@@ -86,6 +86,36 @@ async def discover_api_capabilities() -> Optional[Dict[str, Any]]:
     return caps
 
 
+_EKS_VERSION_RE = re.compile(r"-eks-")
+_GKE_VERSION_RE = re.compile(r"-gke\.")
+
+
+def detect_platform(caps: Dict[str, Any]) -> str:
+    """Which managed K8s platform this cluster runs — "openshift" | "eks" |
+    "gke" | "" (undetected) — from facts discover_api_capabilities() already
+    gathered. No new API call, no new RBAC: Node listing (the usual
+    node-label approach, e.g. eks.amazonaws.com/..., cloud.google.com/gke-
+    nodepool) was deliberately ruled out, since Discovery has never had a
+    `nodes` RBAC grant (see health_snapshot.py's own note on why capacity
+    data was left out for the same reason).
+
+    openshift_route is checked first since it's the more reliable signal
+    (API-group presence, not a string heuristic). EKS/GKE both embed a
+    reliable vendor suffix in gitVersion (e.g. "v1.28.5-eks-cedffd4",
+    "v1.27.8-gke.1000") that nothing in this codebase previously parsed.
+    "" means neither matched (vanilla/kubeadm/kind/AKS/etc.) — an honest
+    unknown, never a guess.
+    """
+    if caps.get("openshift_route"):
+        return "openshift"
+    git_version = caps.get("gitVersion") or ""
+    if _EKS_VERSION_RE.search(git_version):
+        return "eks"
+    if _GKE_VERSION_RE.search(git_version):
+        return "gke"
+    return ""
+
+
 async def list_namespaces(exclude: Optional[set] = None) -> List[str]:
     """List every namespace this ServiceAccount can see, minus `exclude`."""
     exclude = exclude or set()

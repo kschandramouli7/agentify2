@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listServiceDependencies, listClusterIngress, listScanCoverage, listServiceProfiles,
-  listServiceHealth,
-  type ServiceDependency,
+  listServiceHealth, listColdServices, listCrossClusterPairs,
+  type ServiceDependency, type CrossClusterPair,
 } from "../api";
 import { DependencyFlow, confidence, edgeHealth, rarelyObserved, silentServices, unhealthyEdges, type FlowEdge, type NodeMeta } from "./DependencyFlow";
 import { DependencyChatPanel } from "./DependencyChatPanel";
@@ -220,6 +220,23 @@ function Alert({
   );
 }
 
+// ROADMAP P31 phase 3 (cross-cluster pairing, ADR 0039). Passive annotation
+// only — "also seen in cluster X, warm/cold there too" — never a claim
+// about which side is "old" vs "new"; the pairing itself is convention-
+// based (same name, different cluster), so the prose stays equally modest.
+function CrossClusterNote({ service, pairs }: { service: string; pairs: Map<string, CrossClusterPair> }) {
+  const pair = pairs.get(service);
+  if (!pair || pair.sides.length < 2) return null;
+  return (
+    <span
+      className="topo-cross-cluster-note"
+      title={pair.sides.map(s => `${s.cluster_id}: ${s.cold ? "cold" : "warm"}`).join(", ")}
+    >
+      {" "}⇄ {pair.sides.length} clusters
+    </span>
+  );
+}
+
 function Freshness({ lastSeen }: { lastSeen: string }) {
   const stale = Date.now() - new Date(lastSeen).getTime() > STALE_AFTER_MS;
   // Word + colour, never colour alone.
@@ -333,6 +350,8 @@ export function TopologyPanel() {
   // namespace box, this never triggers a fetch, so there's no apply step to
   // wait for.
   const [pathFilterInput, setPathFilterInput] = useState("");
+  // ROADMAP P31 phase 2 (cold services, ADR 0038).
+  const [showColdOnly, setShowColdOnly] = useState(false);
   const [showMermaid, setShowMermaid] = useState(false);
 
   // Drag-to-resize the chat rail (`.topo-side`) against the diagram
@@ -423,10 +442,41 @@ export function TopologyPanel() {
     () => normalizePathForFilter(stripLeadingHttpMethod(pathFilterInput)),
     [pathFilterInput],
   );
+  // ROADMAP P31 phase 2 (cold services, ADR 0038). Only fetched while the
+  // toggle is on — an extra request on every namespace load for a feature
+  // most views of this panel won't use would be wasteful.
+  const { data: coldServices = [] } = useQuery({
+    queryKey: ["cold-services", applied],
+    queryFn: () => listColdServices(applied),
+    enabled: applied.length > 0 && showColdOnly,
+  });
+  const coldServiceNames = useMemo(() => new Set(coldServices.map(c => c.service)), [coldServices]);
+  // ROADMAP P31 phase 3 (cross-cluster pairing, ADR 0039) — store-only on
+  // the backend; this toggle is its only consumer. Annotates a cold
+  // service with "also seen in cluster X" when a same-named match exists
+  // elsewhere in the fleet, so a reader isn't left guessing whether cold
+  // here means replaced-elsewhere or simply unused.
+  const { data: crossClusterPairs = [] } = useQuery({
+    queryKey: ["cross-cluster-pairs", applied],
+    queryFn: () => listCrossClusterPairs(applied),
+    enabled: applied.length > 0 && showColdOnly,
+  });
+  const crossClusterByService = useMemo(
+    () => new Map(crossClusterPairs.map(p => [p.service, p])),
+    [crossClusterPairs],
+  );
+
   const pathFilteredData = useMemo(() => {
-    if (!activePathFilter || !data) return data;
-    return data.filter(e => e.path === activePathFilter);
-  }, [data, activePathFilter]);
+    let rows = data;
+    if (activePathFilter && rows) rows = rows.filter(e => e.path === activePathFilter);
+    // Composes with the path filter rather than replacing it: an edge must
+    // touch a cold service on EITHER side to show, same "both directions
+    // count" reasoning ListColdServices itself already applies server-side.
+    if (showColdOnly && rows) {
+      rows = rows.filter(e => coldServiceNames.has(e.from_service) || coldServiceNames.has(e.to_service));
+    }
+    return rows;
+  }, [data, activePathFilter, showColdOnly, coldServiceNames]);
   // For the datalist below — always the FULL unfiltered set of known paths,
   // not pathFilteredData's (which would shrink to just the active filter
   // once one is typed, defeating the point of suggesting alternatives).
@@ -435,6 +485,7 @@ export function TopologyPanel() {
     [data],
   );
   const pathFilterHasNoMatches = Boolean(activePathFilter) && (pathFilteredData?.length ?? 0) === 0;
+  const coldFilterHasNoMatches = showColdOnly && !activePathFilter && (pathFilteredData?.length ?? 0) === 0;
 
   // The three sources that turn a call graph into an architecture view. All
   // best-effort: each degrades to empty rather than blanking the panel, because
@@ -512,15 +563,26 @@ export function TopologyPanel() {
       // 'service', which put "www.nokia.com" in the STRONG tier and drew it
       // as "terminal · 1 caller" — indistinguishable from a validated edge.
       const dotted = e.to_service.includes(".");
+      // cross_cluster (ROADMAP P31 phase 1) is deliberately NOT part of the
+      // shape fallback below: a cross-cluster hostname is shape-
+      // indistinguishable from a plain external one (both are dotted names
+      // outside the known-namespace set) — only the backend's own
+      // fleet-wide ingress lookup can tell them apart, so this tier must
+      // come from target_kind directly or not be drawn as cross_cluster at
+      // all.
       const kind =
-        e.target_kind === "cross_namespace" || e.target_kind === "external"
+        e.target_kind === "cross_namespace" || e.target_kind === "external" || e.target_kind === "cross_cluster"
           ? e.target_kind
           : dotted
             ? (knownNamespaceSet.has(e.to_service.split(".").slice(1).join("."))
                 ? "cross_namespace"
                 : "external")
             : null;
-      if (kind) meta.set(e.to_service, { kind, label: e.to_service });
+      // Platform-labeling extension (2026-10-09): only ever meaningful for
+      // cross_cluster (every other kind's target_platform is "" by
+      // construction, since the backend join only matches a resolved
+      // target_cluster_id) — no extra branching needed here.
+      if (kind) meta.set(e.to_service, { kind, label: e.to_service, platform: e.target_platform || undefined });
     }
 
     // Profiles double as an inventory source: they come from cluster_services,
@@ -528,7 +590,7 @@ export function TopologyPanel() {
     // from /admin/tracked still gets drawn.
     for (const p of profiles) {
       const prev = meta.get(p.service);
-      if (prev?.kind === "external" || prev?.kind === "cross_namespace") continue;
+      if (prev?.kind === "external" || prev?.kind === "cross_namespace" || prev?.kind === "cross_cluster") continue;
       meta.set(p.service, {
         ...(prev ?? { kind: "service" as const }),
         kind: "service",
@@ -567,7 +629,7 @@ export function TopologyPanel() {
 
     for (const h of health) {
       const prev = meta.get(h.service) ?? { kind: "service" as const };
-      if (prev.kind === "external" || prev.kind === "cross_namespace") continue;
+      if (prev.kind === "external" || prev.kind === "cross_namespace" || prev.kind === "cross_cluster") continue;
       meta.set(h.service, {
         ...prev,
         kind: "service",
@@ -699,6 +761,17 @@ export function TopologyPanel() {
               Clear
             </button>
           )}
+          {/* ROADMAP P31 phase 2 (cold services, ADR 0038). A candidate list
+            * for decommissioning, not an order — the label and the empty
+            * state below both say so explicitly. */}
+          <label className="topo-cold-toggle">
+            <input
+              type="checkbox"
+              checked={showColdOnly}
+              onChange={e => setShowColdOnly(e.target.checked)}
+            />
+            Show cold only
+          </label>
           <button className="adm-btn adm-btn--ghost" type="button" onClick={() => refetch()}>
             {isFetching ? "Refreshing…" : "Refresh"}
           </button>
@@ -732,7 +805,23 @@ export function TopologyPanel() {
             </div>
           )}
 
-          {!isLoading && !isError && !pathFilterHasNoMatches && graph.edges.length === 0 && arch.standalone.length === 0 && (
+          {/* Cold-only matching nothing is good news, not an empty namespace
+            * — say so explicitly, same reasoning as the path-filter empty
+            * state above (and checked after it: a path filter with no
+            * matches is the more specific explanation when both are active). */}
+          {!isLoading && !isError && !pathFilterHasNoMatches && coldFilterHasNoMatches && (
+            <div className="adm-empty">
+              <p>
+                No services in <strong>{applied}</strong> currently look cold.
+              </p>
+              <p className="adm-muted">
+                This reflects mined log evidence only, scanned recently with no (or no recent)
+                call-graph evidence — not a guarantee nothing depends on them.
+              </p>
+            </div>
+          )}
+
+          {!isLoading && !isError && !pathFilterHasNoMatches && !coldFilterHasNoMatches && graph.edges.length === 0 && arch.standalone.length === 0 && (
             <div className="adm-empty">
               <p>
                 No dependency evidence for <strong>{applied}</strong>
@@ -946,9 +1035,15 @@ export function TopologyPanel() {
                       .sort((a, b) => b.evidence_count - a.evidence_count)
                       .map(e => (
                         <tr key={e.id}>
-                          <td><button type="button" className="topo-link" onClick={() => setFocus(e.from_service)}>{e.from_service}</button></td>
+                          <td>
+                            <button type="button" className="topo-link" onClick={() => setFocus(e.from_service)}>{e.from_service}</button>
+                            {showColdOnly && <CrossClusterNote service={e.from_service} pairs={crossClusterByService} />}
+                          </td>
                           <td className="adm-muted">→</td>
-                          <td><button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button></td>
+                          <td>
+                            <button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button>
+                            {showColdOnly && <CrossClusterNote service={e.to_service} pairs={crossClusterByService} />}
+                          </td>
                           <td className="adm-muted">{e.port ? e.port : "—"}</td>
                           <td className="adm-muted" title={e.path || undefined}>{e.path || "—"}</td>
                           <td className="adm-muted">

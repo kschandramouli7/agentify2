@@ -347,6 +347,7 @@ async def test_push_dependency_sends_port_and_outcome_sentinels_when_unknown(mon
     assert captured["body"]["caller_pod"] == ""
     assert captured["body"]["match_kind"] == ""
     assert captured["body"]["source"] == ""
+    assert captured["body"]["target_cluster_id"] == ""  # ROADMAP P31 phase 1
 
 
 @pytest.mark.asyncio
@@ -379,6 +380,91 @@ async def test_push_dependency_degrades_silently_on_error(monkeypatch):
 
     # Should not raise — best-effort, same convention as the original.
     await st.push_dependency("payments", "payment-ui", "payment-backend", "http://backend", "secret-token")
+
+
+@pytest.mark.asyncio
+async def test_push_dependency_sends_a_resolved_target_cluster_id(monkeypatch):
+    """ROADMAP P31 phase 1 (ADR 0037): target_cluster_id passes through
+    unchanged, same explicit-never-omitted convention as every other
+    optional field here."""
+    import json as _json
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = _json.loads(request.content)
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_dependency(
+        "payments", "payment-ui", "shop.example.com", "http://backend", "secret-token",
+        target_kind="cross_cluster", target_cluster_id="cluster-b",
+    )
+
+    assert captured["body"]["target_kind"] == "cross_cluster"
+    assert captured["body"]["target_cluster_id"] == "cluster-b"
+
+
+# ── resolve_cross_cluster_target (ROADMAP P31 phase 1, ADR 0037) ────────────
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_returns_the_matching_cluster(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["host"] == "shop.example.com"
+        assert request.url.params["kinds"] == "route"
+        return httpx.Response(200, json={"cluster_ids": ["cluster-b"]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], {})
+
+    assert result == ["cluster-b"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_reports_every_ambiguous_match(monkeypatch):
+    """A GSLB-style hostname briefly fronting two clusters during a
+    migration overlap must report BOTH — this function never picks one;
+    that policy judgment belongs to the caller (main.py's extraction loop)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"cluster_ids": ["cluster-b", "cluster-c"]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await st.resolve_cross_cluster_target("shared.example.com", "http://backend", [], {})
+
+    assert result == ["cluster-b", "cluster-c"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_degrades_to_empty_on_http_failure(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    result = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], {})
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_cross_cluster_target_memoizes_per_cycle_cache(monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"cluster_ids": ["cluster-b"]})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    cache = {}
+    first = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], cache)
+    second = await st.resolve_cross_cluster_target("shop.example.com", "http://backend", ["route"], cache)
+
+    assert first == second == ["cluster-b"]
+    assert calls["n"] == 1  # the second call is served from cache, no second HTTP request
 
 
 # ── extract_external_mentions: beyond the namespace boundary ─────────────────

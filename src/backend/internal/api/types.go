@@ -121,7 +121,7 @@ type PricingStore interface {
 // cluster_id from the request body instead (ADR 0029's trusted-internal-
 // caller override, for the Glue-based dependency miner).
 type ServiceDependencyStore interface {
-	UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod, matchKind, source string) error
+	UpsertServiceDependency(ctx context.Context, in pgstore.ServiceDependencyUpsert) error
 	ListServiceDependencies(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceDependency, error)
 
 	// Scan coverage lives on this interface rather than its own because it is
@@ -130,6 +130,12 @@ type ServiceDependencyStore interface {
 	// parameter on NewHandler and two nil checks that are always equal.
 	UpsertScanCoverage(ctx context.Context, tenantID, clusterID, namespace, service string, cycles, podsSeen, podsSampled, logsReadable int, logLines int64) error
 	ListScanCoverage(ctx context.Context, tenantID, namespace string) ([]pgstore.ScanCoverage, error)
+
+	// ListColdServices answers "which services have gone quiet, not just
+	// unscanned" (ROADMAP P31 phase 2, ADR 0038) — lives here rather than
+	// its own interface for the same reason scan coverage does: it reads
+	// both tables this interface already owns.
+	ListColdServices(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]pgstore.ColdService, error)
 }
 
 // ClusterServiceStore is the service->cluster registry interface (ROADMAP
@@ -148,6 +154,13 @@ type ClusterServiceStore interface {
 
 	// Service profile read for the architecture view (ROADMAP P22).
 	ListServiceProfiles(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceProfile, error)
+
+	// ListCrossClusterPairs finds services present in more than one cluster
+	// for this tenant+namespace, convention-based only (ROADMAP P31 phase 3,
+	// ADR 0039) — lives here because cluster_services (the registry this
+	// interface already owns) is the ground truth for "does this service
+	// exist in this cluster".
+	ListCrossClusterPairs(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]pgstore.CrossClusterPair, error)
 }
 
 // NamespaceEntry is one discovered namespace, returned by the namespace-sync
@@ -170,6 +183,11 @@ type NamespaceEntry struct {
 type ClusterIngressStore interface {
 	UpsertClusterIngress(ctx context.Context, tenantID, clusterID string, entries []pgstore.IngressEndpoint) error
 	ListClusterIngress(ctx context.Context, tenantID, namespace string) ([]pgstore.IngressEndpoint, error)
+	// ResolveIngressHost is the validation ground truth for ROADMAP P31
+	// phase 1 (cross-cluster call capture, ADR 0037) — fleet-wide, not
+	// namespace-scoped, since the question is "which OTHER cluster, if
+	// any" rather than "what's in my own namespace".
+	ResolveIngressHost(ctx context.Context, tenantID, host string, kinds []string) ([]string, error)
 }
 
 // ClusterHealthStore is the fleet-wide health/version snapshot interface
@@ -178,7 +196,7 @@ type ClusterIngressStore interface {
 // tool or frontend fleet dashboard consumes ListClusterHealthSnapshots yet,
 // same deliberate scope boundary as ClusterIngressStore.
 type ClusterHealthStore interface {
-	UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int) error
+	UpsertClusterHealthSnapshot(ctx context.Context, tenantID, clusterID, k8sVersion string, podsTotal, podsReady int, platform string) error
 	ListClusterHealthSnapshots(ctx context.Context, tenantID string) ([]pgstore.ClusterHealthSnapshot, error)
 
 	// Per-SERVICE live pod state, for the architecture view (ROADMAP P22).

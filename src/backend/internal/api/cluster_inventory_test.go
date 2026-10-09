@@ -21,6 +21,12 @@ type fakeClusterServiceStore struct {
 	selectors     map[string]map[string]map[string]string // "cluster_id/namespace" -> service -> selector
 	profiles      map[string][]pgstore.ServiceProfile     // namespace -> profiles (ROADMAP P22)
 	profileErr    error
+
+	// ROADMAP P31 phase 3 (cross-cluster pairing, ADR 0039).
+	crossClusterPairs    []pgstore.CrossClusterPair
+	crossClusterErr      error
+	lastCCPStaleDays     int
+	lastCCPScannedWithin int
 }
 
 func (f *fakeClusterServiceStore) ListServiceProfiles(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceProfile, error) {
@@ -28,6 +34,15 @@ func (f *fakeClusterServiceStore) ListServiceProfiles(ctx context.Context, tenan
 		return nil, f.profileErr
 	}
 	return f.profiles[namespace], nil
+}
+
+func (f *fakeClusterServiceStore) ListCrossClusterPairs(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]pgstore.CrossClusterPair, error) {
+	f.lastCCPStaleDays = staleDays
+	f.lastCCPScannedWithin = scannedWithinDays
+	if f.crossClusterErr != nil {
+		return nil, f.crossClusterErr
+	}
+	return f.crossClusterPairs, nil
 }
 
 func (f *fakeClusterServiceStore) UpsertClusterServices(ctx context.Context, tenantID, clusterID string, byNamespace map[string][]pgstore.ServiceEntry) error {

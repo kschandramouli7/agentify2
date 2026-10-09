@@ -367,6 +367,40 @@ def extract_external_mentions(
 
     return found
 
+
+async def resolve_cross_cluster_target(
+    host: str, backend_url: str, kinds: List[str], cache: Dict[str, List[str]],
+) -> List[str]:
+    """Which cluster_id(s), if any, run an ingress/route fronting `host` —
+    the validation that promotes an "external"-shaped hostname mention to
+    the stronger `cross_cluster` tier (ROADMAP P31 phase 1, ADR 0037).
+    Wraps `GET /admin/ingress-lookup`, same best-effort/degrade-to-empty
+    convention as every other Hub call here. `cache` memoizes per scan
+    cycle (keyed by host) so N pods mentioning the same migrating host cost
+    one HTTP call, not N.
+
+    Mirrored from src/adapters/discovery/service_topology.py per ADR 0029's
+    duplication convention — not currently wired into this module's own
+    mine_service_dependencies (which never calls extract_external_mentions
+    at all), kept in sync for consistency should that change later.
+    """
+    if host in cache:
+        return cache[host]
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{backend_url.rstrip('/')}/admin/ingress-lookup",
+                params={"host": host, "kinds": ",".join(kinds)},
+            )
+            resp.raise_for_status()
+            cluster_ids = (resp.json() or {}).get("cluster_ids") or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("resolve_cross_cluster_target failed for host=%s: %s", host, e)
+        cluster_ids = []
+    cache[host] = cluster_ids
+    return cluster_ids
+
+
 async def fetch_tracked_pairs(backend_url: str) -> List[str]:
     """Every tracked `"namespace/service"` pair the Hub knows about.
 
@@ -479,6 +513,26 @@ async def fetch_service_dependencies(namespace: str, backend_url: str) -> List[D
             return resp.json() or []
     except (httpx.HTTPError, ValueError) as e:
         logger.warning("fetch_service_dependencies failed for namespace=%s: %s", namespace, e)
+        return []
+
+
+async def fetch_cold_services(
+    namespace: str, backend_url: str, stale_days: int = 14, scanned_within_days: int = 2,
+) -> List[Dict[str, Any]]:
+    """Read the namespace's "gone quiet, not just unscanned" services
+    (ROADMAP P31 phase 2, ADR 0038). Degrades to an empty list on any
+    failure, same convention as fetch_service_dependencies — a missing
+    report should never block a turn, just mean "nothing to report"."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{backend_url.rstrip('/')}/api/cold-services",
+                params={"namespace": namespace, "stale_days": stale_days, "scanned_within_days": scanned_within_days},
+            )
+            resp.raise_for_status()
+            return resp.json() or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("fetch_cold_services failed for namespace=%s: %s", namespace, e)
         return []
 
 

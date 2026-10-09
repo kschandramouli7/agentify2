@@ -32,6 +32,8 @@ class _Cfg:
     collector_token = "tok"
     max_pods_per_namespace = 2      # deliberately smaller than the pod count
     log_tail_lines = 200
+    mine_external_egress = False
+    cross_cluster_ingress_kinds = ["route"]  # ROADMAP P31 phase 1
 
 
 @pytest.fixture
@@ -210,3 +212,108 @@ async def test_scan_namespace_pushes_port_and_last_known_outcome(monkeypatch, ca
     # The qualified FQDN form ("api.payments.svc.cluster.local") is a
     # separate (port=0) key, so it keeps its own distinct match_kind.
     assert ("batch", "api", 0, None, "", "batch-1", "qualified", "live") in pushed
+
+
+@pytest.mark.asyncio
+async def test_scan_namespace_promotes_a_resolved_external_mention_to_cross_cluster(monkeypatch, captured):
+    """ROADMAP P31 phase 1 (ADR 0037): an external-shaped hostname that
+    resolves to exactly one cluster via the ingress lookup is promoted to
+    target_kind="cross_cluster" with that cluster's id — and this happens
+    UNCONDITIONALLY, even with mine_external_egress left at its default
+    (False), since a resolved match is no longer an unvalidated guess."""
+    pushed = []
+
+    async def fake_push_dependency(ns, from_service, to_service, backend_url, token, target_kind="service",
+                                    port=None, outcome=None, path="", caller_pod="", match_kind="", source="",
+                                    target_cluster_id=""):
+        pushed.append((from_service, to_service, target_kind, target_cluster_id))
+
+    async def fake_resolve(host, backend_url, kinds, cache):
+        assert host == "shop.apps.dc2.example.com"
+        return ["cluster-b"]
+
+    monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
+    monkeypatch.setattr(discovery_main, "resolve_cross_cluster_target", fake_resolve)
+
+    services = [{"name": "batch", "selector": {"app": "batch"}}]
+    pods = [_pod("batch-1", "batch")]
+    logs = "calling http://shop.apps.dc2.example.com/charge now"
+    await _run(monkeypatch, services, pods, {"batch-1": logs})
+
+    assert ("batch", "shop.apps.dc2.example.com", "cross_cluster", "cluster-b") in pushed
+
+
+@pytest.mark.asyncio
+async def test_scan_namespace_ambiguous_cross_cluster_match_is_promoted_but_unattributed(monkeypatch, captured):
+    """A hostname matching more than one cluster's ingress entries (a GSLB
+    name briefly fronting both during a migration overlap) is still
+    promoted to cross_cluster — but target_cluster_id stays "", never a
+    guess at which one."""
+    pushed = []
+
+    async def fake_push_dependency(ns, from_service, to_service, backend_url, token, target_kind="service",
+                                    port=None, outcome=None, path="", caller_pod="", match_kind="", source="",
+                                    target_cluster_id=""):
+        pushed.append((from_service, to_service, target_kind, target_cluster_id))
+
+    async def fake_resolve(host, backend_url, kinds, cache):
+        return ["cluster-b", "cluster-c"]
+
+    monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
+    monkeypatch.setattr(discovery_main, "resolve_cross_cluster_target", fake_resolve)
+
+    services = [{"name": "batch", "selector": {"app": "batch"}}]
+    pods = [_pod("batch-1", "batch")]
+    logs = "calling http://shared.example.com/charge now"
+    await _run(monkeypatch, services, pods, {"batch-1": logs})
+
+    assert ("batch", "shared.example.com", "cross_cluster", "") in pushed
+
+
+@pytest.mark.asyncio
+async def test_scan_namespace_unresolved_external_mention_still_respects_the_egress_gate(monkeypatch, captured):
+    """When the ingress lookup finds NO match anywhere in the fleet, this is
+    a genuinely unvalidated external mention — it must fall through to
+    today's MINE_EXTERNAL_EGRESS gate, not become unconditionally-on just
+    because a lookup was attempted."""
+    pushed = []
+
+    async def fake_push_dependency(ns, from_service, to_service, backend_url, token, target_kind="service",
+                                    port=None, outcome=None, path="", caller_pod="", match_kind="", source="",
+                                    target_cluster_id=""):
+        pushed.append((from_service, to_service, target_kind, target_cluster_id))
+
+    async def fake_resolve(host, backend_url, kinds, cache):
+        return []
+
+    monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
+    monkeypatch.setattr(discovery_main, "resolve_cross_cluster_target", fake_resolve)
+
+    services = [{"name": "batch", "selector": {"app": "batch"}}]
+    pods = [_pod("batch-1", "batch")]
+    logs = "calling https://api.anthropic.com/v1/messages now"
+
+    # Default _Cfg (mine_external_egress=False): no match anywhere in the
+    # fleet, and the gate is off — nothing pushed, same as before this phase.
+    await _run(monkeypatch, services, pods, {"batch-1": logs})
+    assert pushed == []
+
+    # With the gate on, the unresolved mention still pushes as plain "external".
+    class _CfgEgressOn(_Cfg):
+        mine_external_egress = True
+
+    async def fake_list_services(ns):
+        return services
+
+    async def fake_list_pods(ns):
+        return pods
+
+    async def fake_get_pod_logs(ns, pod, tail_lines=200):
+        return logs
+
+    monkeypatch.setattr(discovery_main.k8s_client, "list_services", fake_list_services)
+    monkeypatch.setattr(discovery_main.k8s_client, "list_pods", fake_list_pods)
+    monkeypatch.setattr(discovery_main.k8s_client, "get_pod_logs", fake_get_pod_logs)
+    await discovery_main._scan_namespace("payments", _CfgEgressOn())
+
+    assert ("batch", "api.anthropic.com", "external", "") in pushed

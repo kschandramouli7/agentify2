@@ -41,6 +41,7 @@ from .service_topology import (
     extract_service_calls,
     push_dependency,
     push_scan_coverage,
+    resolve_cross_cluster_target,
 )
 
 logger = logging.getLogger("agentify.discovery")
@@ -67,8 +68,15 @@ def _service_for_pod(pod_labels: Dict[str, str], services: List[Dict[str, Any]])
 
 
 async def _scan_namespace(
-    ns: str, cfg: Config, services_by_namespace: Optional[Dict[str, Set[str]]] = None
+    ns: str, cfg: Config, services_by_namespace: Optional[Dict[str, Set[str]]] = None,
+    cross_cluster_cache: Optional[Dict[str, List[str]]] = None,
 ) -> None:
+    # ROADMAP P31 phase 1: memoizes resolve_cross_cluster_target per distinct
+    # host for this whole scan cycle (passed in from _scan_once, shared
+    # across every namespace) so N pods across N namespaces mentioning the
+    # same migrating host cost one /admin/ingress-lookup call, not N.
+    cc_cache: Dict[str, List[str]] = cross_cluster_cache if cross_cluster_cache is not None else {}
+
     services = await k8s_client.list_services(ns)
     # Seed the shared index from the list this scan already fetched. Free, and
     # it closes the startup window in which the pods watch can deliver events
@@ -164,11 +172,32 @@ async def _scan_namespace(
             # Cross-namespace stays on unconditionally: its namespace segment is
             # checked against namespaces the Hub tracks, so it has the
             # validation the external tier lacks.
-            if kind == "external" and not cfg.mine_external_egress:
-                continue
+            #
+            # ROADMAP P31 phase 1 (ADR 0037): an "external"-shaped mention gets
+            # ONE more chance before the gate above applies — check whether it
+            # actually matches a REAL Ingress/Route elsewhere in this tenant's
+            # fleet. A match promotes it to the validated cross_cluster tier,
+            # which (like cross_namespace) stays on unconditionally, since it
+            # is no longer an unvalidated guess. This costs one memoized
+            # /admin/ingress-lookup call per distinct external-shaped host per
+            # cycle even when MINE_EXTERNAL_EGRESS is off — a deliberate,
+            # bounded, best-effort cost (see ADR 0037's own note on this).
+            target_cluster_id = ""
+            if kind == "external":
+                cluster_ids = await resolve_cross_cluster_target(
+                    target, cfg.backend_url, cfg.cross_cluster_ingress_kinds, cc_cache,
+                )
+                if cluster_ids:
+                    # Ambiguous (>1 cluster, e.g. a GSLB name briefly fronting
+                    # both during a migration overlap) is still promoted, but
+                    # deliberately left unattributed rather than guessed.
+                    kind = "cross_cluster"
+                    target_cluster_id = cluster_ids[0] if len(cluster_ids) == 1 else ""
+                elif not cfg.mine_external_egress:
+                    continue
             await push_dependency(
                 ns, from_service, target, cfg.backend_url, cfg.collector_token, target_kind=kind,
-                caller_pod=pod["name"], source="live",
+                caller_pod=pod["name"], source="live", target_cluster_id=target_cluster_id,
             )
 
     await push_scan_coverage(ns, coverage, cfg.backend_url, cfg.collector_token)
@@ -334,13 +363,17 @@ async def _scan_health(namespaces: List[str], cfg: Config, caps: Optional[Dict[s
     capability info" convention _scan_ingress established.
     """
     k8s_version = caps.get("gitVersion", "") if caps else ""
+    # Platform labeling for cross-cluster edges (cross-cluster call capture
+    # extension, 2026-10-09): detected once here from the same `caps` this
+    # function already reads, never a separate API call.
+    platform = k8s_client.detect_platform(caps) if caps else ""
     pods_total = 0
     pods_ready = 0
     for ns in namespaces:
         counts = await k8s_client.list_pod_health(ns)
         pods_total += counts["total"]
         pods_ready += counts["ready"]
-    await push_health(k8s_version, pods_total, pods_ready, cfg.backend_url, cfg.collector_token)
+    await push_health(k8s_version, pods_total, pods_ready, cfg.backend_url, cfg.collector_token, platform=platform)
 
 
 async def _scan_metrics(namespaces: List[str], cfg: Config) -> None:
@@ -409,9 +442,15 @@ async def _scan_once(cfg: Config, caps: Optional[Dict[str, Any]]) -> None:
     # mention is validated on BOTH segments. Validating only the namespace let
     # a trace UUID through as a service name on 2026-09-05 — the same class of
     # failure that disabled the external tier, one level narrower.
+    #
+    # ROADMAP P31 phase 1: one cross-cluster ingress-lookup cache for this
+    # whole cycle, shared across every namespace below — a host mentioned by
+    # pods in two different namespaces still costs one /admin/ingress-lookup
+    # call, not two.
+    cross_cluster_cache: Dict[str, List[str]] = {}
     for ns in namespaces:
         try:
-            await _scan_namespace(ns, cfg, services_by_namespace)
+            await _scan_namespace(ns, cfg, services_by_namespace, cross_cluster_cache)
         except Exception:
             logger.exception("scan failed for namespace=%s", ns)
 

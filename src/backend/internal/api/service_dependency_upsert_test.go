@@ -28,12 +28,29 @@ type fakeServiceDependencyStore struct {
 	lastCallerPod string
 	lastMatchKind string
 	lastSource    string
+	// ROADMAP P31 phase 1 (cross-cluster call capture, ADR 0037).
+	lastTargetClusterID string
 
 	// Scan-coverage calls, recorded so the coverage tests can assert on them
 	// (ROADMAP P27 phase 1).
 	coverageCalls []coverageCall
 	coverageErr   error
 	coverageRows  []pgstore.ScanCoverage
+
+	// ROADMAP P31 phase 2 (cold services, ADR 0038).
+	coldServicesRows          []pgstore.ColdService
+	coldServicesErr           error
+	lastColdStaleDays         int
+	lastColdScannedWithinDays int
+}
+
+func (f *fakeServiceDependencyStore) ListColdServices(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]pgstore.ColdService, error) {
+	f.lastColdStaleDays = staleDays
+	f.lastColdScannedWithinDays = scannedWithinDays
+	if f.coldServicesErr != nil {
+		return nil, f.coldServicesErr
+	}
+	return f.coldServicesRows, nil
 }
 
 type coverageCall struct {
@@ -58,20 +75,21 @@ func (f *fakeServiceDependencyStore) ListScanCoverage(ctx context.Context, tenan
 	return f.coverageRows, nil
 }
 
-func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, id, tenantID, clusterID, namespace, fromService, toService, targetKind string, port int, outcome, path, callerPod, matchKind, source string) error {
+func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context, in pgstore.ServiceDependencyUpsert) error {
 	f.upsertCalled = true
-	f.lastTenantID = tenantID
-	f.lastClusterID = clusterID
-	f.lastNamespace = namespace
-	f.lastFrom = fromService
-	f.lastTo = toService
-	f.lastTargetKind = targetKind
-	f.lastPort = port
-	f.lastOutcome = outcome
-	f.lastPath = path
-	f.lastCallerPod = callerPod
-	f.lastMatchKind = matchKind
-	f.lastSource = source
+	f.lastTenantID = in.TenantID
+	f.lastClusterID = in.ClusterID
+	f.lastNamespace = in.Namespace
+	f.lastFrom = in.FromService
+	f.lastTo = in.ToService
+	f.lastTargetKind = in.TargetKind
+	f.lastPort = in.Port
+	f.lastOutcome = in.Outcome
+	f.lastPath = in.Path
+	f.lastCallerPod = in.CallerPod
+	f.lastMatchKind = in.MatchKind
+	f.lastSource = in.Source
+	f.lastTargetClusterID = in.TargetClusterID
 	return nil
 }
 
@@ -344,6 +362,48 @@ func TestHandleServiceDependencyUpsert_MatchKindAndSource(t *testing.T) {
 		}
 		if store.lastSource != "" {
 			t.Errorf("source: want empty (unknown sentinel), got %q", store.lastSource)
+		}
+	})
+}
+
+// TestHandleServiceDependencyUpsert_TargetClusterID pins ROADMAP P31 phase 1
+// (cross-cluster call capture, ADR 0037): target_cluster_id passes through
+// from the request body to the store unchanged, including the "absent from
+// the body" case — either a pre-phase collector, or a cross_cluster edge
+// whose ingress-lookup resolved ambiguously — same "not captured" sentinel
+// every other optional field on this request already uses.
+func TestHandleServiceDependencyUpsert_TargetClusterID(t *testing.T) {
+	t.Run("target_cluster_id present in the body is passed through as-is", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"shop.example.com","target_kind":"cross_cluster","target_cluster_id":"cluster-b"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastTargetClusterID != "cluster-b" {
+			t.Errorf("target_cluster_id: want %q, got %q", "cluster-b", store.lastTargetClusterID)
+		}
+	})
+
+	t.Run("target_cluster_id absent from the body defaults to the empty sentinel", func(t *testing.T) {
+		store := &fakeServiceDependencyStore{}
+		h := &Handler{serviceDepsStore: store, integrationStore: &fakeIntegrationStore{}}
+		body := `{"namespace":"payments","from_service":"payment-worker","to_service":"payment-api"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/service-dependencies", strings.NewReader(body))
+		w := httptest.NewRecorder()
+
+		h.HandleServiceDependencyUpsert(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status: want %d, got %d", http.StatusNoContent, w.Code)
+		}
+		if store.lastTargetClusterID != "" {
+			t.Errorf("target_cluster_id: want empty (unknown sentinel), got %q", store.lastTargetClusterID)
 		}
 	})
 }

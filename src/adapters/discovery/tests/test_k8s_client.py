@@ -414,6 +414,33 @@ async def test_discover_api_capabilities_both_absent_on_vanilla_k8s(monkeypatch)
     assert caps["openshift_route"] is False
 
 
+# ── detect_platform (platform-labeling extension, 2026-10-09) ───────────────
+#
+# Pure function over already-gathered capability data — no mocking needed.
+# No node-label approach here, deliberately: Discovery has never had a
+# `nodes` RBAC grant (see health_snapshot.py's own note on why capacity
+# data was left out for the same reason).
+
+def test_detect_platform_openshift_wins_on_the_route_capability():
+    assert k8s_client.detect_platform({"openshift_route": True, "gitVersion": "v1.28.5-eks-abc123"}) == "openshift"
+
+
+def test_detect_platform_eks_from_a_real_gitversion_suffix():
+    assert k8s_client.detect_platform({"openshift_route": False, "gitVersion": "v1.28.5-eks-cedffd4"}) == "eks"
+
+
+def test_detect_platform_gke_from_a_real_gitversion_suffix():
+    assert k8s_client.detect_platform({"openshift_route": False, "gitVersion": "v1.27.8-gke.1000"}) == "gke"
+
+
+def test_detect_platform_unknown_on_vanilla_k8s():
+    assert k8s_client.detect_platform({"openshift_route": False, "gitVersion": "v1.30.0"}) == ""
+
+
+def test_detect_platform_handles_missing_keys_gracefully():
+    assert k8s_client.detect_platform({}) == ""
+
+
 # ── watch_resource / list_container_restarts / parse_cert_expiry
 # (ADR 0027, merged from the retired k8fy adapter) ──────────────────────────
 

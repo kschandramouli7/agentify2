@@ -15,11 +15,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-async def push_health(k8s_version: str, pods_total: int, pods_ready: int, backend_url: str, collector_token: str) -> None:
+async def push_health(
+    k8s_version: str, pods_total: int, pods_ready: int, backend_url: str, collector_token: str,
+    platform: str = "",
+) -> None:
     """Push this cluster's current snapshot. The Hub overwrites this
     cluster's single cluster_health_snapshots row in place (not a set of
-    rows) — always reflects the most recent scan cycle, not history."""
-    payload = {"k8s_version": k8s_version, "pods_total": pods_total, "pods_ready": pods_ready}
+    rows) — always reflects the most recent scan cycle, not history.
+
+    platform ("openshift" | "eks" | "gke" | "") is sent explicitly, never
+    omitted — same "not captured" sentinel convention every other optional
+    field in this codebase follows. See k8s_client.py's detect_platform for
+    how it's derived.
+    """
+    payload = {"k8s_version": k8s_version, "pods_total": pods_total, "pods_ready": pods_ready, "platform": platform or ""}
     # Omit the header entirely when unset — see push_inventory's identical
     # comment (inventory.py) for why.
     headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}

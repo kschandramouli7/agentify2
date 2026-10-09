@@ -35,6 +35,19 @@ class Config:
     # is validated against namespaces the Hub actually tracks, which is the
     # kind of guard the external tier lacks entirely.
     mine_external_egress: bool = False
+    # Which cluster_ingress_endpoints `kind`s are trusted to validate a
+    # cross-cluster target (ROADMAP P31 phase 1, ADR 0037). Route entries
+    # are an exact 1:1 host->backend mapping (k8s_client.py's list_routes);
+    # Ingress/HTTPRoute entries are a known-lossy N×M cross product
+    # (ingress.py's own docstring).
+    #
+    # Widened to include ingress/httproute (2026-10-09, ADR 0037 amendment):
+    # Route is an OpenShift-only CRD, so a Route-only default silently
+    # cannot capture ANY cross-cluster edge touching a non-OpenShift
+    # platform — exactly the case a mixed OpenShift+EKS+GKE fleet is. This
+    # trades Route's exactness for Ingress/HTTPRoute's lossy-but-only-
+    # available-form coverage on those platforms, fleet-wide, by default.
+    cross_cluster_ingress_kinds: List[str] = field(default_factory=lambda: ["route", "ingress", "httproute"])
 
 
 def load_from_env() -> Config:
@@ -52,6 +65,7 @@ def load_from_env() -> Config:
         ),
         health_port=_int_env("HEALTH_PORT", 8300),
         mine_external_egress=_bool_env("MINE_EXTERNAL_EGRESS", False),
+        cross_cluster_ingress_kinds=_list_env("CROSS_CLUSTER_INGRESS_KINDS", "route,ingress,httproute"),
     )
 
 
