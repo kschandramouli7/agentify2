@@ -177,8 +177,14 @@ _MAX_RAW_PATH_LEN = 200  # a longer capture is more likely log prose than a real
 
 def _normalize_path(raw: str) -> str:
     """/orders/12345 -> /orders/:id. Empty or unparseable input -> "" (the
-    "not captured" sentinel everywhere else in this pipeline uses)."""
-    if not raw or len(raw) > _MAX_RAW_PATH_LEN:
+    "not captured" sentinel everywhere else in this pipeline uses). A bare
+    "/" with nothing after it normalizes to "" too — unlike "/health" or
+    "/v1/pki/issue", it names no operation, so it carries no more
+    diagnostic value than "no path captured" at all. Without this, a log
+    line ending "host/" (no path) and one ending just "host" (also no
+    path) would split the same edge's evidence across two rows instead of
+    accumulating in one."""
+    if not raw or raw == "/" or len(raw) > _MAX_RAW_PATH_LEN:
         return ""
     segments = raw.split("/")
     normalized = []

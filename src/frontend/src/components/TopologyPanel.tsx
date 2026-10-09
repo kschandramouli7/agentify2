@@ -705,14 +705,13 @@ export function TopologyPanel() {
         <div>
           <h2>Service Dependencies</h2>
           <p className="adm-panel__desc">
-            Every service in the namespace, its declared entry points, and the calls actually
-            observed between them. <strong>Solid arrows are mined from pod logs</strong> — an
-            edge exists only where a caller logged the callee's hostname, so a missing one
-            means <em>no evidence</em>, not <em>no dependency</em>, and the counts are scan
-            cycles, measuring <em>confidence, not traffic</em>. <strong>Dashed purple arrows
-            are declared routes</strong> read from Kubernetes Ingress objects — facts, with no
-            count. A dashed box is a service the inventory knows about that no observed call
-            mentions.
+            Every service in this namespace, how it's reached from outside, and the calls
+            we've actually seen between services. <strong>Solid arrows come from log
+            evidence</strong> — if one's missing, we just haven't seen it yet, not that it
+            doesn't happen. The number on each arrow is how often we've seen it, not how much
+            traffic it carries. <strong>Dashed purple arrows are routes declared in
+            Kubernetes</strong>, not observed — always shown, with no count. A dashed box is a
+            known service we've never seen called.
           </p>
         </div>
         <div className="adm-filters">

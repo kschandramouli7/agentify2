@@ -275,6 +275,7 @@ def test_extract_service_calls_path_stops_at_trailing_log_prose():
     ("/sessions/0123456789abcdef0123456789abcdef", "/sessions/:id"),  # 32-char hex
     ("/health", "/health"),              # no identifier segment — unchanged
     ("/v1/pki/issue", "/v1/pki/issue"),  # no identifier segment — unchanged
+    ("/", ""),                           # names no operation — same as not captured
     ("", ""),
 ])
 def test_normalize_path(raw, normalized):
