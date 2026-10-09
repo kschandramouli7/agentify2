@@ -157,11 +157,28 @@ class Settings(BaseSettings):
 
     # Glue-based dependency mining (ADR 0029, ROADMAP P15/P18 use case #2) —
     # a periodic background task, gated on the same athena_* config above
-    # (skips itself when unconfigured). Default matches Glue's hour-level
-    # partition granularity (_partition_predicate) so each cycle scans
-    # exactly the newly-landed partition rather than re-scanning old data.
+    # (skips itself when unconfigured).
+    #
+    # Revised 2026-10-09 (was 3600s, "matches Glue's hour-level partition
+    # granularity"): that reasoning undersold the real floor. The hour
+    # partition is just a storage layout — data actually lands inside it
+    # every time Firehose flushes, which `infra/terraform/aws/logging.tf`'s
+    # aws_kinesis_firehose_delivery_stream sets to buffering_interval = 300
+    # (5 minutes). Polling once an hour meant sitting on up to ~55 minutes
+    # of already-landed data for no reason. 300s matches that real cadence —
+    # polling faster than Firehose's own flush interval would just rescan
+    # data that hasn't changed yet.
+    #
+    # Cost tradeoff, accepted not hidden: run_once's own `hours_back=2`
+    # default (dependency_miner.py) is unchanged and unrelated to this
+    # interval — it exists to cover late/cross-hour-boundary data, a
+    # correctness margin, not a freshness one. At 300s instead of 3600s,
+    # that same 2-hour window gets rescanned ~12x as often — a real Athena
+    # bytes-scanned cost increase, independent of and in addition to this
+    # freshness gain. Revisit `hours_back` separately if that cost matters
+    # more than the freshness win in practice.
     dependency_mining_interval_seconds: int = Field(
-        default=3600, validation_alias=AliasChoices("DEPENDENCY_MINING_INTERVAL_SECONDS")
+        default=300, validation_alias=AliasChoices("DEPENDENCY_MINING_INTERVAL_SECONDS")
     )
 
     # Langfuse prompt management (optional — falls back to local strings if not set)

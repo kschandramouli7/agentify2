@@ -242,3 +242,24 @@ the form nearly every real caller uses.
   "which cluster is pod X in" is ever built for ADR 0028's pod-specific
   fan-out limitation, which could also simplify parts of this miner's
   selector-matching need.
+
+## Amendment (2026-10-09) — interval lowered to 300s; the "up to an hour" cost above no longer holds
+
+The **"hourly cadence means ... up to an hour to first appear"** cost
+accepted above was based on an incomplete picture: `DEPENDENCY_MINING_INTERVAL_SECONDS`
+was set to match the Glue table's hour-level **partition** granularity, but
+the partition boundary isn't the same thing as how often new data actually
+*lands* inside it. `infra/terraform/aws/logging.tf`'s Firehose delivery
+stream flushes to S3 every 300 seconds (`buffering_interval = 300`) —
+polling once an hour meant sitting on up to ~55 minutes of already-landed
+data for no reason. `dependency_mining_interval_seconds`'s default is now
+**300s**, matching that real flush cadence — the floor below which polling
+faster would just rescan data that hasn't changed yet.
+
+`run_once`'s own `hours_back=2` default (`dependency_miner.py`) is
+unchanged, deliberately: it exists to cover late/cross-hour-boundary data,
+a correctness margin unrelated to polling frequency. At 300s instead of
+3600s, that same 2-hour window is now rescanned ~12x as often — a real
+Athena bytes-scanned cost increase, accepted alongside the freshness gain,
+not instead of it. Revisit `hours_back` on its own if that cost turns out
+to matter more in practice than the latency win does.

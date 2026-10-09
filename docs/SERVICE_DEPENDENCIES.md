@@ -392,7 +392,7 @@ function, so the matching rule below is true of all of them.
 | Producer | Reads | Cadence | Scope |
 |---|---|---|---|
 | **Live miner** — `_scan_namespace`, [discovery/main.py](../src/adapters/discovery/main.py) | pod logs via the K8s API, on the cluster | `SCAN_INTERVAL_SECONDS`, **60s** | the cluster it runs in |
-| **Glue/Athena miner** — [dependency_miner.py](../src/agent/k8fy/dependency_miner.py) | shipped logs in Glue, via Athena | `DEPENDENCY_MINING_INTERVAL_SECONDS`, **3600s** | every onboarded cluster |
+| **Glue/Athena miner** — [dependency_miner.py](../src/agent/k8fy/dependency_miner.py) | shipped logs in Glue, via Athena | `DEPENDENCY_MINING_INTERVAL_SECONDS`, **300s** (matches Firehose's own 5-minute flush interval — revised 2026-10-09, was 3600s) | every onboarded cluster |
 | **Agent skill path** — `mine_service_dependencies`, [service_topology.py](../src/agent/k8fy/service_topology.py) | the log tail a diagnose already fetched | per query | whatever was diagnosed |
 
 Live mining is the **faster** signal; Glue mining is the **broader** one (a

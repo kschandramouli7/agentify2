@@ -910,15 +910,22 @@ export function TopologyPanel() {
                       {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
                       failing: {unhealthy.map(e => {
                         const h = edgeHealth(e);
-                        return `${e.from_service}→${e.to_service} (${h.badCount}/${h.classified} failed)`;
+                        // Two rows for the same from→to pair are not a
+                        // duplicate — they're distinct edges that differ by
+                        // port and/or path (the Dependencies table's own
+                        // columns), which this summary must show or they
+                        // look identical. ":8443" / "/charge" mirror how a
+                        // URL itself would distinguish them.
+                        const where = (e.port ? `:${e.port}` : "") + (e.path || "");
+                        return `${e.from_service}→${e.to_service}${where} (${h.badCount}/${h.classified} failed)`;
                       }).join(", ")}.
                     </>
                   }
                   detail={
                     <>
-                      Based only on calls with a classified outcome — most evidence has none yet
-                      (outcome inference is deliberately conservative), so this is a lower bound on
-                      how many dependencies are actually unhealthy, not the full picture.
+                      This is likely an undercount — many calls aren't classified as pass or
+                      fail yet. Many log lines never say whether the call succeeded — no status
+                      code, no error word. Rather than guess, those are left unclassified.
                     </>
                   }
                 />
@@ -931,14 +938,20 @@ export function TopologyPanel() {
                   headline={
                     <>
                       {rare.length === 1 ? "1 edge is" : `${rare.length} edges are`} caught in under a
-                      quarter of scans ({rare.map(e => `${e.from_service}→${e.to_service}`).join(", ")}).
+                      quarter of scans ({rare.map(e => {
+                        // Same fix as the unhealthy banner above: two rows
+                        // for the same from→to pair differ by port/path,
+                        // not a duplicate — show what actually differs.
+                        const where = (e.port ? `:${e.port}` : "") + (e.path || "");
+                        return `${e.from_service}→${e.to_service}${where}`;
+                      }).join(", ")}).
                     </>
                   }
                   detail={
                     <>
-                      The miner samples only 5 pods per namespace and the last 200 log lines, so edges
-                      it rarely catches are a sign it is <strong>missing others entirely</strong> — treat
-                      this graph as more incomplete than the counts suggest.
+                      We only sample a limited slice of pods and logs per namespace, so a rarely
+                      caught edge likely means <strong>we're missing others entirely</strong> —
+                      there's probably more going on than this graph shows.
                     </>
                   }
                 />
