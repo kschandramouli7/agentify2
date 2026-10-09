@@ -83,6 +83,20 @@ const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "
 // the Python extraction logic itself (ADR 0029). Without this, an operator
 // would have to already know a stored edge's normalized template
 // ("/orders/:id") to find it, rather than typing a real example they saw.
+// Two edge rows sharing the same from→to pair are not a duplicate — they
+// differ by port and/or path, the Dependencies table's own columns — and
+// the unhealthy/incomplete banners below must show what differs or they
+// look like an exact duplicate. Port is appended bare (":8443" reads
+// unambiguously as a port). Path is wrapped in brackets rather than bare-
+// concatenated: a bare "/" path (a real observation — a call to the root
+// path, not "no path captured") would otherwise render as a trailing slash
+// that looks like a typo, e.g. "payment-worker→payment/".
+function edgeDisambiguator(e: { port?: number; path?: string }): string {
+  const port = e.port ? `:${e.port}` : "";
+  const path = e.path ? ` [${e.path}]` : "";
+  return `${port}${path}`;
+}
+
 function normalizePathForFilter(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length > PATH_MAX_RAW_LEN) return "";
@@ -910,14 +924,7 @@ export function TopologyPanel() {
                       {unhealthy.length === 1 ? "1 dependency is" : `${unhealthy.length} dependencies are`}{" "}
                       failing: {unhealthy.map(e => {
                         const h = edgeHealth(e);
-                        // Two rows for the same from→to pair are not a
-                        // duplicate — they're distinct edges that differ by
-                        // port and/or path (the Dependencies table's own
-                        // columns), which this summary must show or they
-                        // look identical. ":8443" / "/charge" mirror how a
-                        // URL itself would distinguish them.
-                        const where = (e.port ? `:${e.port}` : "") + (e.path || "");
-                        return `${e.from_service}→${e.to_service}${where} (${h.badCount}/${h.classified} failed)`;
+                        return `${e.from_service}→${e.to_service}${edgeDisambiguator(e)} (${h.badCount}/${h.classified} failed)`;
                       }).join(", ")}.
                     </>
                   }
@@ -938,13 +945,9 @@ export function TopologyPanel() {
                   headline={
                     <>
                       {rare.length === 1 ? "1 edge is" : `${rare.length} edges are`} caught in under a
-                      quarter of scans ({rare.map(e => {
-                        // Same fix as the unhealthy banner above: two rows
-                        // for the same from→to pair differ by port/path,
-                        // not a duplicate — show what actually differs.
-                        const where = (e.port ? `:${e.port}` : "") + (e.path || "");
-                        return `${e.from_service}→${e.to_service}${where}`;
-                      }).join(", ")}).
+                      quarter of scans ({rare.map(e =>
+                        `${e.from_service}→${e.to_service}${edgeDisambiguator(e)}`
+                      ).join(", ")}).
                     </>
                   }
                   detail={
