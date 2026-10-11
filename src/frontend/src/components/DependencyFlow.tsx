@@ -242,9 +242,9 @@ function fit(text: string, max: number): string {
 const NODE_W = 158;
 const NODE_H = 60;   // three lines: name, what it is, and its role in the graph
 const BEND_H = 20;   // a routing waypoint reserves less room than a real node
-const COL_GAP = 84;
-const ROW_GAP = 26;
-const PAD = 18;
+const COL_GAP = 104; // widened (was 84) for more breathing room between columns
+const ROW_GAP = 32;  // widened (was 26) so stacked edges/nodes don't feel cramped
+const PAD = 22;      // widened (was 18)
 
 // Past this the picture stops informing and the focus view/table take over.
 const MAX_NODES = 24;
@@ -647,8 +647,14 @@ export function layout(
 }
 
 const CORNER = 5;    // corner rounding; small enough to still read as square
-const PORT_GAP = 9;  // vertical spacing between an edge's attachment points
-const TRACK_GAP = 14; // horizontal spacing between edges' vertical runs
+const PORT_GAP = 11; // vertical spacing between an edge's attachment points (was 9)
+// Horizontal spacing between parallel edges' vertical runs (was 14). Two
+// edges to the same target get labels centred TRACK_GAP apart (see
+// edgePath's `mid`); .flow__count is 10.5px tabular-nums, so a 5-digit
+// count like "49346" renders ~32px wide. 14px left two such labels reading
+// as one illegible blob — confirmed from a real screenshot, not a guess.
+// 32px is the minimum that clears a 5-digit label; rounded up for margin.
+const TRACK_GAP = 36;
 const BACK_EDGE_ROOM = 46; // room below the boxes for a back edge's return track
 
 /**
@@ -780,23 +786,40 @@ export function edgePath(
   }
 
   const track = port?.track ?? 0;
+  // Labels get a small vertical nudge proportional to this edge's own track,
+  // on top of whatever x-separation the route itself provides — a second,
+  // independent line of defense against two parallel edges' labels landing
+  // close enough to blur together (textAnchor="middle" digit strings are
+  // wider than they look, and TRACK_GAP alone is sized for the common case,
+  // not every count's digit length).
+  const labelYNudge = Math.sign(track) * 8;
 
   if (via.length > 0) {
-    // A column-skipping edge takes ONE bypass channel rather than an elbow per
-    // leg. The waypoint already reserves a row between the boxes it passes, so
-    // running the whole horizontal at that row is both correct and legible:
-    // the edge visibly goes around the intervening node.
-    //
-    // Elbowing per leg instead produced a staircase whose segments closed into
-    // a rectangle, which read as a container rather than as two edges.
-    const channelY = via[0].y;
+    // A column-skipping edge visits EVERY waypoint layout() reserved for it,
+    // not just the first. Each intervening column orders its own waypoints
+    // independently (one barycenter pass per column), so two columns an edge
+    // crosses are NOT guaranteed to land on the same row — collapsing to a
+    // single channel at via[0]'s row (the previous approach) meant any
+    // column after the first had no actual reservation backing the row the
+    // edge was drawn through, so it could cross straight through an
+    // unrelated node that legitimately owned that row in ITS OWN column.
+    // Visiting each via[i].x/y in turn keeps the edge inside the space
+    // layout() actually reserved for it, the whole way across.
     const sx = start.x + 18 + track;
     const ex = end.x - 18 - track;
     const pts: Pt[] = [start];
-    if (Math.abs(start.y - channelY) >= 0.5) pts.push({ x: sx, y: start.y }, { x: sx, y: channelY });
-    if (Math.abs(end.y - channelY) >= 0.5) pts.push({ x: ex, y: channelY }, { x: ex, y: end.y });
+    if (Math.abs(start.y - via[0].y) >= 0.5) pts.push({ x: sx, y: start.y }, { x: sx, y: via[0].y });
+    pts.push({ x: via[0].x, y: via[0].y });
+    for (let i = 1; i < via.length; i++) {
+      if (Math.abs(via[i - 1].y - via[i].y) >= 0.5) pts.push({ x: via[i].x, y: via[i - 1].y });
+      pts.push({ x: via[i].x, y: via[i].y });
+    }
+    const last = via[via.length - 1];
+    if (Math.abs(last.y - end.y) >= 0.5) pts.push({ x: ex, y: last.y }, { x: ex, y: end.y });
     pts.push(end);
-    return { d: orthPath(pts), mid: { x: (sx + ex) / 2, y: channelY } };
+    const midX = via.reduce((s, p) => s + p.x, 0) / via.length;
+    const midY = via.reduce((s, p) => s + p.y, 0) / via.length;
+    return { d: orthPath(pts), mid: { x: midX, y: midY + labelYNudge } };
   }
 
   // Adjacent columns: the classic Z, with the vertical run on this edge's own
@@ -812,8 +835,8 @@ export function edgePath(
   const vertical = pts.find((q, i) => i > 0 && Math.abs(q.x - pts[i - 1].x) < 0.5 && Math.abs(q.y - pts[i - 1].y) > 8);
   const vi = vertical ? pts.indexOf(vertical) : -1;
   const mid = vi > 0
-    ? { x: pts[vi].x, y: (pts[vi].y + pts[vi - 1].y) / 2 }
-    : { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+    ? { x: pts[vi].x, y: (pts[vi].y + pts[vi - 1].y) / 2 + labelYNudge }
+    : { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 + labelYNudge };
   return { d: orthPath(pts), mid };
 }
 
