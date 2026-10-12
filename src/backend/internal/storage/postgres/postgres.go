@@ -3101,6 +3101,16 @@ type ServiceProfile struct {
 	Image           string        `json:"image"`
 	Schedule        string        `json:"schedule"`
 	ClusterID       string        `json:"cluster_id,omitempty"`
+	// Platform-labeling, widened to inventory-known services (2026-10-12):
+	// joined in at read time from cluster_health_snapshots, never stored on
+	// this row — same "derive, don't store the aggregate" posture
+	// ListServiceDependencies' own Platform field already uses. Lets a
+	// service with ZERO observed calls still show its platform on the
+	// diagram (TopologyPanel.tsx derives edge-observed nodes' platform from
+	// service_dependencies already; this covers the services that join
+	// adds nothing for, because no edge ever touched them). "" means
+	// undetected or the snapshot is missing, never a guess.
+	Platform string `json:"platform,omitempty"`
 	// When the collector last rewrote this row. A profile is DECLARED state, so
 	// it only changes on deploy — a profile hours old is normal, and the reason
 	// this is exposed is the opposite case: nothing here changes when the
@@ -3251,10 +3261,12 @@ func (c *Client) ListServiceProfiles(ctx context.Context, tenantID, namespace st
 		return nil, fmt.Errorf("set tenant context: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT namespace, service, service_type, ports, workload_kind,
-		       replicas_desired, replicas_ready, image, schedule, COALESCE(cluster_id, ''),
-		       updated_at
-		FROM cluster_services WHERE namespace = $1 ORDER BY service`, namespace)
+		SELECT cs.namespace, cs.service, cs.service_type, cs.ports, cs.workload_kind,
+		       cs.replicas_desired, cs.replicas_ready, cs.image, cs.schedule, COALESCE(cs.cluster_id, ''),
+		       cs.updated_at, COALESCE(chs.platform, '')
+		FROM cluster_services cs
+		LEFT JOIN cluster_health_snapshots chs ON chs.cluster_id = cs.cluster_id
+		WHERE cs.namespace = $1 ORDER BY cs.service`, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -3270,7 +3282,7 @@ func (c *Client) ListServiceProfiles(ctx context.Context, tenantID, namespace st
 		var updatedAt sql.NullTime
 		if err := rows.Scan(&p.Namespace, &p.Service, &p.ServiceType, &portsJSON, &p.WorkloadKind,
 			&p.ReplicasDesired, &p.ReplicasReady, &p.Image, &p.Schedule, &p.ClusterID,
-			&updatedAt); err != nil {
+			&updatedAt, &p.Platform); err != nil {
 			return nil, err
 		}
 		if updatedAt.Valid {

@@ -553,6 +553,13 @@ export type ServiceProfile = {
   image: string;
   schedule: string;                     // CronJob only
   cluster_id?: string;
+  /** Platform-labeling, widened to inventory (2026-10-12). Joined in at read
+   *  time from cluster_health_snapshots, never stored on this row — lets a
+   *  service with ZERO observed calls still show its platform badge (the
+   *  service_dependencies-based join only ever reaches services an edge
+   *  actually touched). Absent/"" means undetected or the snapshot is
+   *  missing, never a guess. */
+  platform?: string;
   /** When the collector last rewrote this row. Declared state changes only on
    *  deploy, so an old timestamp is NOT a finding by itself — what it detects
    *  is the collector having stopped, which otherwise looks exactly like a

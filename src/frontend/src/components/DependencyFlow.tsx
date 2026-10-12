@@ -744,13 +744,15 @@ export function layout(
 
 const CORNER = 5;    // corner rounding; small enough to still read as square
 const PORT_GAP = 11; // vertical spacing between an edge's attachment points (was 9)
-// Horizontal spacing between parallel edges' vertical runs (was 14). Two
-// edges to the same target get labels centred TRACK_GAP apart (see
-// edgePath's `mid`); .flow__count is 10.5px tabular-nums, so a 5-digit
-// count like "49346" renders ~32px wide. 14px left two such labels reading
-// as one illegible blob — confirmed from a real screenshot, not a guess.
-// 32px is the minimum that clears a 5-digit label; rounded up for margin.
-const TRACK_GAP = 36;
+// Horizontal spacing between parallel edges' vertical runs (was 14, then 36).
+// Two edges to the same target get labels centred TRACK_GAP apart (see
+// edgePath's `mid`); must clear the WIDEST of the stacked per-edge labels,
+// not just the evidence count. That used to be .flow__count's own 5-digit
+// count ("49346" ~32px, the reason for the 36 value) — but the port label
+// (below) changed from a bare ":8080" to "Port:8080" for clarity, which at
+// up to 5 port digits ("Port:65535") is the new widest line at ~60px.
+// Rounded up for margin, same posture as the original 14->36 fix.
+const TRACK_GAP = 64;
 const BACK_EDGE_ROOM = 46; // room below the boxes for a back edge's return track
 
 /**
@@ -1198,18 +1200,21 @@ export function DependencyFlow({
                     matters belongs on the specific line, not as a single
                     number on the box it leaves (that used to be the box's
                     OWN declared Service port, a different and often
-                    unrelated fact — see profileText's comment). A separate
-                    stacked line above the count, not appended to it: a
-                    combined "49346 · :9090" label would be wide enough to
-                    overrun TRACK_GAP's spacing (sized for a 5-digit count
-                    alone) and reintroduce the parallel-edge label collisions
-                    already fixed once this session. Omitted when not
-                    captured (0), same "silent when nothing to say"
-                    convention as the health word below — never shown as
-                    ":0". */}
+                    unrelated fact — see profileText's comment). Labelled
+                    "Port:8080", not a bare ":8080" — the bare form read as
+                    ambiguous next to the evidence count's own bare number
+                    right below it (a real screenshot showed exactly that
+                    confusion). A separate stacked line above the count, not
+                    appended to it: appending would make one line wide
+                    enough to overrun TRACK_GAP's spacing and reintroduce
+                    the parallel-edge label collisions already fixed once
+                    this session — TRACK_GAP was widened instead to clear
+                    this label's own width. Omitted when not captured (0),
+                    same "silent when nothing to say" convention as the
+                    health word below — never shown as "Port:0". */}
                 {!declared && !!e.port && (
                   <text x={mid.x} y={mid.y - 18} textAnchor="middle" className="flow__count flow__port">
-                    :{e.port}
+                    Port:{e.port}
                   </text>
                 )}
                 {/* Health word — deliberately absent when healthy or unknown,

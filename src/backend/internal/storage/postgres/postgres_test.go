@@ -666,6 +666,54 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("platform-labeling, widened to inventory (2026-10-12): ListServiceProfiles joins platform from cluster_health_snapshots, missing snapshot reads as empty not an error", func(t *testing.T) {
+		// This is what lets a service with ZERO observed calls still show its
+		// platform badge on the diagram — ListServiceDependencies' own join
+		// only ever reaches services an edge actually touched.
+		tenantID := uuid.New().String()
+		ns := "payments-" + tenantID[:8]
+		if err := client.UpsertClusterHealthSnapshot(ctx, tenantID, "profile-cluster-a", "v1.29.1-eks-abc", 10, 10, "eks"); err != nil {
+			t.Fatalf("upsert cluster health snapshot: %v", err)
+		}
+		if err := client.UpsertClusterServices(ctx, tenantID, "profile-cluster-a", map[string][]ServiceEntry{
+			ns: {
+				{Name: "known-platform-svc", Selector: map[string]string{"app": "known-platform-svc"}},
+			},
+		}); err != nil {
+			t.Fatalf("upsert cluster services (known cluster): %v", err)
+		}
+		if err := client.UpsertClusterServices(ctx, tenantID, "profile-cluster-unknown", map[string][]ServiceEntry{
+			ns: {
+				{Name: "no-snapshot-svc", Selector: map[string]string{"app": "no-snapshot-svc"}},
+			},
+		}); err != nil {
+			t.Fatalf("upsert cluster services (cluster with no health snapshot): %v", err)
+		}
+
+		profiles, err := client.ListServiceProfiles(ctx, tenantID, ns)
+		if err != nil {
+			t.Fatalf("list service profiles: %v", err)
+		}
+		byService := map[string]ServiceProfile{}
+		for _, p := range profiles {
+			byService[p.Service] = p
+		}
+		known, ok := byService["known-platform-svc"]
+		if !ok {
+			t.Fatalf("no profile for known-platform-svc; got %+v", profiles)
+		}
+		if known.Platform != "eks" {
+			t.Errorf("known-platform-svc platform = %q, want eks", known.Platform)
+		}
+		unknown, ok := byService["no-snapshot-svc"]
+		if !ok {
+			t.Fatalf("no profile for no-snapshot-svc; got %+v", profiles)
+		}
+		if unknown.Platform != "" {
+			t.Errorf("no-snapshot-svc platform = %q, want empty (no snapshot for its cluster, not an error)", unknown.Platform)
+		}
+	})
+
 	t.Run("ROADMAP P27 phase 1: scan_coverage ACCUMULATES across cycles, so a denominator survives collector restarts", func(t *testing.T) {
 		// The core of the feature is the ON CONFLICT arithmetic. The collector
 		// reports only what it did this cycle and has no durable memory across
@@ -1788,18 +1836,36 @@ func TestPostgresStores(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list snapshots: %v", err)
 		}
-		if len(snapshots) != 2 {
-			t.Fatalf("want both clusters' snapshots, got %d: %v", len(snapshots), snapshots)
-		}
+		// "Fleet-wide" means ListClusterHealthSnapshots has no tenant filter
+		// at all by design (its own SQL comment says so) — every OTHER
+		// subtest in this suite that upserts a cluster_health_snapshots row
+		// shares this one table, so asserting an exact total length here was
+		// only ever passing by accident of subtest ordering. Find this
+		// test's own two clusters among however many rows exist instead,
+		// same "find by name" pattern every other subtest in this file uses.
+		byCluster := map[string]ClusterHealthSnapshot{}
 		for _, s := range snapshots {
-			// Platform-labeling extension (2026-10-09).
-			if s.ClusterID == "cluster-a" && s.Platform != "eks" {
-				t.Errorf("cluster-a platform = %q, want eks", s.Platform)
-			}
-			if s.ClusterID == "cluster-b" && s.Platform != "" {
-				t.Errorf("cluster-b platform = %q, want empty (undetected)", s.Platform)
-			}
+			byCluster[s.ClusterID] = s
 		}
+		a, ok := byCluster["cluster-a"]
+		if !ok {
+			t.Fatalf("no snapshot for cluster-a; got %d rows: %v", len(snapshots), snapshots)
+		}
+		if a.Platform != "eks" {
+			t.Errorf("cluster-a platform = %q, want eks", a.Platform)
+		}
+		b, ok := byCluster["cluster-b"]
+		if !ok {
+			t.Fatalf("no snapshot for cluster-b; got %d rows: %v", len(snapshots), snapshots)
+		}
+		if b.Platform != "" {
+			t.Errorf("cluster-b platform = %q, want empty (undetected)", b.Platform)
+		}
+		// Captured before the re-upsert below, not hardcoded to 2 — same
+		// fleet-wide-table reasoning as above: however many rows other
+		// subtests have contributed, a re-upsert overwriting in place must
+		// not change that count, whatever it is.
+		beforeCount := len(snapshots)
 
 		// A second push to cluster-a overwrites its row in place — proves
 		// this is a single-row upsert, not an accumulating history.
@@ -1810,8 +1876,8 @@ func TestPostgresStores(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list snapshots after re-upsert: %v", err)
 		}
-		if len(snapshots) != 2 {
-			t.Fatalf("re-upsert should overwrite, not add a row: want 2 snapshots, got %d", len(snapshots))
+		if len(snapshots) != beforeCount {
+			t.Fatalf("re-upsert should overwrite, not add a row: want %d snapshots, got %d", beforeCount, len(snapshots))
 		}
 		var clusterA *ClusterHealthSnapshot
 		for i := range snapshots {

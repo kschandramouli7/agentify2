@@ -644,6 +644,12 @@ export function TopologyPanel() {
         ports: p.ports?.length ? p.ports : undefined,
         image: p.image || undefined,
         schedule: p.schedule || undefined,
+        // Platform-labeling, widened to inventory (2026-10-12): an edge
+        // (above) is the stronger signal when one exists, so this only
+        // fills the gap for a service with zero observed calls — exactly
+        // the "no observed calls" nodes that otherwise never got a badge.
+        clusterId: prev?.clusterId ?? (p.cluster_id || undefined),
+        platform: prev?.platform ?? (p.platform || undefined),
       });
     }
 
