@@ -88,6 +88,24 @@ spec:
           value: "payment-api payment payment-worker"
         - name: NAMESPACE
           value: "payments"
+        # ROADMAP P31 phase 1 validation (ADR 0037): a FULL external-looking
+        # hostname (not templated with .$NAMESPACE.svc.cluster.local the way
+        # TARGETS above is), so extract_external_mentions sees it as an
+        # "external"-shaped mention and Discovery's live scan calls
+        # /admin/ingress-lookup for it. This host is registered as a Route
+        # belonging to a synthetic second cluster_id in cluster_ingress_endpoints
+        # (not a real second cluster — see the demo-seed SQL this host's
+        # string must exactly match, case-sensitive, no scheme/port). A real
+        # match promotes the edge to target_kind=cross_cluster through the
+        # actual pipeline, not a pre-seeded row — proving the feature, not
+        # just the diagram. Space-separated, same loop shape as TARGETS.
+        # Always-on, like TARGETS above: this whole namespace exists to
+        # keep generating real dependency-mining evidence, not just for a
+        # one-off test window (contrast payment-worker.yaml's CRASH_LOOP,
+        # which IS a toggle, because a crash-looping pod is disruptive by
+        # default and should not run continuously).
+        - name: EXTERNAL_TARGETS
+          value: "payment-legacy.payments.apps.demo-ocp.example.com"
         command:
         - /bin/sh
         - -c
@@ -108,6 +126,22 @@ spec:
                 # the callee answers, and an unreachable dependency is exactly
                 # what an operator wants surfaced. payment-worker has no
                 # listener, so this branch is the expected one for it.
+                echo "payment-batch: called https://$target/ unreachable"
+              fi
+            done
+            # ROADMAP P31 phase 1 (ADR 0037) validation: logged as a FULL
+            # hostname, not built from $NAMESPACE the way the loop above is
+            # — this is the point. extract_external_mentions only promotes
+            # an "external"-shaped mention, and a qualified in-cluster name
+            # is never that. -T 3 again so a DNS failure on this made-up
+            # domain cannot stall the burst; it is always expected to be
+            # "unreachable" (nothing really resolves it), same as
+            # payment-worker's branch above — the edge exists because the
+            # call was MADE and LOGGED, not because it succeeded.
+            for target in $EXTERNAL_TARGETS; do
+              if wget -q -O- --no-check-certificate -T 3 "https://$target/" >/dev/null 2>&1; then
+                echo "payment-batch: called https://$target/ ok"
+              else
                 echo "payment-batch: called https://$target/ unreachable"
               fi
             done

@@ -95,18 +95,28 @@ export function platformLabel(platform?: string): string {
 
 // Deliberately abstract shapes, NOT the real AWS/GCP/OpenShift trademarked
 // logos — bundling official brand marks would carry trademark/usage-
-// guideline risk this codebase has no process to clear. Each is just a
-// small, distinct silhouette in the platform's existing badge colour
+// guideline risk this codebase has no process to clear. One cohesive family
+// of three precise geometric primitives (hexagon / circle / diamond), not a
+// freehand cloud silhouette — a hand-tuned bezier blob is hard to render
+// crisply at a 13px glyph size and looked rougher than a plain shape at
+// that scale. Each is filled in the platform's existing badge colour
 // (styles.css's flow__platform-badge--* variables), so the eye can tell
 // platforms apart by shape+colour before reading the text — but the text
 // (platformLabel above) always renders alongside, never alone, same "word +
 // colour, never colour/icon alone" convention every other status marker on
 // this canvas already follows.
-const PLATFORM_GLYPH_PATH: Record<string, string> = {
-  openshift: "M8 1 L14 4.5 L14 11.5 L8 15 L2 11.5 L2 4.5 Z", // hexagon
-  eks: "M4 12 Q1 12 1 9 Q1 6.5 3.5 6.3 Q4 3 7 3 Q9.5 3 10.3 5 Q13 5 13 7.5 Q15 7.8 15 10 Q15 12 12.5 12 Z", // cloud
-  gke: "M2 2 L2 14 L13 8 Z", // pennant
-};
+function PlatformShape({ platform }: { platform: string }) {
+  switch (platform) {
+    case "openshift":
+      return <path d="M8 1.2 L13.9 4.6 L13.9 11.4 L8 14.8 L2.1 11.4 L2.1 4.6 Z" />;
+    case "eks":
+      return <circle cx="8" cy="8" r="6.5" />;
+    case "gke":
+      return <path d="M8 1.5 L14.5 8 L8 14.5 L1.5 8 Z" />;
+    default:
+      return null;
+  }
+}
 
 /** A small inline glyph for a wire-level platform value, or null when
  *  undetected/unrecognized — never rendered without platformLabel's text
@@ -114,15 +124,14 @@ const PLATFORM_GLYPH_PATH: Record<string, string> = {
  *  this file's outer diagram <svg> and inside ordinary HTML (the panel
  *  header's cluster-level summary) — nested <svg> is valid in both. */
 export function PlatformGlyph({ platform, size = 13 }: { platform?: string; size?: number }) {
-  const d = platform ? PLATFORM_GLYPH_PATH[platform] : undefined;
-  if (!d) return null;
+  if (!platform || !platformLabel(platform)) return null;
   return (
     <svg
       width={size} height={size} viewBox="0 0 16 16"
       className={`flow__platform-glyph flow__platform-glyph--${platform}`}
       aria-hidden="true"
     >
-      <path d={d} />
+      <PlatformShape platform={platform} />
     </svg>
   );
 }
@@ -1309,7 +1318,7 @@ export function DependencyFlow({
                   <>
                     <svg x={n.x + NODE_W - 32} y={n.y + 3} width="13" height="13" viewBox="0 0 16 16"
                          className={`flow__platform-glyph flow__platform-glyph--${m.platform}`} aria-hidden="true">
-                      <path d={PLATFORM_GLYPH_PATH[m.platform] ?? ""} />
+                      <PlatformShape platform={m.platform} />
                     </svg>
                     <text
                       x={n.x + NODE_W - 6} y={n.y + 12} textAnchor="end"
