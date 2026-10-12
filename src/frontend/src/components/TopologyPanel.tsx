@@ -599,6 +599,35 @@ export function TopologyPanel() {
       if (kind) meta.set(e.to_service, { kind, label: e.to_service, platform: e.target_platform || undefined });
     }
 
+    // Platform-labeling, widened to every node (2026-10-12): which
+    // cluster/platform a SAME-cluster node actually runs on, from the edge
+    // that observed it — not assumed uniform across the namespace. A
+    // namespace view legitimately spans more than one of the tenant's
+    // clusters (ROADMAP P18 use case #4, ListServiceDependencies is
+    // deliberately NOT filtered by cluster_id), so two services in one view
+    // can be on two different clusters even of the same platform.
+    // from_service is always safe: it's always the observing cluster's own
+    // service. to_service is only safe when the edge is NOT cross_cluster —
+    // a cross_cluster to_service's identity is the RESOLVED TARGET's
+    // platform (target_platform, already set above from a different source
+    // of truth), not this edge's own observing cluster_id/platform.
+    // First edge to report a service wins and later ones are skipped
+    // (`!prev.clusterId` guard): a given pod only ever runs in one cluster,
+    // so every edge touching the same service should agree regardless of
+    // which one assigns it first.
+    for (const e of pathFilteredData ?? []) {
+      const fromPrev = meta.get(e.from_service);
+      if (fromPrev && fromPrev.kind === "service" && !fromPrev.clusterId) {
+        meta.set(e.from_service, { ...fromPrev, clusterId: e.cluster_id || undefined, platform: e.platform || undefined });
+      }
+      if (e.target_kind !== "cross_cluster") {
+        const toPrev = meta.get(e.to_service);
+        if (toPrev && toPrev.kind === "service" && !toPrev.clusterId) {
+          meta.set(e.to_service, { ...toPrev, clusterId: e.cluster_id || undefined, platform: e.platform || undefined });
+        }
+      }
+    }
+
     // Profiles double as an inventory source: they come from cluster_services,
     // which is the registry itself, so a service present there but missing
     // from /admin/tracked still gets drawn.

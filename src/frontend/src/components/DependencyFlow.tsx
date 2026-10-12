@@ -75,11 +75,22 @@ export type NodeMeta = {
   liveAt?: string;
   scanAt?: string;
   unreportedForMs?: number;
-  /** Platform-labeling extension (2026-10-09, ROADMAP P31 phase 1). Which
-   *  managed K8s platform a cross_cluster node's resolved target cluster
-   *  runs — "openshift" | "eks" | "gke". Absent means undetected or not
-   *  applicable (every kind other than cross_cluster), never a guess. */
+  /** Platform-labeling extension (2026-10-09, ROADMAP P31 phase 1; widened
+   *  to every node 2026-10-12). Which managed K8s platform this node's own
+   *  cluster runs — "openshift" | "eks" | "gke". For a cross_cluster node
+   *  this is the RESOLVED TARGET's platform; for every other kind it's
+   *  derived from whichever edge observed it (TopologyPanel.tsx), since a
+   *  namespace view can legitimately span more than one of the tenant's
+   *  clusters (ROADMAP P18 use case #4) — same platform is not guaranteed
+   *  uniform across every node in one view. Absent means undetected, never
+   *  a guess. */
   platform?: string;
+  /** The actual cluster_id behind the platform badge above — not shown on
+   *  the canvas itself (an opaque id reads as noise next to a short
+   *  platform word), but in the tooltip, so two same-platform nodes that
+   *  are nonetheless on two DIFFERENT clusters are still distinguishable
+   *  on inspection. */
+  clusterId?: string;
 };
 
 /** Short display form for a wire-level platform value, for the badge and
@@ -1275,8 +1286,14 @@ export function DependencyFlow({
                    (m?.serviceType ? `\nexposure: ${m.serviceType}` : "") +
                    // Platform-labeling extension (2026-10-09): full name in
                    // the tooltip even though the badge shows a short form.
+                   // clusterId rides alongside (2026-10-12): the badge alone
+                   // can't tell two DIFFERENT clusters of the same platform
+                   // apart, which a namespace view spanning more than one
+                   // cluster (ROADMAP P18 use case #4) makes a real case,
+                   // not hypothetical.
                    (m?.platform
-                     ? `\nPlatform: ${{ openshift: "OpenShift", eks: "AWS EKS", gke: "GCP GKE" }[m.platform] ?? m.platform}`
+                     ? `\nPlatform: ${{ openshift: "OpenShift", eks: "AWS EKS", gke: "GCP GKE" }[m.platform] ?? m.platform}` +
+                       (m.clusterId ? ` (cluster ${m.clusterId})` : "")
                      : "") +
                    (m?.coverage != null
                      ? `\nObserved in ${Math.round(m.coverage * 100)}% of scans` +
@@ -1307,16 +1324,25 @@ export function DependencyFlow({
                   {fit(m?.label ?? n.id, 21)}
                 </text>
                 {/* Platform-labeling extension (2026-10-09, ROADMAP P31
-                  * phase 1): only a cross_cluster node carries a platform
-                  * at all (see NodeMeta's own comment) — every same-cluster
-                  * node in this namespace shares the SAME platform, so
-                  * badging each one would just repeat the fact; the panel
-                  * header carries that summary instead (TopologyPanel.tsx).
-                  * This corner badge only fires where platform actually
-                  * DIFFERS: a cross-cluster edge's resolved target. */}
-                {m?.kind === "cross_cluster" && m.platform && platformLabel(m.platform) && (
+                  * phase 1; widened to every node 2026-10-12): shown
+                  * whenever a node has a known platform, cross_cluster or
+                  * not — a namespace view can legitimately span more than
+                  * one of the tenant's clusters (ROADMAP P18 use case #4),
+                  * so "every same-cluster node shares one platform" turned
+                  * out not to hold in general, only in the common single-
+                  * cluster-per-namespace case. The panel header still
+                  * carries a one-line summary for that common case
+                  * (TopologyPanel.tsx); this per-node badge is what
+                  * actually distinguishes two nodes that differ. */}
+                {m?.platform && platformLabel(m.platform) && (
                   <>
-                    <svg x={n.x + NODE_W - 32} y={n.y + 3} width="13" height="13" viewBox="0 0 16 16"
+                    {/* The text is right-aligned ending at NODE_W-6; "OCP"/
+                      * "EKS"/"GKE" at this font-size run ~22px wide, so the
+                      * glyph (13px + a 3px gap) must end by NODE_W-6-22-3 =
+                      * NODE_W-31 to clear it — it previously started there
+                      * instead of ending there, so the hexagon sat on top of
+                      * the text's first letter. */}
+                    <svg x={n.x + NODE_W - 44} y={n.y + 3} width="13" height="13" viewBox="0 0 16 16"
                          className={`flow__platform-glyph flow__platform-glyph--${m.platform}`} aria-hidden="true">
                       <PlatformShape platform={m.platform} />
                     </svg>
