@@ -46,6 +46,14 @@ type Config struct {
 	ServiceDependencyCallersRetentionDays            int
 	ServiceDependencyCallersRetentionIntervalMinutes int
 
+	// service_dependency_buckets retention (ROADMAP P27 phase 4, bucketed
+	// evidence, ADR 0040). Own dedicated config, same reasoning as callers'
+	// above — this table grows by a fixed ~24 rows/day per edge regardless
+	// of pod churn, an unrelated growth profile to either events or
+	// callers. Days=0 disables the janitor, same convention as above.
+	ServiceDependencyBucketsRetentionDays            int
+	ServiceDependencyBucketsRetentionIntervalMinutes int
+
 	// Proactive investigation loop (ADR 0016 / spec 009). Opt-in: disabled by default.
 	InvestigationEnabled              bool
 	InvestigationWebhookURL           string
@@ -108,6 +116,9 @@ func LoadFromEnv() (*Config, error) {
 
 		ServiceDependencyCallersRetentionDays:            getEnvInt("SERVICE_DEPENDENCY_CALLERS_RETENTION_DAYS", 30),
 		ServiceDependencyCallersRetentionIntervalMinutes: getEnvInt("SERVICE_DEPENDENCY_CALLERS_RETENTION_INTERVAL_MINUTES", 60),
+
+		ServiceDependencyBucketsRetentionDays:            getEnvInt("SERVICE_DEPENDENCY_BUCKETS_RETENTION_DAYS", 30),
+		ServiceDependencyBucketsRetentionIntervalMinutes: getEnvInt("SERVICE_DEPENDENCY_BUCKETS_RETENTION_INTERVAL_MINUTES", 60),
 
 		InvestigationEnabled:              getEnvBool("INVESTIGATION_ENABLED", false),
 		InvestigationWebhookURL:           getEnv("INVESTIGATION_WEBHOOK_URL", ""),

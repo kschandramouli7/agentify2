@@ -41,6 +41,21 @@ func (p serviceDependencyCallersPurger) PurgeOlderThan(ctx context.Context, cuto
 	return p.inner.PurgeServiceDependencyCallersOlderThan(ctx, cutoff)
 }
 
+// serviceDependencyBucketsPurger adapts PurgeServiceDependencyBucketsOlderThan
+// (ROADMAP P27 phase 4, bucketed evidence, ADR 0040) the same way
+// serviceDependencyCallersPurger above adapts the callers table's purge —
+// its own differently-named method, since *postgres.Client can't implement
+// PurgeOlderThan twice on one receiver.
+type serviceDependencyBucketsPurger struct {
+	inner interface {
+		PurgeServiceDependencyBucketsOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+	}
+}
+
+func (p serviceDependencyBucketsPurger) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	return p.inner.PurgeServiceDependencyBucketsOlderThan(ctx, cutoff)
+}
+
 // Package main: entry point for the agentify backend service.
 func main() {
 	// Setup logging
@@ -122,6 +137,22 @@ func main() {
 			if j := retention.New(serviceDependencyCallersPurger{purger}, cfg.ServiceDependencyCallersRetentionDays,
 				cfg.ServiceDependencyCallersRetentionIntervalMinutes, logger, "service_dependency_callers",
 				telemetry.ServiceDependencyCallersPurgedTotal); j != nil {
+				go j.Run(janitorCtx)
+			}
+		}
+	}
+
+	// service_dependency_buckets retention janitor (ROADMAP P27 phase 4,
+	// bucketed evidence, ADR 0040) — same wiring shape as the callers
+	// janitor just above, its own adapter since this is a third,
+	// differently-named purge method on the same receiver.
+	if relationalErr == nil {
+		if purger, ok := relationalBackend.(interface {
+			PurgeServiceDependencyBucketsOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+		}); ok {
+			if j := retention.New(serviceDependencyBucketsPurger{purger}, cfg.ServiceDependencyBucketsRetentionDays,
+				cfg.ServiceDependencyBucketsRetentionIntervalMinutes, logger, "service_dependency_buckets",
+				telemetry.ServiceDependencyBucketsPurgedTotal); j != nil {
 				go j.Run(janitorCtx)
 			}
 		}

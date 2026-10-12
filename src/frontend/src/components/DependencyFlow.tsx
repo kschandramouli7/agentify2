@@ -84,13 +84,47 @@ export type NodeMeta = {
 
 /** Short display form for a wire-level platform value, for the badge and
  *  the tooltip — "" (undetected) renders as nothing, never as a label. */
-function platformLabel(platform?: string): string {
+export function platformLabel(platform?: string): string {
   switch (platform) {
     case "openshift": return "OCP";
     case "eks": return "EKS";
     case "gke": return "GKE";
     default: return "";
   }
+}
+
+// Deliberately abstract shapes, NOT the real AWS/GCP/OpenShift trademarked
+// logos — bundling official brand marks would carry trademark/usage-
+// guideline risk this codebase has no process to clear. Each is just a
+// small, distinct silhouette in the platform's existing badge colour
+// (styles.css's flow__platform-badge--* variables), so the eye can tell
+// platforms apart by shape+colour before reading the text — but the text
+// (platformLabel above) always renders alongside, never alone, same "word +
+// colour, never colour/icon alone" convention every other status marker on
+// this canvas already follows.
+const PLATFORM_GLYPH_PATH: Record<string, string> = {
+  openshift: "M8 1 L14 4.5 L14 11.5 L8 15 L2 11.5 L2 4.5 Z", // hexagon
+  eks: "M4 12 Q1 12 1 9 Q1 6.5 3.5 6.3 Q4 3 7 3 Q9.5 3 10.3 5 Q13 5 13 7.5 Q15 7.8 15 10 Q15 12 12.5 12 Z", // cloud
+  gke: "M2 2 L2 14 L13 8 Z", // pennant
+};
+
+/** A small inline glyph for a wire-level platform value, or null when
+ *  undetected/unrecognized — never rendered without platformLabel's text
+ *  beside it. A plain nested <svg>, so the same component works both inside
+ *  this file's outer diagram <svg> and inside ordinary HTML (the panel
+ *  header's cluster-level summary) — nested <svg> is valid in both. */
+export function PlatformGlyph({ platform, size = 13 }: { platform?: string; size?: number }) {
+  const d = platform ? PLATFORM_GLYPH_PATH[platform] : undefined;
+  if (!d) return null;
+  return (
+    <svg
+      width={size} height={size} viewBox="0 0 16 16"
+      className={`flow__platform-glyph flow__platform-glyph--${platform}`}
+      aria-hidden="true"
+    >
+      <path d={d} />
+    </svg>
+  );
 }
 
 /** The middle line of a node: what this service IS.
@@ -122,10 +156,15 @@ function profileText(m?: NodeMeta): string | null {
   if (m.replicasReady != null && m.replicasDesired != null) {
     bits.push(`${m.replicasReady}/${m.replicasDesired}`);
   }
-  if (m.ports?.length) {
-    const p = m.ports[0];
-    bits.push(m.ports.length > 1 ? `${p.port} +${m.ports.length - 1}` : String(p.port));
-  } else if (m.serviceType === "Headless") {
+  // The Service's OWN declared port(s) used to render here too, but that is
+  // a different fact from what port a CALLER actually used on a given edge
+  // (e.port, captured per observation) — a box can expose one port (often
+  // just a metrics port) while every edge touching it carries a completely
+  // different one. Showing the Service's own port here read as "the port
+  // traffic uses," which it often isn't. Per-edge ports now render on the
+  // edges themselves (see the flow__count text below); the Service's own
+  // port list is still in this node's tooltip, just not on the box.
+  if (m.serviceType === "Headless" && !m.ports?.length) {
     bits.push("headless");
   }
   return bits.length ? bits.join(" · ") : null;
@@ -376,6 +415,43 @@ export function edgeHealth(e: FlowEdge): EdgeHealth {
     short: "",
     classified, badCount,
   };
+}
+
+// Trend — is call VOLUME rising or falling, not whether it's healthy
+// (ROADMAP P27 phase 4, bucketed evidence, ADR 0040). Deliberately separate
+// from edgeHealth() above for the same reason confidence() is separate from
+// health: a single running evidence_count can't tell steady traffic from a
+// burst, or notice a decline except by comparing two totals by hand — this
+// compares the two 24h windows the backend already sums from hourly
+// buckets, so the reader never has to do that arithmetic themselves.
+const TREND_RATIO_UP = 1.2;
+const TREND_RATIO_DOWN = 0.8;
+
+export type EdgeTrend = {
+  key: "rising" | "steady" | "declining" | "unknown";
+  label: string; // full sentence, for the tooltip
+};
+
+export function evidenceTrend(e: FlowEdge): EdgeTrend {
+  const last24h = e.last_24h_count ?? 0;
+  const prior24h = e.prior_24h_count ?? 0;
+  if (last24h === 0 && prior24h === 0) {
+    return { key: "unknown", label: "Not enough recent bucketed evidence to judge a trend." };
+  }
+  if (prior24h === 0) {
+    return {
+      key: "rising",
+      label: `Rising — ${last24h} call${last24h === 1 ? "" : "s"} in the last 24h, none in the 24h before that.`,
+    };
+  }
+  const ratio = last24h / prior24h;
+  if (ratio >= TREND_RATIO_UP) {
+    return { key: "rising", label: `Rising — ${last24h} calls in the last 24h vs ${prior24h} in the prior 24h.` };
+  }
+  if (ratio <= TREND_RATIO_DOWN) {
+    return { key: "declining", label: `Declining — ${last24h} calls in the last 24h vs ${prior24h} in the prior 24h.` };
+  }
+  return { key: "steady", label: `Steady — ${last24h} calls in the last 24h vs ${prior24h} in the prior 24h.` };
 }
 
 /** Edges with a drawn health verdict of degraded or failing — the actionable
@@ -1042,6 +1118,7 @@ export function DependencyFlow({
               (!e.target_kind && meta?.get(e.to_service)?.kind === "external");
             const c = confidence(e);
             const h = declared ? null : edgeHealth(e);
+            const t = declared ? null : evidenceTrend(e);
             const stale = !declared && isStale(e);
             const { d, mid } = edgePath(a, b, l.bends.get(e.id) ?? [], ports.get(e.id));
             return (
@@ -1059,6 +1136,7 @@ export function DependencyFlow({
                       `This counts sightings in logs, not requests: confidence, not traffic volume.\n` +
                       (e.port ? `Port ${e.port}.\n` : "Port not captured for this row (qualified-hostname mention).\n") +
                       `${h?.label}\n` +
+                      `${t?.label}\n` +
                       (e.target_kind === "external"
                         ? "WEAKER EVIDENCE: a public hostname, validated against nothing — no " +
                           "Service list exists for the internet, so this rests on hostname shape.\n"
@@ -1092,6 +1170,26 @@ export function DependencyFlow({
                 {!declared && (
                   <text x={mid.x} y={mid.y - 6} textAnchor="middle" className="flow__count">
                     {e.evidence_count}
+                  </text>
+                )}
+                {/* Port — per EDGE, not per box: one from_service can call
+                    different downstream services (or the same one, via
+                    different edges) on different ports, so the port that
+                    matters belongs on the specific line, not as a single
+                    number on the box it leaves (that used to be the box's
+                    OWN declared Service port, a different and often
+                    unrelated fact — see profileText's comment). A separate
+                    stacked line above the count, not appended to it: a
+                    combined "49346 · :9090" label would be wide enough to
+                    overrun TRACK_GAP's spacing (sized for a 5-digit count
+                    alone) and reintroduce the parallel-edge label collisions
+                    already fixed once this session. Omitted when not
+                    captured (0), same "silent when nothing to say"
+                    convention as the health word below — never shown as
+                    ":0". */}
+                {!declared && !!e.port && (
+                  <text x={mid.x} y={mid.y - 18} textAnchor="middle" className="flow__count flow__port">
+                    :{e.port}
                   </text>
                 )}
                 {/* Health word — deliberately absent when healthy or unknown,
@@ -1201,16 +1299,25 @@ export function DependencyFlow({
                 </text>
                 {/* Platform-labeling extension (2026-10-09, ROADMAP P31
                   * phase 1): only a cross_cluster node carries a platform
-                  * at all (see NodeMeta's own comment) — a short text
-                  * glyph, not a logo, same "word + colour" convention
-                  * every other status marker on this canvas already uses. */}
+                  * at all (see NodeMeta's own comment) — every same-cluster
+                  * node in this namespace shares the SAME platform, so
+                  * badging each one would just repeat the fact; the panel
+                  * header carries that summary instead (TopologyPanel.tsx).
+                  * This corner badge only fires where platform actually
+                  * DIFFERS: a cross-cluster edge's resolved target. */}
                 {m?.kind === "cross_cluster" && m.platform && platformLabel(m.platform) && (
-                  <text
-                    x={n.x + NODE_W - 6} y={n.y + 12} textAnchor="end"
-                    className={`flow__platform-badge flow__platform-badge--${m.platform}`}
-                  >
-                    {platformLabel(m.platform)}
-                  </text>
+                  <>
+                    <svg x={n.x + NODE_W - 32} y={n.y + 3} width="13" height="13" viewBox="0 0 16 16"
+                         className={`flow__platform-glyph flow__platform-glyph--${m.platform}`} aria-hidden="true">
+                      <path d={PLATFORM_GLYPH_PATH[m.platform] ?? ""} />
+                    </svg>
+                    <text
+                      x={n.x + NODE_W - 6} y={n.y + 12} textAnchor="end"
+                      className={`flow__platform-badge flow__platform-badge--${m.platform}`}
+                    >
+                      {platformLabel(m.platform)}
+                    </text>
+                  </>
                 )}
                 {profile && (
                   <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__what">

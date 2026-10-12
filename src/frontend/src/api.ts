@@ -509,6 +509,17 @@ export type ServiceDependency = {
    *  means undetected, never a guess. */
   platform?: string;
   target_platform?: string;
+  /** ROADMAP P27 phase 4 (bucketed evidence, ADR 0040). Sums over hourly
+   *  evidence buckets, computed server-side at read time, never stored on
+   *  this row — same "derive, don't store the aggregate" posture
+   *  caller_pod_count already uses. last_24h_count covers [now-24h, now);
+   *  prior_24h_count covers [now-48h, now-24h) — the two windows compared
+   *  to call an edge rising/steady/declining (see evidenceTrend() in
+   *  DependencyFlow.tsx). Both 0 means either "no recent evidence" or
+   *  "predates this phase" — not distinguished here, same as
+   *  qualified_match_count/bare_match_count both being 0. */
+  last_24h_count?: number;
+  prior_24h_count?: number;
 };
 
 /** One entry point into the cluster from outside — an Ingress, Gateway

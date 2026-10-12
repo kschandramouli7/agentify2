@@ -1542,6 +1542,25 @@ code {
 
 .adm-panel__desc { margin: 0; color: var(--muted); font-size: 13px; }
 
+/* Namespace-level platform summary, next to the Dependencies h2
+   (TopologyPanel.tsx, platform-labeling extension). Text colour stays
+   neutral — the glyph alone carries the brand colour, same "word +
+   colour" split the per-node badge uses, just inverted here since this
+   chip's background is the panel surface, not a node box. */
+.adm-platform-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  vertical-align: middle;
+}
+
 .adm-panel__section { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
 .adm-panel__section h3 { margin: 0 0 4px; font-size: 15px; font-weight: 700; }
 .adm-panel__section > .adm-panel__desc { margin-bottom: 12px; }
@@ -3289,6 +3308,15 @@ code {
 .flow__platform-badge--openshift { fill: #ee3524; }
 .flow__platform-badge--eks { fill: #ff9900; }
 .flow__platform-badge--gke { fill: #4285f4; }
+
+/* The glyph beside the badge text above — same three colours, same "never
+   alone" rule: this is a deliberately abstract shape, not a real brand
+   logo, so it is styled identically wherever platformLabel's text renders,
+   including the panel-header summary (TopologyPanel.tsx), which uses this
+   class outside the diagram's own <svg> canvas. */
+.flow__platform-glyph--openshift { fill: #ee3524; }
+.flow__platform-glyph--eks { fill: #ff9900; }
+.flow__platform-glyph--gke { fill: #4285f4; }
 
 /* Health (ROADMAP P27 phase 2, ADR 0031) — is this dependency WORKING, not
    just does it exist. Same status tokens and idiom the node boxes already

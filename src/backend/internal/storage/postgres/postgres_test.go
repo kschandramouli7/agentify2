@@ -1200,6 +1200,133 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P27 phase 4 (bucketed evidence, ADR 0040): two upserts in the same hour accumulate into one bucket row, not two", func(t *testing.T) {
+		tenantID := uuid.New().String()
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "bucket-caller", ToService: "bucket-callee", TargetKind: "service", Port: 0, Outcome: "success", Path: "", CallerPod: "", MatchKind: "", Source: ""}); err != nil {
+			t.Fatalf("upsert #1: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "bucket-caller", ToService: "bucket-callee", TargetKind: "service", Port: 0, Outcome: "failure", Path: "", CallerPod: "", MatchKind: "", Source: ""}); err != nil {
+			t.Fatalf("upsert #2: %v", err)
+		}
+
+		var rowCount, evidenceCount, successCount, failureCount int
+		if err := client.db.QueryRowContext(ctx, `
+			SELECT COUNT(*), SUM(evidence_count), SUM(outcome_success_count), SUM(outcome_failure_count)
+			FROM service_dependency_buckets
+			WHERE tenant_id = $1 AND from_service = 'bucket-caller' AND to_service = 'bucket-callee'`,
+			tenantID).Scan(&rowCount, &evidenceCount, &successCount, &failureCount); err != nil {
+			t.Fatalf("query buckets: %v", err)
+		}
+		if rowCount != 1 {
+			t.Fatalf("bucket row count = %d, want 1 (both upserts land in the same current-hour bucket)", rowCount)
+		}
+		if evidenceCount != 2 {
+			t.Errorf("bucket evidence_count = %d, want 2", evidenceCount)
+		}
+		if successCount != 1 || failureCount != 1 {
+			t.Errorf("bucket outcome counts = success:%d failure:%d, want 1 and 1", successCount, failureCount)
+		}
+	})
+
+	t.Run("ROADMAP P27 phase 4 (bucketed evidence, ADR 0040): ListServiceDependencies sums only the last-24h and prior-24h windows, not the full history", func(t *testing.T) {
+		tenantID := uuid.New().String()
+		// Creates the service_dependencies row itself plus one real bucket at
+		// the current hour (contributes 1 to the last-24h window).
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "trend-caller", ToService: "trend-callee", TargetKind: "service", Port: 0, Outcome: "", Path: "", CallerPod: "", MatchKind: "", Source: ""}); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		// A bucket inside the prior-24h window [now-48h, now-24h).
+		if _, err := client.db.ExecContext(ctx, `
+			INSERT INTO service_dependency_buckets (tenant_id, cluster_id, namespace, from_service, to_service, port, path, bucket_start, evidence_count)
+			VALUES ($1, 'cluster-a', 'payments', 'trend-caller', 'trend-callee', 0, '', NOW() - INTERVAL '30 hours', 7)`,
+			tenantID); err != nil {
+			t.Fatalf("seed prior-24h bucket: %v", err)
+		}
+		// A bucket OUTSIDE both windows — must never leak into either sum.
+		if _, err := client.db.ExecContext(ctx, `
+			INSERT INTO service_dependency_buckets (tenant_id, cluster_id, namespace, from_service, to_service, port, path, bucket_start, evidence_count)
+			VALUES ($1, 'cluster-a', 'payments', 'trend-caller', 'trend-callee', 0, '', NOW() - INTERVAL '50 hours', 100)`,
+			tenantID); err != nil {
+			t.Fatalf("seed out-of-window bucket: %v", err)
+		}
+
+		deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list dependencies: %v", err)
+		}
+		var found *ServiceDependency
+		for i := range deps {
+			if deps[i].FromService == "trend-caller" && deps[i].ToService == "trend-callee" {
+				found = &deps[i]
+			}
+		}
+		if found == nil {
+			t.Fatalf("no row for trend-caller->trend-callee; got %+v", deps)
+		}
+		if found.Last24hCount != 1 {
+			t.Errorf("last_24h_count = %d, want 1 (only the real upsert's current-hour bucket)", found.Last24hCount)
+		}
+		if found.Prior24hCount != 7 {
+			t.Errorf("prior_24h_count = %d, want 7 (the seeded -30h bucket, not the -50h one)", found.Prior24hCount)
+		}
+	})
+
+	t.Run("ROADMAP P27 phase 4 (bucketed evidence, ADR 0040): an edge with no bucket evidence yet reads 0/0, not an error", func(t *testing.T) {
+		tenantID := uuid.New().String()
+		if _, err := client.db.ExecContext(ctx, `
+			INSERT INTO service_dependencies (id, namespace, from_service, to_service, tenant_id, cluster_id, target_kind, port, path, evidence_count, first_seen, last_seen)
+			VALUES ($1, 'payments', 'nobucket-caller', 'nobucket-callee', $2, 'cluster-a', 'service', 0, '', 1, NOW(), NOW())`,
+			uuid.New().String(), tenantID); err != nil {
+			t.Fatalf("seed edge with no bucket row: %v", err)
+		}
+		deps, err := client.ListServiceDependencies(ctx, tenantID, "payments")
+		if err != nil {
+			t.Fatalf("list dependencies: %v", err)
+		}
+		for _, d := range deps {
+			if d.FromService == "nobucket-caller" && d.ToService == "nobucket-callee" {
+				if d.Last24hCount != 0 || d.Prior24hCount != 0 {
+					t.Errorf("last_24h_count/prior_24h_count = %d/%d, want 0/0 (predates this phase, not an error)", d.Last24hCount, d.Prior24hCount)
+				}
+				return
+			}
+		}
+		t.Fatalf("no row for nobucket-caller->nobucket-callee; got %+v", deps)
+	})
+
+	t.Run("ROADMAP P27 phase 4 (bucketed evidence, ADR 0040): PurgeServiceDependencyBucketsOlderThan deletes stale buckets, keeps fresh ones", func(t *testing.T) {
+		tenantID := uuid.New().String()
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "bpurge-caller", ToService: "bpurge-callee", TargetKind: "service", Port: 0, Outcome: "", Path: "", CallerPod: "", MatchKind: "", Source: ""}); err != nil {
+			t.Fatalf("upsert fresh bucket: %v", err)
+		}
+		if _, err := client.db.ExecContext(ctx, `
+			INSERT INTO service_dependency_buckets (tenant_id, cluster_id, namespace, from_service, to_service, port, path, bucket_start, evidence_count)
+			VALUES ($1, 'cluster-a', 'payments', 'bpurge-caller', 'bpurge-callee', 0, '', NOW() - INTERVAL '90 days', 3)`,
+			tenantID); err != nil {
+			t.Fatalf("seed stale bucket: %v", err)
+		}
+
+		cutoff := time.Now().Add(-30 * 24 * time.Hour)
+		n, err := client.PurgeServiceDependencyBucketsOlderThan(ctx, cutoff)
+		if err != nil {
+			t.Fatalf("purge: %v", err)
+		}
+		if n < 1 {
+			t.Errorf("purged count = %d, want at least 1 (the 90-day-old bucket)", n)
+		}
+
+		var remaining int
+		if err := client.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM service_dependency_buckets
+			WHERE tenant_id = $1 AND from_service = 'bpurge-caller' AND to_service = 'bpurge-callee'`,
+			tenantID).Scan(&remaining); err != nil {
+			t.Fatalf("count remaining buckets: %v", err)
+		}
+		if remaining != 1 {
+			t.Errorf("remaining bucket rows = %d, want 1 (the fresh current-hour bucket survives, the 90-day one is purged)", remaining)
+		}
+	})
+
 	t.Run("ROADMAP P31 phase 1 (cross-cluster call capture): target_cluster_id round-trips and is never downgraded by a later ambiguous sighting", func(t *testing.T) {
 		tenantID := uuid.New().String()
 		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "xc-caller", ToService: "shop.example.com", TargetKind: "cross_cluster", TargetClusterID: "cluster-b"}); err != nil {
@@ -1761,6 +1888,15 @@ func TestServiceDependencyTenantIsolation(t *testing.T) {
 	// test never writes a health snapshot itself.
 	if _, err := client.db.ExecContext(ctx, `GRANT SELECT ON cluster_health_snapshots TO rls_test_app`); err != nil {
 		t.Fatalf("grant restricted test role read access to cluster_health_snapshots: %v", err)
+	}
+	// service_dependency_buckets (ROADMAP P27 phase 4, bucketed evidence,
+	// ADR 0040): UpsertServiceDependency now writes an hourly bucket row in
+	// the same transaction as the edge row, and ListServiceDependencies
+	// LEFT JOINs it for the two 24h trend windows — same SELECT/INSERT/
+	// UPDATE grant as service_dependency_callers above, since this test
+	// exercises both directions through the restricted role.
+	if _, err := client.db.ExecContext(ctx, `GRANT SELECT, INSERT, UPDATE ON service_dependency_buckets TO rls_test_app`); err != nil {
+		t.Fatalf("grant restricted test role access to service_dependency_buckets: %v", err)
 	}
 	appDB, err := sql.Open("postgres", "host=localhost port=54329 user=rls_test_app password=rls_test_app dbname=agentify_test sslmode=disable")
 	if err != nil {

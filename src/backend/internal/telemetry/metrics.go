@@ -65,6 +65,14 @@ var (
 		Help: "service_dependency_callers rows deleted by the retention janitor.",
 	})
 
+	// ServiceDependencyBucketsPurgedTotal counts hourly evidence buckets
+	// deleted by their own retention janitor (ROADMAP P27 phase 4, bucketed
+	// evidence, ADR 0040).
+	ServiceDependencyBucketsPurgedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "agentify_service_dependency_buckets_purged_total",
+		Help: "service_dependency_buckets rows deleted by the retention janitor.",
+	})
+
 	// HTTPRequestsTotal / HTTPRequestDuration are generic HTTP metrics. `path`
 	// is safe to label on because our routes carry no path-param ids.
 	HTTPRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

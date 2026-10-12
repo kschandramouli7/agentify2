@@ -2477,7 +2477,22 @@ only reliable guard is checking a candidate against a real object.
   replicas" when the caller's own replica count is known.
 - **Bucketed evidence** instead of a running total — a single counter cannot
   separate steady traffic from a 02:00 daily burst, and it would have made the
-  decline above visible directly rather than by arithmetic. **Not started.**
+  decline above visible directly rather than by arithmetic. **SHIPPED
+  2026-10-12** ([ADR 0040](decisions/0040-bucketed-evidence-capture.md)):
+  hourly buckets in a new `service_dependency_buckets` child table, captured
+  passively in the same transaction as the edge upsert (`bucket_start` is
+  server-computed from `NOW()`, never client-supplied) — zero producer
+  changes needed, same posture provenance and caller cardinality both used.
+  `ListServiceDependencies` gains a second aggregating LEFT JOIN summing two
+  24h windows (`last_24h_count`/`prior_24h_count`); the frontend's new
+  `evidenceTrend()` compares them and adds one "Rising/Steady/Declining"
+  line to the existing edge tooltip — passive UI only, no new chart or
+  column, matching every other sub-item in this phase. Its own dedicated
+  retention janitor (`SERVICE_DEPENDENCY_BUCKETS_RETENTION_DAYS`, default
+  30, reusing the same generalized `Janitor` ADR 0035 built) bounds this
+  table's otherwise-unbounded ~24-rows/day-per-edge growth — the explicit
+  "there has to be a timebound" requirement this work was scoped under.
+  **All four sub-items of phase 4 are now shipped.**
 - **Path / operation class** — `/health` versus `/charge`. A probe-only edge is
   a far weaker dependency, and both P24 and any SPOF analysis will over-weight
   probes without this. **SHIPPED 2026-10-04** ([ADR 0034](decisions/0034-path-operation-class-capture.md)):

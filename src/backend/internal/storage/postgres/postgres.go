@@ -646,6 +646,53 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- ROADMAP P27 phase 4 (bucketed evidence, ADR 0040): the last of this
+	-- phase's four sub-items. evidence_count/outcome counters on
+	-- service_dependencies are running totals since first_seen -- they
+	-- cannot distinguish steady traffic from a burst, or notice a declining
+	-- rate except by comparing two totals arithmetically (the exact
+	-- limitation this item's own ROADMAP entry names). Hourly buckets are
+	-- the smallest grain that resolves a daily burst pattern (e.g. a 02:00
+	-- batch job) from a steady trickle across the same day.
+	--
+	-- bucket_start is computed server-side as date_trunc('hour', NOW()) at
+	-- upsert time (see UpsertServiceDependency below), never client-supplied
+	-- -- this avoids clock-skew between the three producers (live miner,
+	-- Glue miner, agent skill) the way last_seen's NOW() already does for
+	-- the parent row. No separate id column, same posture as
+	-- service_dependency_callers: the composite key already uniquely
+	-- identifies a row.
+	CREATE TABLE IF NOT EXISTS service_dependency_buckets (
+		tenant_id              TEXT NOT NULL,
+		cluster_id             TEXT NOT NULL DEFAULT '',
+		namespace              TEXT NOT NULL,
+		from_service           TEXT NOT NULL,
+		to_service             TEXT NOT NULL,
+		port                   INT NOT NULL DEFAULT 0,
+		path                   TEXT NOT NULL DEFAULT '',
+		bucket_start           TIMESTAMP NOT NULL,
+		evidence_count         INT NOT NULL DEFAULT 0,
+		outcome_success_count  INT NOT NULL DEFAULT 0,
+		outcome_failure_count  INT NOT NULL DEFAULT 0,
+		outcome_timeout_count  INT NOT NULL DEFAULT 0,
+		PRIMARY KEY (tenant_id, cluster_id, namespace, from_service, to_service, port, path, bucket_start)
+	);
+	CREATE INDEX IF NOT EXISTS idx_service_dep_buckets_edge
+		ON service_dependency_buckets(tenant_id, cluster_id, namespace, from_service, to_service, port, path);
+
+	ALTER TABLE IF EXISTS service_dependency_buckets ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS service_dependency_buckets FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'service_dependency_buckets' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON service_dependency_buckets
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
 	-- Service->cluster registry (ROADMAP P16 / ADR 0023): which cluster(s)
 	-- run a given (namespace, service), populated deterministically by
 	-- agentify-discovery's inventory push (POST /api/cluster-inventory) —
@@ -2379,6 +2426,17 @@ type ServiceDependency struct {
 	// a guess.
 	Platform       string `json:"platform,omitempty"`
 	TargetPlatform string `json:"target_platform,omitempty"`
+	// ROADMAP P27 phase 4 (bucketed evidence, ADR 0040). Sums over
+	// service_dependency_buckets, computed at read time, never stored on
+	// this row -- same "derive, don't store the aggregate" posture
+	// CallerPodCount already uses. Last24hCount covers [now-24h, now);
+	// Prior24hCount covers [now-48h, now-24h) -- the two windows the
+	// frontend compares to call an edge rising/steady/declining. Both 0
+	// means either "no recent evidence" or "predates this phase" -- not
+	// distinguished here, same as QualifiedMatchCount/BareMatchCount both
+	// being 0 above.
+	Last24hCount  int `json:"last_24h_count"`
+	Prior24hCount int `json:"prior_24h_count"`
 }
 
 // UpsertServiceDependency records one piece of evidence for a from->to edge —
@@ -2502,7 +2560,46 @@ func (c *Client) UpsertServiceDependency(ctx context.Context, in ServiceDependen
 			return err
 		}
 	}
+	// ROADMAP P27 phase 4 (bucketed evidence, ADR 0040): same transaction as
+	// the edge row above, so the running total and its hourly breakdown can
+	// never drift relative to each other. bucket_start is the server's own
+	// clock truncated to the hour, not client-supplied — see the schema
+	// migration's comment for why.
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO service_dependency_buckets (tenant_id, cluster_id, namespace, from_service, to_service, port, path, bucket_start,
+		                                          evidence_count, outcome_success_count, outcome_failure_count, outcome_timeout_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, date_trunc('hour', NOW()), 1,
+		        CASE WHEN $8 = 'success' THEN 1 ELSE 0 END,
+		        CASE WHEN $8 = 'failure' THEN 1 ELSE 0 END,
+		        CASE WHEN $8 = 'timeout' THEN 1 ELSE 0 END)
+		ON CONFLICT (tenant_id, cluster_id, namespace, from_service, to_service, port, path, bucket_start) DO UPDATE SET
+		  evidence_count        = service_dependency_buckets.evidence_count + 1,
+		  outcome_success_count = service_dependency_buckets.outcome_success_count + CASE WHEN $8 = 'success' THEN 1 ELSE 0 END,
+		  outcome_failure_count = service_dependency_buckets.outcome_failure_count + CASE WHEN $8 = 'failure' THEN 1 ELSE 0 END,
+		  outcome_timeout_count = service_dependency_buckets.outcome_timeout_count + CASE WHEN $8 = 'timeout' THEN 1 ELSE 0 END`,
+		in.TenantID, in.ClusterID, in.Namespace, in.FromService, in.ToService, in.Port, in.Path, in.Outcome)
+	if err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// PurgeServiceDependencyBucketsOlderThan deletes hourly evidence buckets
+// whose bucket_start predates cutoff (ROADMAP P27 phase 4's bucketed-
+// evidence retention janitor) and returns the number of rows removed.
+// Unlike service_dependency_callers (bounded by pod churn) this table grows
+// by a fixed ~24 rows/day per edge regardless of fleet size, but still needs
+// a bound: without one, history accumulates forever even for edges nobody
+// looks at. Not scoped to one tenant — a maintenance sweep across all
+// tenants' stale rows, same posture as the other two purgers above.
+func (c *Client) PurgeServiceDependencyBucketsOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := c.db.ExecContext(ctx,
+		`DELETE FROM service_dependency_buckets WHERE bucket_start < $1`, cutoff.UTC())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // PurgeServiceDependencyCallersOlderThan deletes caller-pod sightings whose
@@ -2878,6 +2975,14 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 	// tenant_id needed in either ON clause: cluster_health_snapshots' PK is
 	// cluster_id alone (globally unique), and RLS already scopes the read,
 	// same as cluster_ingress_endpoints' own host-reverse lookup.
+	//
+	// LEFT JOIN a pre-aggregated subquery over service_dependency_buckets
+	// (ROADMAP P27 phase 4, bucketed evidence, ADR 0040): two conditional
+	// SUMs over the same table give the frontend the two 24h windows it
+	// needs to call an edge rising/steady/declining, without a second round
+	// trip or a new endpoint — same "join it into the edge the frontend
+	// already fetches" posture platform labeling and caller cardinality
+	// both used.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
 		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
@@ -2885,7 +2990,8 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		       sd.qualified_match_count, sd.bare_match_count, COALESCE(sd.target_cluster_id, ''),
 		       COALESCE(cs.expected_failure_reason, ''), COALESCE(cpc.caller_pod_count, 0),
 		       COALESCE(cpc.sources, '[]'::jsonb),
-		       COALESCE(ocs.platform, ''), COALESCE(tcs.platform, '')
+		       COALESCE(ocs.platform, ''), COALESCE(tcs.platform, ''),
+		       COALESCE(tb.last_24h_count, 0), COALESCE(tb.prior_24h_count, 0)
 		FROM service_dependencies sd
 		LEFT JOIN cluster_services cs
 		  ON cs.tenant_id = sd.tenant_id AND cs.cluster_id = sd.cluster_id
@@ -2901,6 +3007,16 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		     AND cpc.to_service = sd.to_service AND cpc.port = sd.port AND cpc.path = sd.path
 		LEFT JOIN cluster_health_snapshots ocs ON ocs.cluster_id = sd.cluster_id
 		LEFT JOIN cluster_health_snapshots tcs ON tcs.cluster_id = sd.target_cluster_id
+		LEFT JOIN (
+		    SELECT tenant_id, cluster_id, namespace, from_service, to_service, port, path,
+		           SUM(CASE WHEN bucket_start >= NOW() - INTERVAL '24 hours' THEN evidence_count ELSE 0 END) AS last_24h_count,
+		           SUM(CASE WHEN bucket_start >= NOW() - INTERVAL '48 hours' AND bucket_start < NOW() - INTERVAL '24 hours'
+		                    THEN evidence_count ELSE 0 END) AS prior_24h_count
+		    FROM service_dependency_buckets
+		    GROUP BY tenant_id, cluster_id, namespace, from_service, to_service, port, path
+		) tb ON tb.tenant_id = sd.tenant_id AND tb.cluster_id = sd.cluster_id
+		    AND tb.namespace = sd.namespace AND tb.from_service = sd.from_service
+		    AND tb.to_service = sd.to_service AND tb.port = sd.port AND tb.path = sd.path
 		WHERE sd.namespace = $1 ORDER BY sd.evidence_count DESC`, namespace)
 	if err != nil {
 		return nil, err
@@ -2916,7 +3032,8 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 			&d.Port, &d.Path, &d.OutcomeSuccessCount, &d.OutcomeFailureCount, &d.OutcomeTimeoutCount,
 			&d.QualifiedMatchCount, &d.BareMatchCount, &d.TargetClusterID,
 			&d.ExpectedFailureReason, &d.CallerPodCount, &sourcesJSON,
-			&d.Platform, &d.TargetPlatform); err != nil {
+			&d.Platform, &d.TargetPlatform,
+			&d.Last24hCount, &d.Prior24hCount); err != nil {
 			return nil, err
 		}
 		// A malformed sources blob must not fail the whole namespace — the

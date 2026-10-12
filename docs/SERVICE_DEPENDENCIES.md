@@ -675,10 +675,15 @@ keep unhealthy.
   namespace produce separate rows, which is correct but can read as duplicates.
 - **Self-mentions are dropped** — a service logging its own name is not a
   dependency.
-- **No edge weighting by time.** `evidence_count` is cumulative since
-  `first_seen`; a dependency removed months ago keeps its count and only its
-  `last_seen` goes stale. Read freshness, not volume, to judge whether an edge
-  is current.
+- **`evidence_count` itself is still cumulative since `first_seen`**, and
+  remains so by design — a dependency removed months ago keeps its count and
+  only its `last_seen` goes stale, so freshness (not the raw count) is still
+  how you judge whether an edge is current. **Recent trend is now available
+  separately**, though (ROADMAP P27 phase 4, bucketed evidence, [ADR
+  0040](../context-mesh/decisions/0040-bucketed-evidence-capture.md)): a
+  parallel hourly-bucketed table lets the edge tooltip say
+  "Rising/Steady/Declining — N calls in the last 24h vs M in the prior 24h,"
+  without changing what the running total itself means.
 - **Every timestamp column is naive `TIMESTAMP` written with `NOW()`**, so it
   holds the *server's* local time while the Go driver hands it back labelled
   UTC. The two only agree when the server's zone is UTC. RDS defaults to UTC so

@@ -5,7 +5,7 @@ import {
   listServiceHealth, listColdServices, listCrossClusterPairs,
   type ServiceDependency, type CrossClusterPair,
 } from "../api";
-import { DependencyFlow, confidence, edgeHealth, rarelyObserved, silentServices, unhealthyEdges, type FlowEdge, type NodeMeta } from "./DependencyFlow";
+import { DependencyFlow, PlatformGlyph, confidence, edgeHealth, platformLabel, rarelyObserved, silentServices, unhealthyEdges, type FlowEdge, type NodeMeta } from "./DependencyFlow";
 import { DependencyChatPanel } from "./DependencyChatPanel";
 
 // Service-to-service dependency review (ROADMAP P18 use case #2, ADR 0029).
@@ -698,12 +698,31 @@ export function TopologyPanel() {
   // draw a health verdict of degraded or failing.
   const unhealthy = useMemo(() => unhealthyEdges(graph.edges), [graph.edges]);
   const selected = focus && graph.services.includes(focus) ? focus : null;
+  // Platform-labeling extension, panel-level summary (2026-10-12): every
+  // edge's `platform` is the OBSERVING cluster's — i.e. this namespace's
+  // own cluster — so any one non-empty value answers "what am I looking
+  // at" without repeating a per-node badge on every same-cluster box (that
+  // badge stays reserved for cross_cluster nodes, where platform actually
+  // DIFFERS from this one — see DependencyFlow's corner-badge comment).
+  // "" means undetected, same honesty convention as everywhere else.
+  const namespacePlatform = useMemo(
+    () => graph.edges.find(e => e.platform)?.platform ?? "",
+    [graph.edges]
+  );
 
   return (
     <div className="adm-panel adm-panel--wide">
       <div className="adm-panel__header">
         <div>
-          <h2>Service Dependencies</h2>
+          <h2>
+            Service Dependencies
+            {namespacePlatform && platformLabel(namespacePlatform) && (
+              <span className="adm-platform-chip" title={`This namespace's cluster: ${namespacePlatform}`}>
+                <PlatformGlyph platform={namespacePlatform} size={12} />
+                {platformLabel(namespacePlatform)}
+              </span>
+            )}
+          </h2>
           <p className="adm-panel__desc">
             Every service in this namespace, how it's reached from outside, and the calls
             we've actually seen between services. <strong>Solid arrows come from log
