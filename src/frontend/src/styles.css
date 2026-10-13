@@ -3309,14 +3309,12 @@ code {
 .flow__platform-badge--eks { fill: #ff9900; }
 .flow__platform-badge--gke { fill: #4285f4; }
 
-/* The glyph beside the badge text above — same three colours, same "never
-   alone" rule: this is a deliberately abstract shape, not a real brand
-   logo, so it is styled identically wherever platformLabel's text renders,
-   including the panel-header summary (TopologyPanel.tsx), which uses this
-   class outside the diagram's own <svg> canvas. */
-.flow__platform-glyph--openshift { fill: #ee3524; }
-.flow__platform-glyph--eks { fill: #ff9900; }
-.flow__platform-glyph--gke { fill: #4285f4; }
+/* The glyph beside the badge text above (DependencyFlow.tsx's PlatformShape)
+   sets its own explicit per-element fills now — a backdrop colour plus a
+   white/multi-colour foreground mark needs two-or-more colours on one
+   glyph, which a single CSS class fill couldn't express. No colour rule
+   needed here as a result; .flow__platform-glyph(--*) stays only as a
+   hook class, not a style source. */
 
 /* Health (ROADMAP P27 phase 2, ADR 0031) — is this dependency WORKING, not
    just does it exist. Same status tokens and idiom the node boxes already

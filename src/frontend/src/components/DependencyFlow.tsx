@@ -104,26 +104,55 @@ export function platformLabel(platform?: string): string {
   }
 }
 
-// Deliberately abstract shapes, NOT the real AWS/GCP/OpenShift trademarked
-// logos — bundling official brand marks would carry trademark/usage-
-// guideline risk this codebase has no process to clear. One cohesive family
-// of three precise geometric primitives (hexagon / circle / diamond), not a
-// freehand cloud silhouette — a hand-tuned bezier blob is hard to render
-// crisply at a 13px glyph size and looked rougher than a plain shape at
-// that scale. Each is filled in the platform's existing badge colour
-// (styles.css's flow__platform-badge--* variables), so the eye can tell
-// platforms apart by shape+colour before reading the text — but the text
-// (platformLabel above) always renders alongside, never alone, same "word +
-// colour, never colour/icon alone" convention every other status marker on
-// this canvas already follows.
+// Deliberately NOT the real AWS/GCP/OpenShift trademarked logos — bundling
+// official brand marks would carry trademark/usage-guideline risk this
+// codebase has no process to clear. Each is still loosely EVOCATIVE of how
+// that platform is actually recognized, though, rather than an arbitrary
+// geometric primitive (a plain hexagon/circle/diamond tested as too flat to
+// read as "an icon" rather than a flat shape):
+//   - OpenShift: a red circular badge with a white 3-blade pinwheel, the
+//     same circular-mark/radial-symmetry impression as OpenShift's own logo.
+//   - AWS (EKS): an orange rounded badge with a white "smile" arc and
+//     arrowhead, the same motif as AWS's own smile-underline mark.
+//   - GCP (GKE): four dots in Google's own public brand palette
+//     (#4285F4/#EA4335/#FBBC05/#34A853), arranged in a small pinwheel —
+//     recognizable through colour, the way Google's own marks are, without
+//     reproducing its lettering.
+// Each element sets its own explicit fill (not inherited from a CSS class)
+// since a backdrop-plus-foreground design needs two different colours on
+// one glyph, unlike the old single-shape/single-fill version.
 function PlatformShape({ platform }: { platform: string }) {
   switch (platform) {
-    case "openshift":
-      return <path d="M8 1.2 L13.9 4.6 L13.9 11.4 L8 14.8 L2.1 11.4 L2.1 4.6 Z" />;
+    case "openshift": {
+      const petal = "M8 8 C9.5 6.3 9.5 3.8 8 2 C6.5 3.8 6.5 6.3 8 8 Z";
+      return (
+        <g>
+          <circle cx="8" cy="8" r="7" fill="#ee3524" />
+          <g fill="#fff">
+            <path d={petal} />
+            <path d={petal} transform="rotate(120 8 8)" />
+            <path d={petal} transform="rotate(240 8 8)" />
+          </g>
+        </g>
+      );
+    }
     case "eks":
-      return <circle cx="8" cy="8" r="6.5" />;
+      return (
+        <g>
+          <rect x="1" y="1" width="14" height="14" rx="3" fill="#ff9900" />
+          <path d="M3.5 9.5 Q8 13 12.5 9" stroke="#fff" strokeWidth="1.3" fill="none" strokeLinecap="round" />
+          <path d="M11.3 7.9 L12.8 9 L11.1 10.1 Z" fill="#fff" />
+        </g>
+      );
     case "gke":
-      return <path d="M8 1.5 L14.5 8 L8 14.5 L1.5 8 Z" />;
+      return (
+        <g>
+          <circle cx="8" cy="3.2" r="2.6" fill="#ea4335" />
+          <circle cx="12.8" cy="8" r="2.6" fill="#fbbc05" />
+          <circle cx="8" cy="12.8" r="2.6" fill="#34a853" />
+          <circle cx="3.2" cy="8" r="2.6" fill="#4285f4" />
+        </g>
+      );
     default:
       return null;
   }
