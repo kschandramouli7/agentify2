@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import metrics
 from config.settings import get_settings
 from k8fy import dependency_miner
+from k8fy import splunk_dependency_miner
 from k8fy.agent import get_chat_agent, refresh_pricing_from_backend
 from k8fy import prompt_manager
 from k8fy.live_diagnostics import LIVE_DIAGNOSTIC_TOOLS
@@ -32,6 +33,13 @@ app = FastAPI(title="agentify-agent", version="0.1.0")
 # await the same task the startup hook created.
 _dependency_miner_shutdown = asyncio.Event()
 _dependency_miner_task: Optional[asyncio.Task] = None
+
+# Splunk dependency miner (ROADMAP P15, ADR 0042) — a second, independent
+# periodic task alongside the Glue one above: same shutdown-signal/await
+# shape, its own Event/Task pair since the two run on different intervals
+# and must be stoppable independently.
+_splunk_dependency_miner_shutdown = asyncio.Event()
+_splunk_dependency_miner_task: Optional[asyncio.Task] = None
 
 
 class ChatRequest(BaseModel):
@@ -66,15 +74,32 @@ async def startup_event():
         )
     )
 
+    global _splunk_dependency_miner_task
+    splunk_config = {
+        "url": settings.splunk_url,
+        "index": settings.splunk_index,
+        "token": settings.splunk_token,
+        "verify_tls": settings.splunk_verify_tls,
+    }
+    _splunk_dependency_miner_task = asyncio.create_task(
+        splunk_dependency_miner.run_forever(
+            settings.backend_url, splunk_config, settings.splunk_mining_interval_seconds, _splunk_dependency_miner_shutdown,
+        )
+    )
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Signal the dependency miner's background task to stop and wait for
-    its current cycle (if any) to finish — same graceful-shutdown
+    """Signal both dependency miners' background tasks to stop and wait for
+    their current cycle (if any) to finish — same graceful-shutdown
     convention as agentify-discovery's own SIGTERM handling."""
     _dependency_miner_shutdown.set()
     if _dependency_miner_task is not None:
         await _dependency_miner_task
+
+    _splunk_dependency_miner_shutdown.set()
+    if _splunk_dependency_miner_task is not None:
+        await _splunk_dependency_miner_task
 
 
 @app.get("/health")

@@ -122,6 +122,34 @@ def _fetch_langfuse_secrets(secret_name: str, region: str) -> dict:
         return {}
 
 
+def _fetch_splunk_secret(secret_name: str, region: str) -> str:
+    """Fetch the Splunk REST API token from AWS Secrets Manager (ADR 0041).
+
+    Splunk is an optional, additional log-platform connector (ROADMAP P15) —
+    same posture as Langfuse above, not the Anthropic key's fail-fast one.
+    Returns "" and logs a warning on failure rather than raising, so the
+    service starts normally with the Splunk tier simply unavailable
+    (log_router.py falls through to Athena/the live cluster either way).
+    """
+    client = boto3.client("secretsmanager", region_name=region)
+    try:
+        response = client.get_secret_value(SecretId=secret_name)
+    except ClientError as e:
+        logger.warning(
+            "Splunk secret '%s' not found in Secrets Manager: %s — Splunk log tier disabled",
+            secret_name,
+            e,
+        )
+        return ""
+    raw = response.get("SecretString") or ""
+    try:
+        data = json.loads(raw)
+        return data.get("token", "") if isinstance(data, dict) else ""
+    except (json.JSONDecodeError, AttributeError):
+        # A plain-string secret (just the token, no JSON wrapper) is also valid.
+        return raw.strip()
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -154,6 +182,35 @@ class Settings(BaseSettings):
     athena_workgroup: str = Field(default="", validation_alias=AliasChoices("ATHENA_WORKGROUP"))
     athena_database: str = Field(default="", validation_alias=AliasChoices("ATHENA_DATABASE"))
     athena_table: str = Field(default="", validation_alias=AliasChoices("ATHENA_TABLE"))
+
+    # Splunk log-platform connector (ROADMAP P15, ADR 0041) — a customer's
+    # real, already-populated log platform, tried before Athena's own test
+    # harness when configured. Empty url/index/token means unconfigured;
+    # log_router.get_logs() then skips straight to Athena/the live cluster,
+    # same "empty means unconfigured, not an error" posture athena_* above
+    # already has. splunk_token is resolved below the same way Langfuse's
+    # keys are: env var first, Secrets Manager as the fallback.
+    splunk_url: str = Field(default="", validation_alias=AliasChoices("SPLUNK_URL"))
+    splunk_index: str = Field(default="", validation_alias=AliasChoices("SPLUNK_INDEX"))
+    splunk_token: str = Field(default="", validation_alias=AliasChoices("SPLUNK_TOKEN"))
+    splunk_secret_name: str = "agentify/dev/splunk"
+    # Enterprise Splunk deployments self-sign their management port often
+    # enough that this needs to be a real, named knob (default True — fail
+    # safe) rather than a hardcoded verify=True a future reader has to find.
+    splunk_verify_tls: bool = Field(default=True, validation_alias=AliasChoices("SPLUNK_VERIFY_TLS"))
+
+    # Splunk as a continuous dependency-mining source (ROADMAP P15, ADR
+    # 0042) — splunk_dependency_miner.py's own interval, deliberately NOT
+    # shared with dependency_mining_interval_seconds above. The Glue miner's
+    # 300s floor comes from Firehose's own buffering_interval; Splunk has no
+    # equivalent hard floor (its own indexing latency is typically seconds),
+    # so a shorter default is plausible here. 60s matches Discovery's own
+    # live-scan cadence — the fastest existing precedent in this codebase —
+    # but is explicitly named in the ADR as worth tuning against real search
+    # load once a real instance exists, not a number to trust blindly.
+    splunk_mining_interval_seconds: int = Field(
+        default=60, validation_alias=AliasChoices("SPLUNK_MINING_INTERVAL_SECONDS")
+    )
 
     # Glue-based dependency mining (ADR 0029, ROADMAP P15/P18 use case #2) —
     # a periodic background task, gated on the same athena_* config above
@@ -247,6 +304,17 @@ class Settings(BaseSettings):
                 self.langfuse_public_key = lf.get("LANGFUSE_PUBLIC_KEY", "")
             if not self.langfuse_secret_key:
                 self.langfuse_secret_key = lf.get("LANGFUSE_SECRET_KEY", "")
+
+        # Splunk token: only attempt Secrets Manager when a URL/index are
+        # actually configured but the token wasn't supplied directly — an
+        # unconfigured Splunk tier (the common case today) shouldn't log a
+        # fetch attempt for a secret that was never meant to exist.
+        if self.splunk_url and self.splunk_index and not self.splunk_token:
+            logger.info(
+                "SPLUNK_TOKEN not set in environment; fetching from Secrets Manager",
+                extra={"secret": self.splunk_secret_name, "region": self.aws_region},
+            )
+            self.splunk_token = _fetch_splunk_secret(self.splunk_secret_name, self.aws_region)
 
         return self
 

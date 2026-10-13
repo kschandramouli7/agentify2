@@ -1,0 +1,159 @@
+# splunk-test-caller — a synthetic caller that forwards its OWN log lines to
+# the disposable Splunk instance (infra/kubernetes/splunk-test/splunk.yaml),
+# for verifying ADR 0041 (Splunk read connector) and ADR 0042 (Splunk
+# dependency mining) against real Splunk REST API behavior.
+#
+# WHY A NEW WORKLOAD INSTEAD OF A SIDECAR ON payment-batch
+#
+# payment-batch.yaml's own header explains why that workload is
+# deliberately single-container: get_pod_logs sends no `container`
+# parameter, so the K8s API returns 400 for ANY multi-container pod,
+# silently breaking Discovery's live mining AND the diagnose skill's log
+# tail for that pod. Adding a Splunk-forwarding sidecar there would
+# regress exactly the thing this test exists to prove still works. This
+# workload does both things (log to stdout for the existing live/Glue
+# miners, AND forward to Splunk) from inside ONE container instead —
+# no sidecar, no shared volume, no multi-container risk.
+#
+# WHY IT FORWARDS THE FIELDS IT DOES
+#
+# HEC's "fields" metadata comes back as literal top-level keys in Splunk
+# search results (output_mode=json) — this is deliberately shaped to match
+# log_platform_splunk.py's/splunk_dependency_miner.py's assumed schema
+# (kubernetes.pod_name, kubernetes.labels.<key>) exactly, so this actually
+# tests that assumption against real Splunk behavior rather than just
+# confirming it by construction.
+#
+# WHY IT HAS A SERVICE
+#
+# Same reason payment-batch has one: both miners resolve from_service by
+# matching pod labels against Service selectors. A caller with no Service
+# is unattributable, however faithfully it logs.
+#
+# SETUP, AFTER splunk.yaml IS APPLIED AND ITS POD IS Ready
+#
+# 1. Mint the Splunk REST API auth token — see splunk.yaml's own runbook
+#    comment at its end.
+# 2. Set these three on agentify-agent's deployment (kubectl set env, not a
+#    manifest edit — same "temporary test toggle" posture payment-worker.yaml's
+#    own CRASH_LOOP already uses):
+#      kubectl set env deployment/agentify-agent -n agentify \
+#        SPLUNK_URL=https://splunk-test.splunk-test.svc.cluster.local:8089 \
+#        SPLUNK_INDEX=main \
+#        SPLUNK_TOKEN=<the minted REST API token> \
+#        SPLUNK_VERIFY_TLS=false
+#    SPLUNK_VERIFY_TLS=false because Splunk's default cert is self-signed —
+#    fine for this disposable in-cluster test, never for a real deployment.
+#    SPLUNK_INDEX=main (Splunk's own default index) avoids needing to
+#    create a custom one just for this test.
+# 3. Apply this manifest. Within ~30s, HEC events should be landing in
+#    Splunk; within SPLUNK_MINING_INTERVAL_SECONDS (default 60s) of the
+#    agent picking up its new env, splunk_dependency_miner.py's next cycle
+#    should push source="splunk" edges.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: splunk-test-caller
+  namespace: payments
+  labels:
+    app: splunk-test-caller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: splunk-test-caller
+  template:
+    metadata:
+      labels:
+        app: splunk-test-caller
+    spec:
+      containers:
+      - name: caller
+        image: alpine:3.19
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: CALL_INTERVAL_SECONDS
+          value: "30"
+        # Same TARGETS convention as payment-batch.yaml: each must be a
+        # real Service in this namespace, validated against the live
+        # Service list, not trusted from log text alone.
+        - name: TARGETS
+          value: "payment-api payment payment-worker"
+        - name: NAMESPACE
+          value: "payments"
+        - name: SPLUNK_HEC_URL
+          value: "https://splunk-test.splunk-test.svc.cluster.local:8088/services/collector/event"
+        # Plain value, not a secretKeyRef: splunk-test-hec (splunk.yaml) is a
+        # Secret in the splunk-test namespace, and Secrets are namespace-
+        # scoped — this pod runs in `payments`, so it cannot reference a
+        # different namespace's Secret at all. Paste the SAME disposable
+        # test token value you put in splunk.yaml's splunk-test-hec Secret.
+        - name: SPLUNK_HEC_TOKEN
+          value: "REPLACE_ME_disposable_test_hec_token"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          apk add --no-cache curl >/dev/null 2>&1
+          echo "splunk-test-caller starting — forwards its own calls to Splunk HEC (ADR 0041/0042 verification)"
+          echo "targets: $TARGETS  interval: ${CALL_INTERVAL_SECONDS}s"
+
+          # Every $line here is one of this script's own two fixed sentences
+          # below, never untrusted input — safe to interpolate directly into
+          # this JSON literal, which would NOT be safe for arbitrary text.
+          send_to_splunk() {
+            line="$1"
+            payload=$(printf '{"event":"%s","sourcetype":"_json","fields":{"kubernetes.pod_name":"%s","kubernetes.labels.app":"splunk-test-caller","kubernetes.container_name":"caller"}}' \
+              "$line" "$POD_NAME")
+            # -k: Splunk's default HEC cert is self-signed, same posture as
+            # SPLUNK_VERIFY_TLS=false on the agent side for this test instance.
+            curl -s -k "$SPLUNK_HEC_URL" -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" -d "$payload" >/dev/null 2>&1
+          }
+
+          while true; do
+            for svc in $TARGETS; do
+              target="$svc.$NAMESPACE.svc.cluster.local"
+              # busybox wget: --no-check-certificate because the serving
+              # certs come from the Vault PKI test CA (same reasoning
+              # payment-batch.yaml's own wget call already documents),
+              # -T 3 so an unreachable target cannot stall the burst.
+              if wget -q -O- --no-check-certificate -T 3 "https://$target/" >/dev/null 2>&1; then
+                line="splunk-test-caller: called https://$target/ ok"
+              else
+                line="splunk-test-caller: called https://$target/ unreachable"
+              fi
+              echo "$line"
+              send_to_splunk "$line"
+            done
+            echo "splunk-test-caller: burst complete"
+            sleep "${CALL_INTERVAL_SECONDS:-30}"
+          done
+        resources:
+          requests:
+            memory: "16Mi"
+            cpu:    "5m"
+          limits:
+            memory: "64Mi"
+            cpu:    "50m"
+---
+# Headless, same reasoning as payment-batch's own Service: nothing routes
+# to this workload, and a ClusterIP would advertise an endpoint that
+# serves nothing — it exists purely so from_service attribution works.
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-test-caller
+  namespace: payments
+  labels:
+    app: splunk-test-caller
+spec:
+  clusterIP: None
+  selector:
+    app: splunk-test-caller
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: 9090

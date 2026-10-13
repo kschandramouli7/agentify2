@@ -1,0 +1,150 @@
+# Disposable Splunk Free instance for verifying ADR 0041 (Splunk read
+# connector) and ADR 0042 (Splunk dependency mining) against a real Splunk
+# REST API — not a production log platform, not sized for real traffic.
+#
+# WHY A SEPARATE NAMESPACE, NOT infra/kubernetes/payments-test/
+#
+# This has nothing to do with service-dependency discovery itself (unlike
+# payment-batch/payment-worker) — it's the log PLATFORM being tested
+# against, not a workload generating evidence. Keeping it in its own
+# namespace makes it trivially easy to tear down as one unit once
+# verification is done: `kubectl delete namespace splunk-test`.
+#
+# WHY NO FARGATE PROFILE
+#
+# Unlike `payments`, this namespace is deliberately NOT added to
+# infra/terraform/aws/logging.tf's log_platform_clusters list — Splunk is a
+# stateful, resource-heavier workload than Fargate's lightweight model
+# suits, and this cluster already has ordinary EC2-backed node groups for
+# namespaces like `agentify` itself. No Terraform change needed; this
+# namespace's pods just schedule onto those nodes normally.
+#
+# WHY THE SPLUNK AUTH TOKEN ISN'T IN THIS MANIFEST
+#
+# SPLUNK_HEC_TOKEN (below) is the one secret Splunk's own Docker image lets
+# you pre-bake at container start, auto-enabling HTTP Event Collector with
+# that exact value. The REST API token the agent's connector actually
+# authenticates with (Authorization: Bearer <token>) is a DIFFERENT
+# credential with no equivalent env var — it has to be minted once Splunk
+# is already running. See the runbook comment at the bottom of this file
+# for the exact command.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: splunk-test
+---
+# Fill these in before applying — never commit real values here.
+#   admin password: openssl rand -base64 24
+#   HEC token:      a UUID, e.g. `cat /proc/sys/kernel/random/uuid` or `uuidgen`
+#                   (Splunk accepts any string as a fixed HEC token value;
+#                   a UUID shape is just convention, not a requirement)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: splunk-test-admin
+  namespace: splunk-test
+type: Opaque
+stringData:
+  password: "REPLACE_ME_disposable_test_password"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: splunk-test-hec
+  namespace: splunk-test
+type: Opaque
+stringData:
+  token: "REPLACE_ME_disposable_test_hec_token"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: splunk-test
+  namespace: splunk-test
+  labels:
+    app: splunk-test
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # single instance, no rolling-update overlap needed or wanted
+  selector:
+    matchLabels:
+      app: splunk-test
+  template:
+    metadata:
+      labels:
+        app: splunk-test
+    spec:
+      containers:
+      - name: splunk
+        image: splunk/splunk:9.2
+        ports:
+        - name: web
+          containerPort: 8000   # UI, optional — useful for human inspection via port-forward
+        - name: hec
+          containerPort: 8088   # HTTP Event Collector — what the test caller workload ingests through
+        - name: management
+          containerPort: 8089   # REST API — what the agent's connector searches through
+        env:
+        - name: SPLUNK_START_ARGS
+          value: "--accept-license"
+        - name: SPLUNK_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: splunk-test-admin
+              key: password
+        - name: SPLUNK_HEC_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: splunk-test-hec
+              key: token
+        # Below Splunk's own production sizing guidance (typically 2+ vCPU,
+        # 8+GB) on purpose — adequate only for this disposable, near-zero-
+        # volume verification pass against one synthetic test caller's
+        # worth of traffic, not a sizing recommendation for anything real.
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        readinessProbe:
+          tcpSocket:
+            port: 8089
+          initialDelaySeconds: 60   # Splunk's own first-boot init is slow
+          periodSeconds: 10
+          failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-test
+  namespace: splunk-test
+  labels:
+    app: splunk-test
+spec:
+  selector:
+    app: splunk-test
+  ports:
+  - name: web
+    port: 8000
+    targetPort: 8000
+  - name: hec
+    port: 8088
+    targetPort: 8088
+  - name: management
+    port: 8089
+    targetPort: 8089
+
+# ── Runbook: mint the REST API auth token (one-time, after the pod is Ready) ──
+#
+# kubectl run splunk-token-mint -n splunk-test --rm -i --restart=Never \
+#   --image=curlimages/curl -- curl -sk -u admin:<the admin password above> \
+#   https://splunk-test.splunk-test.svc.cluster.local:8089/services/authorization/tokens \
+#   -d name=admin -d audience=agentify-splunk-test -d "expires_on=+30d" \
+#   -d output_mode=json
+#
+# The response's entry[0].content.token field is the value to set as
+# SPLUNK_TOKEN on agentify-agent (see the companion test-caller manifest's
+# own header for the full wiring instructions).
