@@ -34,6 +34,7 @@ class _Cfg:
     log_tail_lines = 200
     mine_external_egress = False
     cross_cluster_ingress_kinds = ["route"]  # ROADMAP P31 phase 1
+    tracked_label_keys = []  # ROADMAP P32 — empty means "push nothing" by default
 
 
 @pytest.fixture
@@ -317,3 +318,56 @@ async def test_scan_namespace_unresolved_external_mention_still_respects_the_egr
     await discovery_main._scan_namespace("payments", _CfgEgressOn())
 
     assert ("batch", "api.anthropic.com", "external", "") in pushed
+
+
+# ── ROADMAP P32 (ADR 0043): service-label capture wired into _scan_namespace ──
+
+@pytest.mark.asyncio
+async def test_scan_namespace_pushes_service_labels_only_when_tracked_label_keys_given(monkeypatch):
+    """_scan_namespace must call push_service_labels once per sampled pod
+    that resolved a from_service, with that pod's FULL label dict, only
+    when cfg.tracked_label_keys is non-empty — the default _Cfg (empty
+    tracked_label_keys) must make no call at all."""
+    label_calls = []
+
+    async def fake_push_service_labels(ns, service, labels, tracked_keys, backend_url, token):
+        label_calls.append((ns, service, labels, tracked_keys))
+
+    async def fake_push_coverage(ns, stats, backend_url, token):
+        pass
+
+    async def fake_push_dependency(*a, **k):
+        pass
+
+    monkeypatch.setattr(discovery_main, "push_service_labels", fake_push_service_labels)
+    monkeypatch.setattr(discovery_main, "push_scan_coverage", fake_push_coverage)
+    monkeypatch.setattr(discovery_main, "push_dependency", fake_push_dependency)
+
+    services = [{"name": "api", "selector": {"app": "api"}}]
+    pod = {"name": "api-1", "labels": {"app": "api", "apm-id": "APM123456"}}
+
+    async def fake_list_services(ns):
+        return services
+
+    async def fake_list_pods(ns):
+        return [pod]
+
+    async def fake_get_pod_logs(ns, name, tail_lines=200):
+        return ""
+
+    monkeypatch.setattr(discovery_main.k8s_client, "list_services", fake_list_services)
+    monkeypatch.setattr(discovery_main.k8s_client, "list_pods", fake_list_pods)
+    monkeypatch.setattr(discovery_main.k8s_client, "get_pod_logs", fake_get_pod_logs)
+
+    # Default _Cfg: tracked_label_keys is empty -- must not call it at all.
+    await discovery_main._scan_namespace("payments", _Cfg())
+    assert label_calls == []
+
+    # A Cfg with tracked_label_keys set -- must call it exactly once, with
+    # this pod's full label dict (the same dict _service_for_pod already
+    # matched against the Service selector).
+    class _CfgWithTrackedLabels(_Cfg):
+        tracked_label_keys = ["apm-id"]
+
+    await discovery_main._scan_namespace("payments", _CfgWithTrackedLabels())
+    assert label_calls == [("payments", "api", {"app": "api", "apm-id": "APM123456"}, ["apm-id"])]

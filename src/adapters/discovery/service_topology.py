@@ -491,3 +491,44 @@ async def push_dependency(
             resp.raise_for_status()
     except httpx.HTTPError as e:
         logger.warning("push_dependency failed for %s/%s->%s: %s", namespace, from_service, to_service, e)
+
+
+async def push_service_labels(
+    namespace: str, service: str, labels: Dict[str, str], tracked_keys: List[str],
+    backend_url: str, collector_token: str,
+) -> None:
+    """Record every one of this pod's labels whose key is in `tracked_keys`
+    (ROADMAP P32, ADR 0043) — one POST per tracked key found, mirroring
+    push_dependency's own one-call-per-fact shape and its identical
+    Authorization header convention (this collector has a real tenant-
+    scoped credential, unlike the agent's in-process _push_service_labels,
+    which has none to present). No cluster_id in the payload: the Hub
+    resolves it from the collector_token itself, same as push_dependency
+    above never sends one either.
+
+    Best-effort, same log-and-swallow discipline as push_dependency: one
+    dropped label observation never blocks the rest of the scan cycle,
+    and an untracked key is simply never sent — no call, not a server-
+    side rejection."""
+    if not tracked_keys:
+        return
+    headers = {"Authorization": f"Bearer {collector_token}"} if collector_token else {}
+    for key in tracked_keys:
+        value = labels.get(key)
+        if not value:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(
+                    f"{backend_url.rstrip('/')}/api/service-labels",
+                    json={
+                        "namespace": namespace,
+                        "service": service,
+                        "label_key": key,
+                        "label_value": value,
+                    },
+                    headers=headers,
+                )
+                resp.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning("push_service_labels failed for %s/%s (key=%s): %s", namespace, service, key, e)

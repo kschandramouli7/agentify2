@@ -41,6 +41,7 @@ from .service_topology import (
     extract_service_calls,
     push_dependency,
     push_scan_coverage,
+    push_service_labels,
     resolve_cross_cluster_target,
 )
 
@@ -110,6 +111,18 @@ async def _scan_namespace(
         if not from_service:
             continue  # can't attribute this pod's mentions to an edge without a from_service
         coverage[from_service]["pods_sampled"] += 1
+
+        # ROADMAP P32 (ADR 0043): piggybacks on the from_service resolution
+        # above, costs no extra K8s call — pod["labels"] is the same dict
+        # _service_for_pod already matched against the Service selector.
+        # Unlike the edges below, this needs no log read at all, but stays
+        # inside the same sampled/truncated loop rather than the full
+        # `attributed` list, for the same bounded-cost reasoning
+        # max_pods_per_namespace already applies to everything else here.
+        if cfg.tracked_label_keys:
+            await push_service_labels(
+                ns, from_service, pod["labels"], cfg.tracked_label_keys, cfg.backend_url, cfg.collector_token,
+            )
 
         raw_logs = await k8s_client.get_pod_logs(ns, pod["name"], tail_lines=cfg.log_tail_lines)
         if not raw_logs:

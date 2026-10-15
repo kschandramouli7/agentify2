@@ -25,3 +25,25 @@ def test_cross_cluster_ingress_kinds_strips_whitespace_and_drops_empties(monkeyp
     monkeypatch.setenv("CROSS_CLUSTER_INGRESS_KINDS", " route , , ingress ")
     cfg = load_from_env()
     assert cfg.cross_cluster_ingress_kinds == ["route", "ingress"]
+
+
+# ── ROADMAP P32 (ADR 0043): tracked_label_keys ───────────────────────────────
+
+def test_tracked_label_keys_defaults_to_empty(monkeypatch):
+    """Empty means "push nothing" -- an allowlist, not a denylist over an
+    unbounded label space (ADR 0043 Decision #1)."""
+    monkeypatch.delenv("TRACKED_LABEL_KEYS", raising=False)
+    cfg = load_from_env()
+    assert cfg.tracked_label_keys == []
+
+
+def test_tracked_label_keys_parses_a_comma_separated_list(monkeypatch):
+    monkeypatch.setenv("TRACKED_LABEL_KEYS", "apm-id,team,cost-center")
+    cfg = load_from_env()
+    assert cfg.tracked_label_keys == ["apm-id", "team", "cost-center"]
+
+
+def test_tracked_label_keys_strips_whitespace_and_drops_empties(monkeypatch):
+    monkeypatch.setenv("TRACKED_LABEL_KEYS", " apm-id , , team ")
+    cfg = load_from_env()
+    assert cfg.tracked_label_keys == ["apm-id", "team"]

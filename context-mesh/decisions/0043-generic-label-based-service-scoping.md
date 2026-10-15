@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted   ·   (date: 2026-10-15)   ·   Implemented 2026-10-15 for the Glue and Splunk miners, the single-shot and chat entry points, and the LLM-tool fallback — Discovery's live-scan capture and the frontend in/out-of-scope visual treatment are explicitly NOT done yet; see the amendment after Consequences.
+Accepted   ·   (date: 2026-10-15)   ·   Implemented 2026-10-15, including Discovery's live-scan capture — only the frontend in/out-of-scope visual treatment remains undone; see the amendment after Consequences.
 
 ## Context
 
@@ -181,16 +181,20 @@ the `_push_service_labels` tests in `test_dependency_miner.py`/
   `route == "label_scoped_dependencies"` branch), and the conversational
   fallback (`lookup_services_by_label`, a new Claude tool in `tools.py`).
 
+**Discovery's own live per-cluster scan** (`src/adapters/discovery/`) was
+wired in as a follow-up (2026-10-15, same day): `Config.tracked_label_keys`
+(same `_list_env` pattern as `cross_cluster_ingress_kinds`), a new
+`push_service_labels` in Discovery's own `service_topology.py` (same
+`Authorization: Bearer {collector_token}` convention `push_dependency`
+already uses there — no `cluster_id` in the payload either; the Hub
+resolves it from the credential), called from `_scan_namespace` right
+after `from_service` resolves, inside the same sampled/truncated pod loop
+`push_dependency` and the log read already use. All three mining paths
+(Discovery's live scan, the Glue miner, the Splunk miner) now capture
+labels identically. 266 Discovery tests pass (8 new).
+
 **Explicitly NOT done, flagged rather than silently skipped:**
 
-- **Discovery's own live per-cluster scan** (`src/adapters/discovery/`)
-  does not yet call `_push_service_labels` — only the two Hub-side Python
-  miners do. Discovery is a separate deployable with its own config
-  system (dataclass + `_list_env`, not pydantic `Settings`), and wiring it
-  in properly deserves its own pass rather than a rushed addition here.
-  Until that lands, a service whose ONLY mining evidence comes from
-  Discovery's live scan (no Glue/Splunk coverage) will never appear in a
-  label-scoped lookup even if correctly tagged.
 - **Frontend visual distinction between in-scope and out-of-scope nodes**
   (spec 012's open question #3) was not built. The existing
   `ServiceGraphSection`/`service_graph` rendering path is reused as-is

@@ -383,6 +383,78 @@ async def test_push_dependency_degrades_silently_on_error(monkeypatch):
     await st.push_dependency("payments", "payment-ui", "payment-backend", "http://backend", "secret-token")
 
 
+# ── push_service_labels (ROADMAP P32, ADR 0043) ──────────────────────────────
+
+@pytest.mark.asyncio
+async def test_push_service_labels_sends_bearer_token_and_no_cluster_id(monkeypatch):
+    import json as _json
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append({"auth": request.headers.get("authorization"), "body": _json.loads(request.content)})
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_service_labels(
+        "payments", "checkout-ui", {"apm-id": "APM123456", "team": "checkout"},
+        ["apm-id", "team"], "http://backend", "secret-token",
+    )
+
+    assert len(calls) == 2
+    for c in calls:
+        assert c["auth"] == "Bearer secret-token"
+        # No cluster_id in the payload at all -- the Hub resolves it from
+        # the Authorization header, same as push_dependency never sends one.
+        assert "cluster_id" not in c["body"]
+    got_keys = {c["body"]["label_key"] for c in calls}
+    assert got_keys == {"apm-id", "team"}
+
+
+@pytest.mark.asyncio
+async def test_push_service_labels_skips_a_tracked_key_the_pod_never_set(monkeypatch):
+    import json as _json
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(_json.loads(request.content))
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_service_labels(
+        "payments", "checkout-ui", {"apm-id": "APM123456"}, ["apm-id", "cost-center"],
+        "http://backend", "secret-token",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["label_key"] == "apm-id"
+
+
+@pytest.mark.asyncio
+async def test_push_service_labels_no_tracked_keys_makes_no_call(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not be called when tracked_keys is empty")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_service_labels("payments", "checkout-ui", {"apm-id": "APM123456"}, [], "http://backend", "secret-token")
+
+
+@pytest.mark.asyncio
+async def test_push_service_labels_degrades_silently_on_error(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await st.push_service_labels(  # must not raise
+        "payments", "checkout-ui", {"apm-id": "APM123456"}, ["apm-id"], "http://backend", "secret-token",
+    )
+
+
 @pytest.mark.asyncio
 async def test_push_dependency_sends_a_resolved_target_cluster_id(monkeypatch):
     """ROADMAP P31 phase 1 (ADR 0037): target_cluster_id passes through

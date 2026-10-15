@@ -48,6 +48,13 @@ class Config:
     # trades Route's exactness for Ingress/HTTPRoute's lossy-but-only-
     # available-form coverage on those platforms, fleet-wide, by default.
     cross_cluster_ingress_kinds: List[str] = field(default_factory=lambda: ["route", "ingress", "httproute"])
+    # Generic label-based service scoping (ROADMAP P32, ADR 0043) — which pod
+    # label keys this collector also pushes to service_labels, alongside the
+    # edges it already mines each cycle. An ALLOWLIST, not a denylist over an
+    # unbounded label space (ADR 0043 Decision #1): empty means "push
+    # nothing", the same "optional, additive capture" posture the agent's own
+    # Glue/Splunk miners use for the identical setting.
+    tracked_label_keys: List[str] = field(default_factory=list)
 
 
 def load_from_env() -> Config:
@@ -66,6 +73,7 @@ def load_from_env() -> Config:
         health_port=_int_env("HEALTH_PORT", 8300),
         mine_external_egress=_bool_env("MINE_EXTERNAL_EGRESS", False),
         cross_cluster_ingress_kinds=_list_env("CROSS_CLUSTER_INGRESS_KINDS", "route,ingress,httproute"),
+        tracked_label_keys=_list_env("TRACKED_LABEL_KEYS", ""),
     )
 
 
