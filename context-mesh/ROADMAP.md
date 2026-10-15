@@ -40,7 +40,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P12** | Multi-turn conversational chat — dedicated Chat nav page | After P11 | Architecture decided 2026-06-17 |
 | **P13** | Agentic use cases expansion | **Use Cases 1+2 done (2026-07-20)** — see below; 3/4/5 not started | [spec 011](specs/011-agentic-use-cases.md), [ADR 0020](decisions/0020-phase-3-remediation-with-approval-gate.md) |
 | **P14** | Split out two standalone agents: remediation executor (security isolation) + PR review agent (second domain) | **Next up (agreed 2026-07-20)** — see below | — |
-| **P15** | Pull-based log-platform connector (Splunk first, Elasticsearch/OpenSearch second) — replaces direct-cluster log fetch with a query-time read against wherever logs already land | Athena test harness shipped 2026-07-25. Splunk read connector (ADR 0041) + Splunk continuous dependency-mining (ADR 0042) both designed + implemented 2026-10-13, unit-tested, **not live-verified**. OpenSearch/Elasticsearch connector code not started | [spec 008](specs/008-on-demand-pod-logs.md), [ADR 0014](decisions/0014-on-demand-ephemeral-log-fetch.md) (extends, does not revisit), [ADR 0021](decisions/0021-log-platform-test-infra.md), [ADR 0041](decisions/0041-splunk-log-connector.md), [ADR 0042](decisions/0042-splunk-dependency-mining.md) |
+| **P15** | Pull-based log-platform connector (Splunk first, Elasticsearch/OpenSearch second) — replaces direct-cluster log fetch with a query-time read against wherever logs already land | Athena test harness shipped 2026-07-25. Splunk read connector (ADR 0041) + Splunk continuous dependency-mining (ADR 0042) designed + implemented 2026-10-13, **live-verified end-to-end 2026-10-15** against a real disposable Splunk instance (`service_dependency_callers` rows confirmed with `source='splunk'`) — see ROADMAP body for the three real bugs this surfaced and fixed. OpenSearch/Elasticsearch connector code not started | [spec 008](specs/008-on-demand-pod-logs.md), [ADR 0014](decisions/0014-on-demand-ephemeral-log-fetch.md) (extends, does not revisit), [ADR 0021](decisions/0021-log-platform-test-infra.md), [ADR 0041](decisions/0041-splunk-log-connector.md), [ADR 0042](decisions/0042-splunk-dependency-mining.md) |
 | **P16** | Multi-cluster connector — wire the existing `Integration` model into runtime routing (currently admin-only bookkeeping) | Proposed (2026-07-21), revised 2026-08-02 for tenant-scoping (`Integration` gains `tenant_id`) — see below | `internal/models/integration.go`, `internal/api/handlers.go` (`HandleResolveCluster`) |
 | **P17** | Multi-cluster access for the live-diagnostics tools | **Superseded 2026-08-02 by [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)** — the central-agent-pulls-via-STS design replaced by [P18](#p18--deterministic-per-cluster-fleet-collector--multi-tenant-hub-ingest-proposed-2026-08-02-revised-2026-08-02-replaces-p17)'s deterministic per-cluster collector; see below | `decisions/0022-multi-tenant-fleet-hub.md` |
 | **P18** | Deterministic per-cluster fleet collector + multi-tenant Hub ingest (replaces P17) | Proposed (2026-08-02) — **use cases #1 (namespace/service/deployment inventory), #2 (service-dependency mining), and #9 (on-demand live drill-down) shipped 2026-08-03; #3 (ingress/entry-point mapping) and #5 (fleet-wide health/version snapshots) shipped 2026-08-04, #4 (cross-cluster dependency edges) confirmed 2026-08-04, all as `agentify-discovery`**; use case #2 extended 2026-08-18 with a Glue/Athena-based miner (ADR 0029) and **verified live 2026-09-01 — 5 edges mined, `evidence_count` climbing (see below)**; review dashboard (Dependencies tab), bare-hostname matching, and a deterministic `dependencies` intent answering in chat and on `/api/query` with no model call (tier1) added 2026-09-01 (ADR 0029 amendment, `docs/SERVICE_DEPENDENCIES.md`) — the FQDN-only rule had left `agentify`/`vault` at zero edges while `payments` passed only because its test workloads logged FQDNs deliberately; use cases #6-#8 not started — see below | `decisions/0022-multi-tenant-fleet-hub.md`, `decisions/0029-glue-based-dependency-mining.md`, `src/adapters/discovery/`, `src/agent/k8fy/service_topology.py`, `src/agent/k8fy/dependency_miner.py`, `src/backend/internal/api/collector_hub.go`, `src/frontend/src/components/TopologyPanel.tsx`, `docs/SERVICE_DEPENDENCIES.md` |
@@ -885,8 +885,8 @@ namespace to the cluster's list," not new pipeline infrastructure. **Not yet
 applied live** — Fargate profile selectors are immutable in EKS, so applying
 this will force-replace the existing `payments` profile.
 
-**Splunk connector: designed and implemented, not yet live-verified
-(2026-10-13, [ADR 0041](decisions/0041-splunk-log-connector.md)):**
+**Splunk connector: live-verified end-to-end (designed/implemented
+2026-10-13, verified 2026-10-15, [ADR 0041](decisions/0041-splunk-log-connector.md)):**
 `src/agent/k8fy/log_platform_splunk.py` — follows the shape Athena actually
 shipped with (a Python module behind `log_router.py`), not the original,
 since-superseded Go `LogSource` design. `get_logs()` now tries Splunk
@@ -896,16 +896,38 @@ test harness when both happen to be configured), falling through to
 Athena, then the live cluster. REST search-jobs API (start → poll →
 fetch), token auth resolved from Secrets Manager the same optional,
 degrade-gracefully way Langfuse's keys already are — never fail-fast like
-the Anthropic key. Unit-tested against mocked HTTP (17 new tests across
-`test_log_platform_splunk.py`/`test_log_router.py`); **the field-mapping
-schema it assumes (Fluent-Bit-style `kubernetes.*` fields, raw text in
-`_raw`) is unverified against any real Splunk index** — the ADR names this
-explicitly as the design's highest-risk assumption. No infra changes yet
-(`infra/kubernetes/agent.yaml` needs the three `SPLUNK_*` env vars added
-once a real instance exists to point at).
+the Anthropic key. Unit-tested against mocked HTTP (now 19 tests across
+`test_log_platform_splunk.py`/`test_log_router.py`).
 
-**Splunk as a continuous dependency-mining source: designed and
-implemented, not yet live-verified (2026-10-13,
+**The field-mapping schema it assumes (Fluent-Bit-style `kubernetes.*`
+fields, raw text in `_raw`) is now confirmed correct against a real,
+disposable Splunk instance** — `kubernetes.pod_name`, `kubernetes.labels.*`,
+`kubernetes.container_name`, and `kubernetes.namespace_name` all land as
+flat, independently-searchable fields exactly as assumed. Getting there
+surfaced three real, unrelated bugs, now fixed:
+1. **Infra gap**: the `payments` namespace's Fargate security group had no
+   rule allowing inbound to the EC2-node-group-backed test Splunk instance
+   — fixed with a new `aws_security_group_rule` in `logging.tf`.
+2. **Test-fixture bug**: the disposable test caller sent `sourcetype:"_json"`,
+   which tells Splunk the EVENT VALUE ITSELF is JSON to parse structurally
+   (not "this envelope is JSON") — every plain-text event was silently
+   dropped (HEC still acked `"Success"` since that happens pre-indexing).
+   Fixed by switching to a non-JSON-triggering sourcetype name.
+3. **Real connector bug, not a fixture issue**: `_build_spl`/
+   `_build_namespace_spl` never named `kubernetes.pod_name`/
+   `kubernetes.labels.*`/`kubernetes.container_name` anywhere in their SPL
+   — and Splunk's JSON results API only returns fields that are either a
+   fixed "default" set or explicitly named in the query. Every field we
+   never referenced vanished from every result row despite being genuinely
+   indexed; the miner ran every cycle, found rows, grouped them by an
+   always-empty `pod_name`, and silently pushed nothing — no exception, no
+   log line. Fixed by appending `| table *` to both queries, with
+   regression tests locking it in (`infra/kubernetes/agent.yaml` still
+   needs the three `SPLUNK_*` env vars added for a production target;
+   they were set by hand via `kubectl set env` on the disposable instance).
+
+**Splunk as a continuous dependency-mining source: live-verified
+end-to-end (designed/implemented 2026-10-13, verified 2026-10-15,
 [ADR 0042](decisions/0042-splunk-dependency-mining.md)).**
 `src/agent/k8fy/splunk_dependency_miner.py` — distinct from the on-demand
 read connector above, this gives Splunk the Glue miner's own role (a
@@ -919,16 +941,17 @@ miner's 300s, which is tied to Firehose's buffering interval and doesn't
 apply here). The Dependencies diagram's existing health/failure
 highlighting and trend indicator work for Splunk-sourced edges with zero
 frontend or backend-schema changes, since neither branches on `source`.
-31 new tests (`test_splunk_dependency_miner.py` + the `log_platform_splunk.py`
+33 new tests (`test_splunk_dependency_miner.py` + the `log_platform_splunk.py`
 refactor this needed — `_run_query` now takes a `result_limit` parameter
 instead of a bare module constant, since mining's namespace-wide fetch
-needs a different cap, 500, than the on-demand read's 200); full agent
-suite: 425 passed. **Stacks a second unverified-schema risk on ADR 0041's
-first**: Splunk events need K8s label metadata (`kubernetes.labels.<key>`
-dotted fields assumed), not just pod/container name, for `from_service`
-attribution — check both against a real instance together before trusting
-production data from this path. Elasticsearch/OpenSearch remains the one
-still-undesigned connector in this item.
+needs a different cap, 500, than the on-demand read's 200), including two
+regression tests pinning the `| table *` fix described above.
+**`service_dependency_callers` now holds real `source='splunk'` rows**
+(`splunk-test-caller → payment-api/payment-worker/payment`) confirmed via
+live query against the disposable harness — both the schema assumption and
+the end-to-end mining pipeline are proven, not just unit-tested.
+Elasticsearch/OpenSearch remains the one still-undesigned connector in
+this item.
 
 ## P16 — Multi-cluster connector (proposed 2026-07-21)
 

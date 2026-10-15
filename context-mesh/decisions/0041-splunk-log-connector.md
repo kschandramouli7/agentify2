@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed   ·   (date: 2026-10-13)
+Accepted   ·   (date: 2026-10-13)   ·   Amended 2026-10-15 — live-verified against a real disposable Splunk instance; see note after Consequences.
 
 ## Context
 
@@ -198,3 +198,26 @@ path for every log-platform tier, not a per-connector reimplementation.
   which case confirm the three-tier ordering above still makes sense with
   a fourth tier added, rather than assuming this ADR's two-platform
   ordering generalizes unchanged.
+
+## Amendment (2026-10-15) — live verification against a real instance
+
+The field-mapping schema assumption named above as the highest risk is
+**confirmed correct**: tested against a disposable self-hosted Splunk
+instance (ADR 0021's "self-hosted disposable pod" pattern, see ROADMAP.md
+P15), `kubernetes.pod_name`, `kubernetes.container_name`, and
+`kubernetes.namespace_name` all land as flat, independently-searchable
+fields exactly as `_build_spl`/the row-parsing code assume.
+
+Getting a clean result surfaced one real bug in this module, now fixed:
+`_build_spl` never named `kubernetes.container_name` (and, when no `pod`
+filter is given, `kubernetes.pod_name`) anywhere in its SPL. Splunk's JSON
+results API only returns fields that are either a fixed "default" set or
+explicitly named in the query — so both fields silently vanished from
+every result row despite being genuinely indexed, with no error of any
+kind. Fixed by appending `| table *` to the query, with a regression test
+(`test_build_spl_requests_all_fields`) pinning it. The infra-level bugs
+that blocked reaching this point at all (a missing security-group rule,
+and a test-fixture `sourcetype` misconfiguration that silently dropped
+every event before it could even be searched) are infrastructure/test-
+harness issues, not connector-code bugs — see ROADMAP.md P15 for the full
+account.

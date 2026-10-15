@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed   ·   (date: 2026-10-13)
+Accepted   ·   (date: 2026-10-13)   ·   Amended 2026-10-15 — live-verified end-to-end against a real disposable Splunk instance; see note after Consequences.
 
 ## Context
 
@@ -159,3 +159,38 @@ design should be stretched to pretend it already does.
   in which case the push-based alerting option from the earlier options
   discussion becomes the next thing to design, not a fallback to silently
   reach for.
+
+## Amendment (2026-10-15) — live verification against a real instance
+
+The second unverified schema assumption named above — label metadata
+(`kubernetes.labels.<key>`) actually being present in Splunk events — is
+**confirmed correct**, tested together with ADR 0041's own assumption
+against the same disposable Splunk instance (ROADMAP.md P15 has the full
+account).
+
+Confirming it surfaced the real bug in this module: `_build_namespace_spl`
+never named `kubernetes.pod_name`/`kubernetes.labels.*`/
+`kubernetes.container_name` anywhere in its SPL (only
+`kubernetes.namespace_name`, via the `WHERE` filter). Splunk's JSON
+results API only returns fields that are either a fixed "default" set or
+explicitly named in the query, so every one of those three fields
+silently vanished from every row — despite being genuinely indexed, as the
+schema-verification step above independently confirmed. The mining cycle
+ran every interval, fetched real rows, and then grouped them all by an
+always-empty `pod_name` — producing zero pushed edges, with no exception
+and no log line anywhere, because the empty-result path was never treated
+as an error. Fixed by appending `| table *` to the query (the same fix
+ADR 0041's connector needed), with a regression test
+(`test_build_namespace_spl_requests_all_fields`) pinning it.
+
+After the fix, a live query against `service_dependency_callers` shows
+real `source='splunk'` rows (`splunk-test-caller → payment-api`,
+`→ payment-worker`, `→ payment`) — the full pipeline, not just the schema
+assumption, is now proven end-to-end.
+
+**Worth generalizing:** this bug class — a field that is genuinely indexed
+but silently absent from results because nothing in the query names it —
+is specific to how Splunk's search API serializes results, not to this
+one query. Any future Splunk SPL added to this codebase should default to
+`| table *` (or an explicit field list covering everything the caller
+reads) rather than relying on "the field exists, so it'll come back."
