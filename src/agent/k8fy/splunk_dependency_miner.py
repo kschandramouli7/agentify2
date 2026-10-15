@@ -44,8 +44,18 @@ def _build_namespace_spl(index: str, namespace: str, limit: int) -> str:
     dependency_miner.py's own _mine_namespace unit of work (query once,
     group by pod_name after fetch), not log_platform_splunk.py's single-pod
     on-demand read shape. No pod filter: this fetches every pod's events in
-    the namespace in one search."""
-    return f'search index={index} kubernetes.namespace_name="{namespace}" | head {limit}'
+    the namespace in one search.
+
+    The trailing "| table *" is load-bearing, not cosmetic: Splunk's JSON
+    results API only returns "default" fields (_raw, _time, host, ...) plus
+    any field explicitly named in the SPL — confirmed live, where
+    kubernetes.namespace_name (named in the WHERE clause above) came back
+    on every row but kubernetes.pod_name/kubernetes.labels.*/
+    kubernetes.container_name (named nowhere in the query) were silently
+    absent despite being genuinely indexed on the event. Without this, every
+    row in by_pod's grouping below is keyed on an empty pod_name and the
+    whole mining pass silently finds nothing to push."""
+    return f'search index={index} kubernetes.namespace_name="{namespace}" | head {limit} | table *'
 
 
 def _extract_labels(row: Dict[str, Any]) -> Dict[str, str]:

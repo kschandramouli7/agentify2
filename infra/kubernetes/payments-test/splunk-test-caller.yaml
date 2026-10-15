@@ -106,8 +106,27 @@ spec:
           # this JSON literal, which would NOT be safe for arbitrary text.
           send_to_splunk() {
             line="$1"
-            payload=$(printf '{"event":"%s","sourcetype":"_json","fields":{"kubernetes.pod_name":"%s","kubernetes.labels.app":"splunk-test-caller","kubernetes.container_name":"caller"}}' \
-              "$line" "$POD_NAME")
+            # sourcetype "_json" tells Splunk the EVENT VALUE ITSELF is a
+            # JSON document to parse structurally, not "this envelope is
+            # JSON" -- our event is plain log text, so Splunk's JsonLineBreaker
+            # fails on the first character (confirmed live via splunkd.log:
+            # "Unexpected character while looking for value: 's'", the first
+            # letter of this script's own log lines) and silently drops
+            # every event -- HEC still acks "Success" since that happens
+            # before indexing. kubernetes.* metadata already rides in HEC's
+            # own top-level "fields" (index-time metadata, parsed
+            # correctly regardless of sourcetype), so _json bought nothing
+            # here and only broke ingestion. Any non-JSON-triggering
+            # sourcetype name works; this one is just descriptive.
+            # kubernetes.namespace_name is required here, not cosmetic:
+            # splunk_dependency_miner.py's SPL query filters on it
+            # (kubernetes.namespace_name="<namespace>") the same way
+            # dependency_miner.py's Athena query already does — confirmed
+            # live that without it the field is simply absent from the
+            # event (table * showed no such field), so the miner's query
+            # would match zero rows even with ingestion otherwise healthy.
+            payload=$(printf '{"event":"%s","sourcetype":"k8s_app_log","fields":{"kubernetes.pod_name":"%s","kubernetes.namespace_name":"%s","kubernetes.labels.app":"splunk-test-caller","kubernetes.container_name":"caller"}}' \
+              "$line" "$POD_NAME" "$NAMESPACE")
             # -k: Splunk's default HEC cert is self-signed, same posture as
             # SPLUNK_VERIFY_TLS=false on the agent side for this test instance.
             curl -s -k "$SPLUNK_HEC_URL" -H "Authorization: Splunk $SPLUNK_HEC_TOKEN" -d "$payload" >/dev/null 2>&1

@@ -152,6 +152,16 @@ def test_build_spl_includes_index_and_namespace():
     assert "| head 50" in spl
 
 
+def test_build_spl_requests_all_fields():
+    # Confirmed live: Splunk's JSON results API drops any field not named
+    # in the SPL itself (even a genuinely indexed one) unless the query
+    # asks for everything explicitly. Without "| table *" here,
+    # kubernetes.container_name (and kubernetes.pod_name when `pod` is
+    # unset) silently vanish from every row.
+    spl = sp._build_spl("k8s_logs", "payments", None, 50)
+    assert spl.endswith("| table *")
+
+
 def test_build_spl_includes_pod_when_given():
     spl = sp._build_spl("k8s_logs", "payments", "payment-worker-abc", 50)
     assert 'kubernetes.pod_name="payment-worker-abc"' in spl

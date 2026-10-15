@@ -214,6 +214,31 @@ resource "aws_security_group_rule" "fargate_to_vault" {
   description              = "Vault API from Fargate pods - vault-cert-init initContainer (ADR 0021)"
 }
 
+# Splunk live-verification harness (ROADMAP P15, ADR 0041/0042) — same gap
+# as the two rules above, found live 2026-10-13: splunk-test-caller runs on
+# Fargate (payments namespace) and needs to reach the disposable Splunk
+# test instance's HEC port, which runs on the EC2 node group (splunk-test
+# has no Fargate profile). Without this, splunk-test-caller's HEC POSTs
+# and ANY cross-namespace reach from payments into splunk-test time out
+# silently (confirmed via `curl` from both sides — DNS resolves, the
+# Service/Endpoints are correctly configured, Splunk itself is listening
+# and healthy on all its ports; only Fargate-sourced traffic into the node
+# group's security group is blocked). Deliberately NOT gated behind
+# var.enable_log_platform_test — that flag controls the separate Glue/
+# Athena harness, not this one. This rule (and the whole splunk-test
+# namespace) is disposable: remove it when that verification pass is done,
+# the same way the namespace itself gets torn down with `kubectl delete
+# namespace splunk-test`.
+resource "aws_security_group_rule" "fargate_to_splunk_test_hec" {
+  type                     = "ingress"
+  from_port                = 8088
+  to_port                  = 8088
+  protocol                 = "tcp"
+  security_group_id        = module.eks.node_security_group_id
+  source_security_group_id = module.eks.cluster_primary_security_group_id
+  description              = "Splunk HEC from Fargate pods - splunk-test-caller (ROADMAP P15, ADR 0041/0042, disposable)"
+}
+
 resource "aws_vpc_endpoint" "log_test" {
   for_each = var.enable_log_platform_test ? toset(["ecr.api", "ecr.dkr", "kinesis-firehose"]) : toset([])
 

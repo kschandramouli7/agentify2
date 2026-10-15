@@ -27,6 +27,18 @@ def test_build_namespace_spl_has_no_pod_filter():
     assert "| head 500" in spl
 
 
+def test_build_namespace_spl_requests_all_fields():
+    # Confirmed live: without "| table *", Splunk's JSON results API
+    # silently drops kubernetes.pod_name/kubernetes.labels.*/
+    # kubernetes.container_name from every row (they're never named
+    # elsewhere in this query), so _mine_namespace's by_pod grouping sees
+    # an empty pod_name for every row and pushes nothing — no exception,
+    # no log line, just zero edges. See log_platform_splunk.py's sibling
+    # test for the same regression on the single-pod query.
+    spl = sdm._build_namespace_spl("k8s_logs", "payments", 500)
+    assert spl.endswith("| table *")
+
+
 def test_extract_labels_strips_prefix():
     row = {
         "kubernetes.pod_name": "payment-worker-abc",

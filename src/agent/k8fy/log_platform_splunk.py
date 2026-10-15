@@ -39,7 +39,13 @@ def _build_spl(index: str, namespace: str, pod: Optional[str], limit: int) -> st
     where = [f"index={index}", f'kubernetes.namespace_name="{namespace}"']
     if pod:
         where.append(f'kubernetes.pod_name="{pod}"')
-    return f"search {' '.join(where)} | head {limit}"
+    # "| table *" is load-bearing, not cosmetic — see
+    # splunk_dependency_miner.py's _build_namespace_spl for the full
+    # explanation (confirmed live): Splunk's JSON results API silently
+    # drops any field not named in the SPL itself, even when it's genuinely
+    # indexed on the event. kubernetes.container_name and (when `pod` is
+    # unset) kubernetes.pod_name are never named in this query otherwise.
+    return f"search {' '.join(where)} | head {limit} | table *"
 
 
 async def _run_query(
