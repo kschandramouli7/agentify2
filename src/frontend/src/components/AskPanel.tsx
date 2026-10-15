@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { askQuery, type QueryResponse } from "../api";
-import { DependencyFlow } from "./DependencyFlow";
+import { buildLabelScopeMeta, DependencyFlow } from "./DependencyFlow";
 
 export function AskPanel() {
   const [question, setQuestion] = useState("Is the payment service healthy?");
@@ -64,6 +64,7 @@ export function AskPanel() {
               edges={resp.details!.service_graph!.dependencies}
               focus={focus}
               onFocus={setFocus}
+              meta={buildLabelScopeMeta(resp.details?.out_of_scope_services)}
             />
           )}
           {resp.sources.length > 0 && (

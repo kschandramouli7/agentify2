@@ -81,6 +81,13 @@ export interface QueryResponse {
       focus?: string | null;
       dependencies: ServiceDependency[];
     };
+    // Label-scoped dependencies (intent "label_scoped_dependencies",
+    // ROADMAP P32, ADR 0043) — present alongside service_graph above.
+    // out_of_scope_services names every edge endpoint that is NOT in
+    // `services` (ADR 0043 Decision #5: a downstream system with a
+    // different, or no, matching tag still appears, distinguished).
+    services?: string[];
+    out_of_scope_services?: string[];
   };
   // Which tier answered: "tier1" means deterministic, no model call.
   tier?: string;
@@ -149,6 +156,16 @@ export interface ChatMessageDetails {
     focus?: string | null;
     dependencies: ServiceDependency[];
   };
+  /**
+   * Label-scoped dependencies (intent "label_scoped_dependencies", ROADMAP
+   * P32, ADR 0043) — present alongside service_graph above when a chat turn
+   * resolved a label key=value lookup. out_of_scope_services names every
+   * edge endpoint NOT in `services` — a downstream system with a different,
+   * or no, matching tag still appears in service_graph, distinguished by
+   * this list rather than hidden.
+   */
+  services?: string[];
+  out_of_scope_services?: string[];
   /**
    * The ordered result of a "trace <input>" chat turn (ROADMAP P29) — one
    * on-demand raw-log search across every onboarded cluster, rendered as a

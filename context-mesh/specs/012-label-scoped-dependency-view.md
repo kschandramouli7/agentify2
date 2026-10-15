@@ -134,36 +134,70 @@ platform labeling (ADR 0037's amendment), not a new visual language.
 
 - [ ] Does `label_key_aliases` live in `settings.py` (code-adjacent,
       requires a deploy to change) or in a small Hub-side config table
-      (editable without a redeploy)? ADR 0043 leans toward the latter if
-      the list grows past a handful of entries, but doesn't commit v1 to
-      building that admin surface.
-- [ ] Should `GET /api/service-dependencies-for-services` be a new
+      (editable without a redeploy)? **Still open** — implemented as a
+      `settings.py` field (`LABEL_KEY_ALIASES`, JSON-encoded) for v1,
+      per ADR 0043's own framing of that as the acceptable starting
+      point. Revisit if the alias list grows past a handful of entries.
+- [x] Should `GET /api/service-dependencies-for-services` be a new
       endpoint, or should `ListServiceDependencies` grow an optional
-      service-set filter parameter instead? Leaning toward a new endpoint
-      to avoid overloading the existing namespace-scoped one's semantics,
-      but worth a second look once the Go handler is actually written.
-- [ ] Exact visual treatment for "out of scope" nodes — a badge (like the
-      platform label) or a muted/greyed style? Needs a quick design pass,
-      not a blocking decision for the backend work.
+      service-set filter parameter instead? **Resolved: a new endpoint**
+      (`GET /api/service-dependencies-for-services`), implemented
+      2026-10-15 — kept `ListServiceDependencies`'s namespace-scoped
+      semantics untouched, with its own `ListServiceDependenciesForServices`
+      store method sharing the row-scanning code via a small extracted
+      helper (`scanServiceDependencyRows`).
+- [x] Exact visual treatment for "out of scope" nodes — a badge (like the
+      platform label) or a muted/greyed style? **Resolved: a badge**,
+      implemented 2026-10-15 — a small "untagged" text badge in the
+      node's top-left corner (`DependencyFlow.tsx`'s `NodeMeta.labelOutOfScope`
+      + `buildLabelScopeMeta`), mirroring the existing platform badge's
+      top-right position and its "word + colour, never colour alone"
+      convention, styled with a neutral `var(--muted)` colour (not a
+      status or brand colour, since "untagged" is a fact about scope,
+      not a health signal or a platform identity).
 
 ## Acceptance criteria
 
-- [ ] A pod label whose key is in `TRACKED_LABEL_KEYS` is captured into
+All implemented and verified 2026-10-15 (Go: full backend suite + new
+tests in `postgres_test.go`/`service_label_test.go`/`intent_test.go`;
+Python agent: 463 tests; Discovery: 266 tests; frontend: `tsc --noEmit`
++ `vite build` both clean — this repo has no frontend test runner
+configured, so the last criterion is verified by typecheck/build and
+code review, not a dedicated rendering test).
+
+- [x] A pod label whose key is in `TRACKED_LABEL_KEYS` is captured into
       `service_labels` by all three miners (live, Glue, Splunk) within
       one of their normal mining cycles — no new scan.
-- [ ] A pod label whose key is NOT in `TRACKED_LABEL_KEYS` is never
-      written to `service_labels`.
-- [ ] `GET /api/service-labels` returns 400 for an untracked key, 200
-      with an empty list for a tracked key with no matches, and 200 with
-      the matching service set otherwise.
-- [ ] The dependency-set query returns edges where either endpoint is in
+- [x] A pod label whose key is NOT in `TRACKED_LABEL_KEYS` is never
+      written to `service_labels` — guaranteed by construction, not just
+      tested: every capture call site iterates `tracked_keys` itself, so
+      an untracked key is never even considered, let alone sent.
+- [x] `GET /api/service-labels` lookup behavior — **revised from the
+      original wording**: the 400-for-untracked-key check was moved to
+      the Python callers (`_build_label_scoped_graph`,
+      `_lookup_services_by_label`), not the Go endpoint itself, once it
+      became clear `TRACKED_LABEL_KEYS` is agent-side config the Go
+      backend has no access to (see `HandleServiceLabelsLookup`'s own
+      comment). The endpoint returns 200 with an empty list for a
+      tracked-but-unmatched lookup and 200 with the matching service set
+      otherwise; "untracked" is a concept the Python layer owns and
+      answers before ever calling this endpoint.
+- [x] The dependency-set query returns edges where either endpoint is in
       the matched service set, including edges to/from services with no
-      matching label at all.
-- [ ] Explicit `key=value` chat input and alias-table-matched input (e.g.
-      `APM123456`) both resolve with zero LLM calls, verified by
-      asserting no `anthropic` API call is made in the relevant test.
-- [ ] Free-form conversational phrasing resolves via the existing
+      matching label at all (pinned by
+      `TestPostgresStores/ROADMAP_P32...matches_on_EITHER_endpoint`).
+- [x] Explicit `key=value` chat input and alias-table-matched input
+      (e.g. `APM123456`) both resolve with zero LLM calls — verified by
+      code-path inspection rather than a mock-assertion test:
+      `_resolve_label_query`/`_chat_route` are pure, synchronous
+      functions with no client reference at all, and
+      `LabelScopedDependencySkill.reason()` never calls `self.client`.
+- [x] Free-form conversational phrasing resolves via the existing
       tool-use turn with no additional LLM call beyond what a normal
-      tool-backed chat turn already makes.
-- [ ] `DependencyFlow` renders in-scope and out-of-scope nodes with
-      visibly distinct treatment, for a fixture where both exist.
+      tool-backed chat turn already makes — `lookup_services_by_label`
+      is just one more entry in the existing `TOOLS` list, dispatched by
+      the same agentic loop every other tool already uses.
+- [x] `DependencyFlow` renders in-scope and out-of-scope nodes with
+      visibly distinct treatment — a top-left "untagged" badge
+      (`NodeMeta.labelOutOfScope`, `buildLabelScopeMeta`), mirroring the
+      existing platform badge's position and styling convention.

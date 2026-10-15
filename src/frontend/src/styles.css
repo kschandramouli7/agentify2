@@ -3309,6 +3309,14 @@ code {
 .flow__platform-badge--eks { fill: #ff9900; }
 .flow__platform-badge--gke { fill: #4285f4; }
 
+/* Label-scoped dependency traceability (ROADMAP P32, ADR 0043) — top-left,
+   mirroring the platform badge's top-right position. Deliberately neutral
+   (var(--muted), not a status or brand colour): "untagged" is a fact about
+   scope, not a health signal or a platform identity, and borrowing either
+   vocabulary here would mislead the same way ADR 0043's own node-styling
+   note warns against for other markers on this canvas. */
+.flow__label-scope-badge { font-size: 9px; font-weight: 600; letter-spacing: 0.02em; fill: var(--muted); }
+
 /* The glyph beside the badge text above (DependencyFlow.tsx's PlatformShape)
    sets its own explicit per-element fills now — a backdrop colour plus a
    white/multi-colour foreground mark needs two-or-more colours on one

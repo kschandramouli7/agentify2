@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted   ·   (date: 2026-10-15)   ·   Implemented 2026-10-15, including Discovery's live-scan capture — only the frontend in/out-of-scope visual treatment remains undone; see the amendment after Consequences.
+Accepted   ·   (date: 2026-10-15)   ·   Implemented 2026-10-15 in full, including Discovery's live-scan capture and the frontend's in/out-of-scope badge; see the amendment after Consequences.
 
 ## Context
 
@@ -193,12 +193,24 @@ after `from_service` resolves, inside the same sampled/truncated pod loop
 (Discovery's live scan, the Glue miner, the Splunk miner) now capture
 labels identically. 266 Discovery tests pass (8 new).
 
-**Explicitly NOT done, flagged rather than silently skipped:**
+**Frontend visual distinction between in-scope and out-of-scope nodes**
+(spec 012's open question #3) was also built as a follow-up (2026-10-15,
+same day): `details.services`/`details.out_of_scope_services` (both
+agent response shapes — `ChatMessageDetails` and `QueryResponse.details`
+in `api.ts` — pass through the Go backend's `map[string]interface{}`
+`Details` field untouched, so no Go change was needed). `DependencyFlow.tsx`
+gained `NodeMeta.labelOutOfScope` and an exported `buildLabelScopeMeta`
+helper, called from both chat-path rendering (`DiagnosisReport.tsx`'s
+`ServiceGraphSection`) and the single-shot Ask tab (`AskPanel.tsx`) so
+neither path drifts from the other. Renders a small "untagged" text
+badge in the node's top-left corner, mirroring the existing platform
+badge's top-right position and "word + colour, never colour alone"
+convention, styled with a neutral `var(--muted)` colour rather than a
+status or brand one. `tsc --noEmit` and `vite build` both pass clean;
+this repo has no frontend test runner configured, so this is verified by
+typecheck/build and code review, not a dedicated rendering test.
 
-- **Frontend visual distinction between in-scope and out-of-scope nodes**
-  (spec 012's open question #3) was not built. The existing
-  `ServiceGraphSection`/`service_graph` rendering path is reused as-is
-  (confirmed safe: `namespace` is display text only, never used for a
-  further API call), so the graph renders correctly today — just without
-  a badge distinguishing which nodes were in the tagged set versus pulled
-  in only because they're connected to one.
+**Nothing from this ADR's scope remains undone** — only the two items
+already named in Decision/Consequences as deliberately out of scope
+(ad-hoc Splunk-index-driven mining; per-tenant `TRACKED_LABEL_KEYS`)
+remain, by design, for future work.

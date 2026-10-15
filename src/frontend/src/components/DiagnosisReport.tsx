@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { runLiveTool, type ChatMessageDetails, type RecommendedAction, type ServiceDependency } from "../api";
-import { DependencyFlow, reach } from "./DependencyFlow";
+import { buildLabelScopeMeta, DependencyFlow, reach } from "./DependencyFlow";
 import { SequenceDiagram } from "./SequenceDiagram";
 
 function statusIcon(status: string): string {
@@ -422,8 +422,12 @@ function ActionRow({ action }: { action: RecommendedAction }) {
 // the page.
 function ServiceGraphSection({
   graph,
+  outOfScopeServices,
 }: {
   graph: { namespace: string; focus?: string | null; dependencies: ServiceDependency[] };
+  /** Label-scoped dependency traceability (ROADMAP P32, ADR 0043) — see
+   *  DependencyFlow.tsx's buildLabelScopeMeta for what this renders. */
+  outOfScopeServices?: string[];
 }) {
   const [focus, setFocus] = useState<string | null>(graph.focus ?? null);
   const [open, setOpen] = useState(true);
@@ -479,7 +483,12 @@ function ServiceGraphSection({
             </ul>
           )}
 
-          <DependencyFlow edges={graph.dependencies} focus={selected} onFocus={setFocus} />
+          <DependencyFlow
+            edges={graph.dependencies}
+            focus={selected}
+            onFocus={setFocus}
+            meta={buildLabelScopeMeta(outOfScopeServices)}
+          />
 
           <p className="diag-graph-note adm-muted">
             Mined from pod logs in <code>{graph.namespace}</code> — an edge exists only where a
@@ -522,7 +531,7 @@ export function DiagnosisReport({ details }: { details: ChatMessageDetails }) {
       <Section title="Recommendations" items={details.recommendations ?? []} defaultOpen={false} />
 
       {(details.service_graph?.dependencies ?? []).length > 0 && (
-        <ServiceGraphSection graph={details.service_graph!} />
+        <ServiceGraphSection graph={details.service_graph!} outOfScopeServices={details.out_of_scope_services} />
       )}
 
       {/* ROADMAP P29 — the ordered result of a "trace <input>" chat turn:

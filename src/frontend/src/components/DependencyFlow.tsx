@@ -91,7 +91,25 @@ export type NodeMeta = {
    *  are nonetheless on two DIFFERENT clusters are still distinguishable
    *  on inspection. */
   clusterId?: string;
+  /** Label-scoped dependency traceability (ROADMAP P32, ADR 0043): true
+   *  when this node was pulled into a label-scoped view by an edge, but
+   *  does NOT itself carry the queried label=value — "connected, but not
+   *  tagged", distinguished rather than hidden (ADR 0043 Decision #5).
+   *  Absent/false for every node in an ordinary (non-label-scoped) view. */
+  labelOutOfScope?: boolean;
 };
+
+/** Builds the sparse `meta` entries a label-scoped view needs — just the
+ *  `labelOutOfScope` flag, one entry per name in `outOfScope` — so a
+ *  caller can pass this straight to DependencyFlow's `meta` prop without
+ *  duplicating this Map-building logic (ROADMAP P32, ADR 0043; both
+ *  AskPanel.tsx and DiagnosisReport.tsx's ServiceGraphSection call this).
+ *  Returns undefined for an empty/absent list — an ordinary view must
+ *  never get an empty Map's worth of pointless lookups. */
+export function buildLabelScopeMeta(outOfScope?: string[]): Map<string, NodeMeta> | undefined {
+  if (!outOfScope || outOfScope.length === 0) return undefined;
+  return new Map(outOfScope.map(name => [name, { labelOutOfScope: true }]));
+}
 
 /** Short display form for a wire-level platform value, for the badge and
  *  the tooltip — "" (undetected) renders as nothing, never as a label. */
@@ -1387,6 +1405,18 @@ export function DependencyFlow({
                       {platformLabel(m.platform)}
                     </text>
                   </>
+                )}
+                {/* Label-scoped dependency traceability (ROADMAP P32, ADR
+                  * 0043): top-LEFT corner, mirroring the platform badge's
+                  * top-right position — the two never describe the same
+                  * node differently, so there is no case where both compete
+                  * for the same corner. Only ever rendered inside a label-
+                  * scoped view (buildLabelScopeMeta only sets this flag for
+                  * one); an ordinary Dependencies-tab view never shows it. */}
+                {m?.labelOutOfScope && (
+                  <text x={n.x + 6} y={n.y + 12} textAnchor="start" className="flow__label-scope-badge">
+                    untagged
+                  </text>
                 )}
                 {profile && (
                   <text x={n.x + NODE_W / 2} y={n.y + 34} textAnchor="middle" className="flow__what">
