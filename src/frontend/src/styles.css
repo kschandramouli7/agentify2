@@ -2887,9 +2887,11 @@ code {
    any alert banners, same margin rhythm as the stat row's own bottom margin. */
 .topo-path-coverage { margin: -12px 0 20px; font-size: 12px; }
 
-/* ROADMAP P31 phase 2 (cold services, ADR 0038) — a plain checkbox + label,
-   sized and spaced to sit inline with the other filter-bar controls. */
-.topo-cold-toggle {
+/* A plain checkbox + label, sized and spaced to sit inline with the other
+   filter-bar controls — shared by every Dependencies-panel toggle (cold-
+   only, show-flow-count), not specific to any one of them despite the
+   first one to use it being ROADMAP P31 phase 2 (cold services, ADR 0038). */
+.topo-toggle {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -2940,13 +2942,24 @@ code {
    since a side-by-side chat panel has no room to be useful below ~960px. */
 .topo-columns { display: flex; gap: 0; align-items: flex-start; }
 .topo-main { flex: 1; min-width: 0; }
-.topo-side { width: 380px; flex: none; }
+/* Sticky, not static: .topo-main can run much taller than the chat rail
+   (a large diagram, a long dependency table), and without this the rail
+   — a real running conversation, not a glance-and-forget widget — would
+   scroll away with the page the moment a reader scrolled past its own
+   600px. top: 20px mirrors the page's own top padding (no fixed site
+   header exists to clear); .topo-chat's height budget above subtracts
+   the matching 20px bottom margin so the sticky box never crosses the
+   bottom of the viewport either. */
+.topo-side { width: 380px; flex: none; position: sticky; top: 20px; }
 @media (max-width: 960px) {
   /* The resize handle isn't rendered here (TopologyPanel only mounts it in
      the side-by-side layout), so it isn't there to provide the stacked
      columns' vertical gap either — restore it directly. */
   .topo-columns { flex-direction: column; gap: 20px; }
-  .topo-side { width: 100%; }
+  /* Sticky only makes sense in the side-by-side layout above 960px —
+     stacked below it, the chat rail is simply the next thing on the page,
+     and pinning it there would trap it mid-scroll over the diagram. */
+  .topo-side { width: 100%; position: static; }
 }
 
 /* Drag handle between .topo-main and .topo-side — replaces .topo-columns'
@@ -3004,7 +3017,12 @@ code {
 .topo-chat {
   display: flex;
   flex-direction: column;
-  height: 600px;
+  /* 600px on a tall viewport (the original fixed height); shrinks to fit a
+     shorter one instead of overflowing past the bottom of the screen —
+     the 40px budget matches the sticky offset + a matching bottom margin
+     on .topo-side below, so the panel never pushes past the viewport
+     edge it's pinned within. */
+  height: min(600px, calc(100vh - 40px));
   background: var(--surface);
   border: 1px solid var(--border-bright);
   border-radius: var(--r-md);

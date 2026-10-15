@@ -323,6 +323,10 @@ export function TopologyPanel() {
   // ROADMAP P31 phase 2 (cold services, ADR 0038).
   const [showColdOnly, setShowColdOnly] = useState(false);
   const [showMermaid, setShowMermaid] = useState(false);
+  // Off by default: a diagram with every arrow numbered reads as busier
+  // than it needs to for a first look, and the count is always still in
+  // each edge's own tooltip regardless of this toggle.
+  const [showFlowCount, setShowFlowCount] = useState(false);
 
   // Drag-to-resize the chat rail (`.topo-side`) against the diagram
   // (`.topo-main`). Width lives in state so it can be dragged; persisted to
@@ -742,13 +746,21 @@ export function TopologyPanel() {
           {/* ROADMAP P31 phase 2 (cold services, ADR 0038). A candidate list
             * for decommissioning, not an order — the label and the empty
             * state below both say so explicitly. */}
-          <label className="topo-cold-toggle">
+          <label className="topo-toggle">
             <input
               type="checkbox"
               checked={showColdOnly}
               onChange={e => setShowColdOnly(e.target.checked)}
             />
             Show cold only
+          </label>
+          <label className="topo-toggle" title="Print the sighting count on each arrow. Always in the tooltip either way.">
+            <input
+              type="checkbox"
+              checked={showFlowCount}
+              onChange={e => setShowFlowCount(e.target.checked)}
+            />
+            Show flow count
           </label>
           <button className="adm-btn adm-btn--ghost" type="button" onClick={() => refetch()}>
             {isFetching ? "Refreshing…" : "Refresh"}
@@ -939,6 +951,7 @@ export function TopologyPanel() {
                 meta={arch.meta}
                 focus={selected}
                 onFocus={setFocus}
+                showFlowCount={showFlowCount}
               />
 
               <div className="topo-focus">

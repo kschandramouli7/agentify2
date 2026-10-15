@@ -1040,7 +1040,7 @@ function roleText(n: Node, m?: NodeMeta): string {
 }
 
 export function DependencyFlow({
-  edges, focus, onFocus, standalone = [], meta,
+  edges, focus, onFocus, standalone = [], meta, showFlowCount = false,
 }: {
   edges: FlowEdge[];
   focus: string | null;
@@ -1050,6 +1050,12 @@ export function DependencyFlow({
   standalone?: string[];
   /** Per-node facts from inventory: node kind, coverage, ingress host. */
   meta?: Map<string, NodeMeta>;
+  /** Print the sighting count on each edge. Off by default — a diagram with
+   *  every arrow numbered reads as busier than it needs to for a first
+   *  look; the count is one click away (TopologyPanel's "Show flow count"
+   *  toggle) for a reader who actually wants it, and it's always in the
+   *  edge's own tooltip regardless of this prop. */
+  showFlowCount?: boolean;
 }) {
   // Focus shows the TRANSITIVE neighbourhood, not one hop. One hop answers
   // "who calls this"; the operator's actual question during an incident is
@@ -1235,8 +1241,10 @@ export function DependencyFlow({
                       markerEnd={`url(#${on ? "flow-arrow-on" : "flow-arrow"})`} />
                 {/* Printed, never implied by thickness alone — and set
                     horizontally rather than on a textPath, which rotated the
-                    digits along the curve and made them unreadable. */}
-                {!declared && (
+                    digits along the curve and made them unreadable. Gated on
+                    showFlowCount: still in every edge's own tooltip either
+                    way, this is just whether it's ALSO on the canvas. */}
+                {!declared && showFlowCount && (
                   <text x={mid.x} y={mid.y - 6} textAnchor="middle" className="flow__count">
                     {e.evidence_count}
                   </text>
