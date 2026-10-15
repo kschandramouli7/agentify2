@@ -16,6 +16,7 @@ from k8fy.skills.deployment_guardian import DeploymentGuardianSkill
 from k8fy.skills.diagnose import DiagnoseSkill
 from k8fy.skills.health_check import HealthSkill
 from k8fy.skills.incident_responder import IncidentResponderSkill
+from k8fy.skills.label_scoped_dependency import LabelScopedDependencySkill
 from k8fy.skills.remediation_executor import RemediationExecutorSkill
 from k8fy.skills.restart_trend import RestartTrendSkill
 from k8fy.skills.vault_cert import VaultCertSkill
@@ -48,6 +49,8 @@ class SkillRouter:
             "dependencies": DependencyGraphSkill(),
             # Same deterministic posture (ROADMAP P31 phase 2, ADR 0038).
             "cold_services": ColdServicesSkill(),
+            # Same deterministic posture (ROADMAP P32, ADR 0043).
+            "label_scoped_dependencies": LabelScopedDependencySkill(),
         }
         # Fallback: full K8fyAgent for general_query or anything new.
         self._fallback: Optional[K8fyAgent] = None

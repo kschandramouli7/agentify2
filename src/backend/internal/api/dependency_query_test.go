@@ -95,6 +95,59 @@ func TestAnswerDependencies_BypassesThePodLookup(t *testing.T) {
 	}
 }
 
+// TestAnswerDependencies_LabelScopedBypassesThePodLookupToo (ROADMAP P32,
+// ADR 0043) pins that label_scoped_dependencies shares the exact same
+// bypass "dependencies" gets above, for a stronger reason: a label-tagged
+// service set isn't scoped to one namespace at all, so RouteToPods'
+// single-namespace assumption wouldn't even make sense here, never mind
+// the empty-pods bail.
+func TestAnswerDependencies_LabelScopedBypassesThePodLookupToo(t *testing.T) {
+	var gotIntent string
+
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var gotBody map[string]interface{}
+		_ = json.Unmarshal(body, &gotBody)
+		gotIntent, _ = gotBody["intent"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{
+			"answer": "3 services tagged APM123456.",
+			"status": "ok",
+			"confidence": 1.0,
+			"sources": ["service_labels"],
+			"tier": "tier1"
+		}`)
+	}))
+	defer agent.Close()
+
+	h := &Handler{
+		agentClient: NewAgentClient(agent.URL),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	body := `{"question":"show me the dependency flow for APM123456","context":{}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/query", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.HandleQuery(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp QueryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Intent != "label_scoped_dependencies" {
+		t.Errorf("intent = %q, want label_scoped_dependencies", resp.Intent)
+	}
+	if resp.Answer == "No data available for this query" {
+		t.Fatal("the pod-lookup bail swallowed the question — the route no longer short-circuits")
+	}
+	if gotIntent != "label_scoped_dependencies" {
+		t.Errorf("agent intent = %q, want label_scoped_dependencies", gotIntent)
+	}
+}
+
 // TestAnswerDependencies_AgentFailureIsGraceful — a dependency question must
 // never 500; the graph is a convenience, not a critical path.
 func TestAnswerDependencies_AgentFailureIsGraceful(t *testing.T) {

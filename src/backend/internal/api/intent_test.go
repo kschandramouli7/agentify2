@@ -128,6 +128,48 @@ func TestInferIntent_ColdServices(t *testing.T) {
 	}
 }
 
+// TestInferIntent_LabelScopedDependencies locks the routing rule for
+// ROADMAP P32 (ADR 0043) — checked BEFORE the general dependencies/cold-
+// services branches, same precedence reasoning cold_services' own test
+// above documents, and only for the two fixed, unambiguous shapes that
+// need no config lookup to recognize.
+func TestInferIntent_LabelScopedDependencies(t *testing.T) {
+	cases := []struct {
+		question string
+		want     string
+	}{
+		// Bare APM-shaped token, anywhere in the message.
+		{"show me the dependency flow for APM123456", "label_scoped_dependencies"},
+		{"what does APM123456 touch", "label_scoped_dependencies"},
+		// Explicit key=value syntax, no APM involved at all — proves this
+		// isn't APM-specific.
+		{"team=checkout", "label_scoped_dependencies"},
+		{"dependency flow for cost-center=1234", "label_scoped_dependencies"},
+
+		// Diagnostic phrasing still wins over this too, same precedence as
+		// every other Tier-1 branch.
+		{"why is APM123456 failing", "diagnose"},
+
+		// Mixed questions go to the branch owning the other domain —
+		// same "mixed questions never get the graph-only answer" rule
+		// TestInferIntent_Dependencies already documents.
+		{"is APM123456 healthy?", "health_check"},
+
+		// Must not false-positive on ordinary "x = y" English phrasing —
+		// the regex deliberately requires no whitespace around "=".
+		{"if x = 5 then what happens", "general_query"},
+
+		// Not label-scoped questions at all.
+		{"who calls payment-api?", "dependencies"},
+		{"is payment healthy?", "health_check"},
+	}
+	for _, c := range cases {
+		if got := inferIntent(c.question); got != c.want {
+			t.Errorf("inferIntent(%q) = %q, want %q", c.question, got, c.want)
+		}
+	}
+}
+
 // TestIsDependencyQuestion_RequiresBothHalves guards the helper directly, so a
 // change that drops either half fails here with a clear message rather than as
 // a confusing intent mismatch.

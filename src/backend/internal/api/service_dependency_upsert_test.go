@@ -42,6 +42,21 @@ type fakeServiceDependencyStore struct {
 	coldServicesErr           error
 	lastColdStaleDays         int
 	lastColdScannedWithinDays int
+
+	// ROADMAP P32 (generic label-based service scoping, ADR 0043).
+	labelUpsertCalls    []labelUpsertCall
+	labelUpsertErr      error
+	servicesByLabelRows []pgstore.ServiceRef
+	servicesByLabelErr  error
+	lastLabelKey        string
+	lastLabelValue      string
+	depsForServicesRows []pgstore.ServiceDependency
+	depsForServicesErr  error
+	lastServicesScope   []pgstore.ServiceRef
+}
+
+type labelUpsertCall struct {
+	tenantID, clusterID, namespace, service, labelKey, labelValue string
 }
 
 func (f *fakeServiceDependencyStore) ListColdServices(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]pgstore.ColdService, error) {
@@ -95,6 +110,31 @@ func (f *fakeServiceDependencyStore) UpsertServiceDependency(ctx context.Context
 
 func (f *fakeServiceDependencyStore) ListServiceDependencies(ctx context.Context, tenantID, namespace string) ([]pgstore.ServiceDependency, error) {
 	return nil, nil
+}
+
+func (f *fakeServiceDependencyStore) UpsertServiceLabel(ctx context.Context, tenantID, clusterID, namespace, service, labelKey, labelValue string) error {
+	f.labelUpsertCalls = append(f.labelUpsertCalls, labelUpsertCall{
+		tenantID: tenantID, clusterID: clusterID, namespace: namespace,
+		service: service, labelKey: labelKey, labelValue: labelValue,
+	})
+	return f.labelUpsertErr
+}
+
+func (f *fakeServiceDependencyStore) ListServicesByLabel(ctx context.Context, tenantID, labelKey, labelValue string) ([]pgstore.ServiceRef, error) {
+	f.lastLabelKey = labelKey
+	f.lastLabelValue = labelValue
+	if f.servicesByLabelErr != nil {
+		return nil, f.servicesByLabelErr
+	}
+	return f.servicesByLabelRows, nil
+}
+
+func (f *fakeServiceDependencyStore) ListServiceDependenciesForServices(ctx context.Context, tenantID string, services []pgstore.ServiceRef) ([]pgstore.ServiceDependency, error) {
+	f.lastServicesScope = services
+	if f.depsForServicesErr != nil {
+		return nil, f.depsForServicesErr
+	}
+	return f.depsForServicesRows, nil
 }
 
 // TestHandleServiceDependencyUpsert_ClusterIDOverride exercises ADR 0029's

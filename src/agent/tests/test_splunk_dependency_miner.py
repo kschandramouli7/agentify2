@@ -91,6 +91,46 @@ async def test_mine_namespace_end_to_end(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mine_namespace_pushes_service_labels_only_when_tracked_label_keys_given(monkeypatch):
+    # ROADMAP P32 (ADR 0043): mirrors dependency_miner.py's own equivalent
+    # test. _push_service_labels is imported from dependency_miner.py into
+    # this module's own namespace, so it's monkeypatched on `sdm`, not
+    # `dm` -- same "from X import Y binds a separate reference" discipline
+    # this file's own module docstring already names for the other shared
+    # helpers.
+    async def fake_fetch_selectors(backend_url, cluster_id, namespace):
+        return {"payment-worker": {"app": "payment-worker"}, "payment-api": {"app": "payment-api"}}
+
+    async def fake_run_query(client, splunk_url, token, spl, hours_back, result_limit=None):
+        return {"rows": [
+            {"kubernetes.pod_name": "payment-worker-abc", "kubernetes.labels.app": "payment-worker",
+             "_raw": "GET payment-api.payments.svc.cluster.local"},
+        ]}
+
+    async def fake_push_edge(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(sdm, "_fetch_selectors", fake_fetch_selectors)
+    monkeypatch.setattr(sdm, "_run_query", fake_run_query)
+    monkeypatch.setattr(sdm, "_push_edge", fake_push_edge)
+
+    label_calls = []
+
+    async def fake_push_service_labels(backend_url, cluster_id, namespace, service, labels, tracked_keys):
+        label_calls.append((cluster_id, namespace, service, labels, tracked_keys))
+
+    monkeypatch.setattr(sdm, "_push_service_labels", fake_push_service_labels)
+
+    await sdm._mine_namespace("http://backend", _SPLUNK_CONFIG, "cluster-a", "payments", hours_back=2)
+    assert label_calls == []  # no tracked_label_keys -- must not call it at all
+
+    await sdm._mine_namespace(
+        "http://backend", _SPLUNK_CONFIG, "cluster-a", "payments", hours_back=2, tracked_label_keys={"apm-id"},
+    )
+    assert label_calls == [("cluster-a", "payments", "payment-worker", {"app": "payment-worker"}, {"apm-id"})]
+
+
+@pytest.mark.asyncio
 async def test_mine_namespace_pushes_each_edge_at_most_once_per_cycle(monkeypatch):
     async def fake_fetch_selectors(backend_url, cluster_id, namespace):
         return {"payment-worker": {"app": "payment-worker"}, "payment-api": {"app": "payment-api"}}
@@ -257,7 +297,7 @@ async def test_run_once_mines_every_cluster_namespace_pair(monkeypatch):
 
     mined = []
 
-    async def fake_mine_namespace(backend_url, splunk_config, cluster_id, namespace, hours_back):
+    async def fake_mine_namespace(backend_url, splunk_config, cluster_id, namespace, hours_back, tracked_label_keys=None):
         mined.append((cluster_id, namespace))
 
     monkeypatch.setattr(sdm, "_fetch_registered_clusters", fake_fetch_clusters)
@@ -275,7 +315,7 @@ async def test_run_once_one_namespace_failure_does_not_block_the_others(monkeypa
 
     mined = []
 
-    async def fake_mine_namespace(backend_url, splunk_config, cluster_id, namespace, hours_back):
+    async def fake_mine_namespace(backend_url, splunk_config, cluster_id, namespace, hours_back, tracked_label_keys=None):
         if namespace == "broken":
             raise RuntimeError("boom")
         mined.append(namespace)

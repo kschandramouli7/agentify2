@@ -237,8 +237,48 @@ async def _push_edge(
         )
 
 
+async def _push_service_labels(
+    backend_url: str, cluster_id: str, namespace: str, service: str,
+    labels: Dict[str, str], tracked_keys: Set[str],
+) -> None:
+    """Record every one of this pod's labels whose key is in `tracked_keys`
+    (ROADMAP P32, ADR 0043) — one POST per tracked key found, mirroring
+    _push_edge's own one-call-per-fact shape. Called once per pod that
+    successfully resolved a from_service, by every miner that already does
+    that resolution (this one, the Splunk miner, Discovery's live scan) —
+    the label dict was already computed for _service_for_labels above; this
+    is the only place in this codebase anything downstream of that match
+    survives past the match itself. Best-effort, same log-and-swallow
+    discipline as _push_edge: one dropped label observation never blocks
+    the rest of the cycle, and an untracked key is simply never sent — no
+    call, not a server-side rejection."""
+    for key in tracked_keys:
+        value = labels.get(key)
+        if not value:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(
+                    f"{backend_url.rstrip('/')}/api/service-labels",
+                    json={
+                        "namespace": namespace,
+                        "service": service,
+                        "cluster_id": cluster_id,
+                        "label_key": key,
+                        "label_value": value,
+                    },
+                )
+                resp.raise_for_status()
+        except httpx.HTTPError as e:
+            logger.warning(
+                "dependency_miner: push_service_labels failed for %s/%s (key=%s) in cluster=%s: %s",
+                namespace, service, key, cluster_id, e,
+            )
+
+
 async def _mine_namespace(
     backend_url: str, athena_config: Dict[str, str], cluster_id: str, namespace: str, hours_back: int,
+    tracked_label_keys: Optional[Set[str]] = None,
 ) -> None:
     """Mine one (cluster, namespace)'s recently-landed log partition for
     service-dependency edges, pushing each discovered (from, to, port, path)
@@ -294,6 +334,10 @@ async def _mine_namespace(
         from_service = _service_for_labels(pod_labels.get(pod_name, {}), selectors)
         if not from_service:
             continue
+        if tracked_label_keys:
+            await _push_service_labels(
+                backend_url, cluster_id, namespace, from_service, pod_labels.get(pod_name, {}), tracked_label_keys,
+            )
         log_text = "\n".join(lines)
 
         # Last KNOWN outcome per (to_service, port, path) wins within this
@@ -333,11 +377,20 @@ async def _mine_namespace(
             )
 
 
-async def run_once(backend_url: str, athena_config: Dict[str, str], hours_back: int = 2) -> None:
+async def run_once(
+    backend_url: str, athena_config: Dict[str, str], hours_back: int = 2,
+    tracked_label_keys: Optional[Set[str]] = None,
+) -> None:
     """One full mining cycle across every registered fleet cluster's
     onboarded namespaces. Never raises — a failure mining one
     (cluster, namespace) never blocks the others (same log-and-continue
-    discipline as agentify-discovery's own _scan_once)."""
+    discipline as agentify-discovery's own _scan_once).
+
+    tracked_label_keys (ROADMAP P32, ADR 0043): which pod label keys to
+    also capture into service_labels this cycle, alongside the edges this
+    function already mines — None/empty means "no label capture", not an
+    error (TRACKED_LABEL_KEYS is an independent, optional config knob from
+    ATHENA_*, same as Splunk mining's own config)."""
     if not (athena_config.get("workgroup") and athena_config.get("database") and athena_config.get("table")):
         logger.info("dependency_miner: Athena not configured, skipping this cycle")
         return
@@ -349,13 +402,14 @@ async def run_once(backend_url: str, athena_config: Dict[str, str], hours_back: 
             continue
         for namespace in cluster.get("namespaces") or []:
             try:
-                await _mine_namespace(backend_url, athena_config, cluster_id, namespace, hours_back)
+                await _mine_namespace(backend_url, athena_config, cluster_id, namespace, hours_back, tracked_label_keys)
             except Exception:
                 logger.exception("dependency_miner: mining failed for cluster=%s namespace=%s", cluster_id, namespace)
 
 
 async def run_forever(
     backend_url: str, athena_config: Dict[str, str], interval_seconds: int, shutdown: asyncio.Event,
+    tracked_label_keys: Optional[Set[str]] = None,
 ) -> None:
     """Periodic background task — same shape as agentify-discovery's own
     scan-cycle ticker (main.py::_run): run once, then wait up to
@@ -363,7 +417,7 @@ async def run_forever(
     the loop; a failed cycle just tries again next time."""
     while not shutdown.is_set():
         try:
-            await run_once(backend_url, athena_config)
+            await run_once(backend_url, athena_config, tracked_label_keys=tracked_label_keys)
         except Exception:
             logger.exception("dependency_miner: mining cycle failed")
         try:

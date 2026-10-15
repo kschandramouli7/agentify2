@@ -23,6 +23,7 @@ against apps that don't log outbound hostnames, and expect it to say nothing
 rather than something wrong.
 """
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -539,6 +540,48 @@ async def fetch_cold_services(
             return resp.json() or []
     except (httpx.HTTPError, ValueError) as e:
         logger.warning("fetch_cold_services failed for namespace=%s: %s", namespace, e)
+        return []
+
+
+async def fetch_services_by_label(label_key: str, label_value: str, backend_url: str) -> List[Dict[str, str]]:
+    """Which (cluster_id, namespace, service) tuples carry label_key=label_value,
+    fleet-wide (ROADMAP P32, ADR 0043) — the first half of a label-scoped
+    dependency query. Degrades to an empty list on any failure, same
+    convention as fetch_service_dependencies: a missing/unreachable lookup
+    should never turn a chat answer into an error, just "nothing found"."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{backend_url.rstrip('/')}/api/service-labels",
+                params={"label_key": label_key, "label_value": label_value},
+            )
+            resp.raise_for_status()
+            return resp.json().get("services", []) or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("fetch_services_by_label failed for %s=%s: %s", label_key, label_value, e)
+        return []
+
+
+async def fetch_service_dependencies_for_services(
+    services: List[Dict[str, str]], backend_url: str,
+) -> List[Dict[str, Any]]:
+    """The dependency graph scoped to an arbitrary SET of (cluster_id,
+    namespace, service) tuples (ROADMAP P32, ADR 0043) — the second half
+    of a label-scoped dependency query, called with
+    fetch_services_by_label's own result. Degrades to an empty list on any
+    failure, same convention as fetch_service_dependencies."""
+    if not services:
+        return []  # nothing to scope to — avoid a round trip for an answer already known
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{backend_url.rstrip('/')}/api/service-dependencies-for-services",
+                params={"services": json.dumps(services)},
+            )
+            resp.raise_for_status()
+            return resp.json() or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("fetch_service_dependencies_for_services failed for %d services: %s", len(services), e)
         return []
 
 

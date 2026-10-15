@@ -173,6 +173,71 @@ async def test_push_edge_degrades_silently_on_error(monkeypatch):
     await dm._push_edge("http://backend", "cluster-a", "payments", "payment-worker", "payment-api")  # must not raise
 
 
+# ── _push_service_labels (ROADMAP P32, ADR 0043) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_push_service_labels_sends_one_call_per_tracked_key_with_a_value(monkeypatch):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await dm._push_service_labels(
+        "http://backend", "cluster-a", "payments", "checkout-ui",
+        {"apm-id": "APM123456", "team": "checkout", "pod-template-hash": "abc123"},
+        {"apm-id", "team"},
+    )
+
+    # Order isn't guaranteed (tracked_keys is a set) -- compare as a set of
+    # frozen dicts instead of a list, same reasoning test_mine_namespace_*
+    # tests already use for pushed-edge sets elsewhere in this file.
+    got = {tuple(sorted(c.items())) for c in calls}
+    want = {
+        tuple(sorted({"namespace": "payments", "service": "checkout-ui", "cluster_id": "cluster-a",
+                       "label_key": "apm-id", "label_value": "APM123456"}.items())),
+        tuple(sorted({"namespace": "payments", "service": "checkout-ui", "cluster_id": "cluster-a",
+                       "label_key": "team", "label_value": "checkout"}.items())),
+    }
+    assert got == want
+    # pod-template-hash was on the pod but never in tracked_keys -- must
+    # never be sent, the entire point of the allowlist (ADR 0043 Decision #1).
+    assert all(c["label_key"] != "pod-template-hash" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_push_service_labels_skips_a_tracked_key_the_pod_never_set(monkeypatch):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await dm._push_service_labels(
+        "http://backend", "cluster-a", "payments", "checkout-ui",
+        {"apm-id": "APM123456"}, {"apm-id", "cost-center"},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["label_key"] == "apm-id"
+
+
+@pytest.mark.asyncio
+async def test_push_service_labels_degrades_silently_on_error(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(httpx.MockTransport(handler)))
+
+    await dm._push_service_labels(  # must not raise
+        "http://backend", "cluster-a", "payments", "checkout-ui", {"apm-id": "APM123456"}, {"apm-id"},
+    )
+
+
 # ── _mine_namespace orchestration ────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -213,6 +278,54 @@ async def test_mine_namespace_end_to_end(monkeypatch):
          "qualified", "glue")
     ]
     assert "cluster_id = 'cluster-a'" in fake_client.started_with["query"]
+
+
+@pytest.mark.asyncio
+async def test_mine_namespace_pushes_service_labels_only_when_tracked_label_keys_given(monkeypatch):
+    # ROADMAP P32 (ADR 0043): the label-capture call piggybacks on the SAME
+    # cycle that already resolves from_service for edge mining -- no second
+    # fetch, gated entirely on whether the caller passed tracked_label_keys
+    # at all (None/empty is the "label capture is off" sentinel, same
+    # posture as ATHENA_*/SPLUNK_* being unconfigured for the edges
+    # themselves).
+    async def fake_fetch_selectors(backend_url, cluster_id, namespace):
+        return {"payment-worker": {"app": "payment-worker"}, "payment-api": {"app": "payment-api"}}
+
+    fake_client = _FakeAthenaClient(rows=[
+        ["payment-worker-abc", "{app=payment-worker}", "2026-07-24T22:22:26Z stdout F GET payment-api.payments.svc.cluster.local"],
+    ])
+    async def fake_push_edge(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(dm, "_fetch_selectors", fake_fetch_selectors)
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: fake_client)
+    monkeypatch.setattr(dm, "_push_edge", fake_push_edge)
+
+    label_calls = []
+
+    async def fake_push_service_labels(backend_url, cluster_id, namespace, service, labels, tracked_keys):
+        label_calls.append((cluster_id, namespace, service, labels, tracked_keys))
+
+    monkeypatch.setattr(dm, "_push_service_labels", fake_push_service_labels)
+
+    # No tracked_label_keys at all -- must not call _push_service_labels.
+    await dm._mine_namespace(
+        "http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2,
+    )
+    assert label_calls == []
+
+    # Re-run the SAME fixture with tracked_label_keys set -- must call it
+    # exactly once, with this pod's full label dict (the labels used to
+    # resolve from_service in the first place), regardless of whether
+    # every tracked key actually has a value.
+    monkeypatch.setattr(dm.boto3, "client", lambda service, region_name=None: _FakeAthenaClient(rows=[
+        ["payment-worker-abc", "{app=payment-worker}", "2026-07-24T22:22:26Z stdout F GET payment-api.payments.svc.cluster.local"],
+    ]))
+    await dm._mine_namespace(
+        "http://backend", {"workgroup": "wg", "database": "db", "table": "tbl"}, "cluster-a", "payments", hours_back=2,
+        tracked_label_keys={"apm-id"},
+    )
+    assert label_calls == [("cluster-a", "payments", "payment-worker", {"app": "payment-worker"}, {"apm-id"})]
 
 
 @pytest.mark.asyncio
@@ -399,7 +512,7 @@ async def test_run_once_mines_every_cluster_namespace_pair(monkeypatch):
 
     mined = []
 
-    async def fake_mine_namespace(backend_url, athena_config, cluster_id, namespace, hours_back):
+    async def fake_mine_namespace(backend_url, athena_config, cluster_id, namespace, hours_back, tracked_label_keys=None):
         mined.append((cluster_id, namespace))
 
     monkeypatch.setattr(dm, "_fetch_registered_clusters", fake_fetch_clusters)
@@ -417,7 +530,7 @@ async def test_run_once_one_namespace_failure_does_not_block_the_others(monkeypa
 
     mined = []
 
-    async def fake_mine_namespace(backend_url, athena_config, cluster_id, namespace, hours_back):
+    async def fake_mine_namespace(backend_url, athena_config, cluster_id, namespace, hours_back, tracked_label_keys=None):
         if namespace == "broken":
             raise RuntimeError("boom")
         mined.append(namespace)

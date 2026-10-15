@@ -1723,6 +1723,135 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P32 (ADR 0043): service labels upsert + lookup, last-observed-wins", func(t *testing.T) {
+		tenantID := uuid.New().String()
+
+		if err := client.UpsertServiceLabel(ctx, tenantID, "cluster-a", "payments", "checkout-ui", "apm-id", "APM111"); err != nil {
+			t.Fatalf("upsert checkout-ui label: %v", err)
+		}
+		if err := client.UpsertServiceLabel(ctx, tenantID, "cluster-a", "payments", "checkout-api", "apm-id", "APM111"); err != nil {
+			t.Fatalf("upsert checkout-api label: %v", err)
+		}
+
+		matches, err := client.ListServicesByLabel(ctx, tenantID, "apm-id", "APM111")
+		if err != nil {
+			t.Fatalf("list by label: %v", err)
+		}
+		if len(matches) != 2 {
+			t.Fatalf("want 2 services tagged APM111, got %d: %+v", len(matches), matches)
+		}
+
+		// Re-observing checkout-ui under a DIFFERENT value (e.g. retagged, or a
+		// later pod carrying a corrected label) must overwrite, not accumulate —
+		// one row per (service, label_key), last-observed wins, same convention
+		// service_dependencies' own outcome/match_kind merge already uses.
+		if err := client.UpsertServiceLabel(ctx, tenantID, "cluster-a", "payments", "checkout-ui", "apm-id", "APM222"); err != nil {
+			t.Fatalf("re-upsert checkout-ui under a new value: %v", err)
+		}
+		after111, err := client.ListServicesByLabel(ctx, tenantID, "apm-id", "APM111")
+		if err != nil {
+			t.Fatalf("list APM111 after retag: %v", err)
+		}
+		if len(after111) != 1 || after111[0].Service != "checkout-api" {
+			t.Fatalf("want only checkout-api still tagged APM111, got %+v", after111)
+		}
+		after222, err := client.ListServicesByLabel(ctx, tenantID, "apm-id", "APM222")
+		if err != nil {
+			t.Fatalf("list APM222: %v", err)
+		}
+		if len(after222) != 1 || after222[0].Service != "checkout-ui" {
+			t.Fatalf("want checkout-ui now tagged APM222, got %+v", after222)
+		}
+
+		// Lookup on an untracked key or an unseen value is a clean empty
+		// result, never an error — ADR 0043 Decision #4's "tracked" validation
+		// lives in the agent's TRACKED_LABEL_KEYS allowlist, not here.
+		none, err := client.ListServicesByLabel(ctx, tenantID, "apm-id", "APM-NEVER-SEEN")
+		if err != nil {
+			t.Fatalf("list unseen value: %v", err)
+		}
+		if len(none) != 0 {
+			t.Fatalf("want 0 matches for an unseen value, got %+v", none)
+		}
+	})
+
+	t.Run("ROADMAP P32 (ADR 0043): ListServiceDependenciesForServices matches on EITHER endpoint", func(t *testing.T) {
+		tenantID := uuid.New().String()
+
+		// In-scope: checkout-api only. Three edges exercise three distinct
+		// cases this query's OR-based scoping (ADR 0043 Decision #5) must get
+		// right:
+		//   1. checkout-ui -> checkout-api: checkout-api matches as TO_service.
+		//   2. checkout-api -> billing (no label at all): checkout-api matches
+		//      as FROM_service, and billing must still appear even though it
+		//      carries no matching (or any) label — this is the exact
+		//      "downstream system with a different/no tag still shows up"
+		//      requirement the OR-scoping exists for.
+		//   3. unrelated-a -> unrelated-b: neither endpoint is in scope, must
+		//      NOT appear.
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "checkout-ui", ToService: "checkout-api", TargetKind: "service"}); err != nil {
+			t.Fatalf("upsert edge 1: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "checkout-api", ToService: "billing", TargetKind: "service"}); err != nil {
+			t.Fatalf("upsert edge 2: %v", err)
+		}
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "unrelated-a", ToService: "unrelated-b", TargetKind: "service"}); err != nil {
+			t.Fatalf("upsert edge 3 (out of scope): %v", err)
+		}
+		// Cross-cluster case (ADR 0037): to_service's cluster is
+		// target_cluster_id, not cluster_id, for this edge — scoping to the
+		// TARGET cluster's copy of the service must still match via the
+		// COALESCE(NULLIF(target_cluster_id, ''), cluster_id) fallback.
+		if err := client.UpsertServiceDependency(ctx, ServiceDependencyUpsert{ID: uuid.New().String(), TenantID: tenantID, ClusterID: "cluster-a", Namespace: "payments", FromService: "xc-caller", ToService: "shop.example.com", TargetKind: "cross_cluster", TargetClusterID: "cluster-b"}); err != nil {
+			t.Fatalf("upsert cross-cluster edge: %v", err)
+		}
+
+		scope := []ServiceRef{{ClusterID: "cluster-a", Namespace: "payments", Service: "checkout-api"}}
+		deps, err := client.ListServiceDependenciesForServices(ctx, tenantID, scope)
+		if err != nil {
+			t.Fatalf("list scoped dependencies: %v", err)
+		}
+		gotPairs := map[string]bool{}
+		for _, d := range deps {
+			gotPairs[d.FromService+"->"+d.ToService] = true
+		}
+		if !gotPairs["checkout-ui->checkout-api"] {
+			t.Errorf("want checkout-ui->checkout-api (checkout-api matches as to_service), got %+v", gotPairs)
+		}
+		if !gotPairs["checkout-api->billing"] {
+			t.Errorf("want checkout-api->billing (billing has no label at all, must still show), got %+v", gotPairs)
+		}
+		if gotPairs["unrelated-a->unrelated-b"] {
+			t.Errorf("unrelated-a->unrelated-b must NOT appear (neither endpoint in scope), got %+v", gotPairs)
+		}
+		if gotPairs["xc-caller->shop.example.com"] {
+			t.Errorf("xc-caller->shop.example.com must NOT appear for the 'cluster-a' scope (its to_service lives in cluster-b), got %+v", gotPairs)
+		}
+
+		// Now scope to the cross-cluster edge's TARGET side specifically.
+		xcScope := []ServiceRef{{ClusterID: "cluster-b", Namespace: "payments", Service: "shop.example.com"}}
+		xcDeps, err := client.ListServiceDependenciesForServices(ctx, tenantID, xcScope)
+		if err != nil {
+			t.Fatalf("list cross-cluster-scoped dependencies: %v", err)
+		}
+		found := false
+		for _, d := range xcDeps {
+			if d.FromService == "xc-caller" && d.ToService == "shop.example.com" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("want xc-caller->shop.example.com when scoped to its resolved target_cluster_id, got %+v", xcDeps)
+		}
+
+		// An empty scope is "nothing to look up", not an error, and must not
+		// round-trip to the database at all (ADR 0043's early return).
+		empty, err := client.ListServiceDependenciesForServices(ctx, tenantID, nil)
+		if err != nil || len(empty) != 0 {
+			t.Fatalf("want (nil, nil) for an empty scope, got (%+v, %v)", empty, err)
+		}
+	})
+
 	t.Run("ROADMAP P30 phase 1 (ADR 0033): security findings upsert, and resolve-on-disappear semantics", func(t *testing.T) {
 		tenantID := uuid.New().String()
 		ns := "security-test-payments"

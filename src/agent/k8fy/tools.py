@@ -354,6 +354,42 @@ TOOLS = [
             "required": ["namespace"],
         },
     },
+    {
+        # ROADMAP P32 (ADR 0043): the fallback for conversational phrasing
+        # that the Tier-1 fast path (_resolve_label_query, checked before
+        # this tool-use loop even runs) didn't recognize — e.g. "what's
+        # connected to the checkout team's services" has no explicit
+        # key=value syntax for a regex to latch onto, so the model fills
+        # label_key/label_value itself from context, same as it fills
+        # arguments for any other tool. Generic by design: never APM-
+        # specific anywhere in this schema or its implementation.
+        "name": "lookup_services_by_label",
+        "description": (
+            "Find services tagged with a specific label (e.g. an APM/application "
+            "id, a team name, a cost center) and the dependency graph scoped to "
+            "them, fleet-wide across every namespace and cluster. A service "
+            "connected to a tagged one but NOT itself tagged with it still "
+            "appears in the result, marked as such — that's deliberate: it shows "
+            "what a tagged application set actually touches, tagged or not. "
+            "Only label keys this deployment has been configured to track can "
+            "be looked up; an unrecognized key returns the tracked list instead "
+            "of a guess."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label_key": {
+                    "type": "string",
+                    "description": "The label key to look up (e.g. 'apm-id', 'team', 'cost-center').",
+                },
+                "label_value": {
+                    "type": "string",
+                    "description": "The label value to match (e.g. 'APM123456', 'checkout').",
+                },
+            },
+            "required": ["label_key", "label_value"],
+        },
+    },
 ]
 
 # ── Vault tool implementations ────────────────────────────────────────────────
@@ -678,6 +714,39 @@ async def _dispatch_live_diagnostic(tool_name: str, arguments: Dict[str, Any], b
     return {"error": f"Unknown live diagnostic tool: {tool_name}"}
 
 
+async def _lookup_services_by_label(label_key: str, label_value: str, backend_url: str) -> Dict[str, Any]:
+    """Implementation behind the lookup_services_by_label tool (ROADMAP
+    P32, ADR 0043). Validates label_key against the agent's
+    TRACKED_LABEL_KEYS allowlist first — an untracked key gets the
+    tracked list back (so the model can tell the user what IS available)
+    rather than a guessed/empty answer. Mirrors k8fy/agent.py's
+    _build_label_scoped_graph; see that function's own docstring for why
+    it isn't imported here instead (circular import)."""
+    from config.settings import get_settings
+    from k8fy.service_topology import fetch_service_dependencies_for_services, fetch_services_by_label
+
+    settings = get_settings()
+    tracked = settings.tracked_label_keys
+    if label_key not in tracked:
+        return {
+            "label_key": label_key, "label_value": label_value, "tracked": False,
+            "tracked_keys": tracked,
+            "error": f"'{label_key}' is not a tracked label key on this deployment.",
+        }
+
+    services = await fetch_services_by_label(label_key, label_value, backend_url)
+    edges = await fetch_service_dependencies_for_services(services, backend_url) if services else []
+    in_scope = sorted({s["service"] for s in services})
+    out_of_scope = sorted({
+        e[k] for e in edges for k in ("from_service", "to_service") if e.get(k) and e[k] not in in_scope
+    })
+    return {
+        "label_key": label_key, "label_value": label_value, "tracked": True,
+        "services": services, "dependencies": edges,
+        "out_of_scope_services": out_of_scope,
+    }
+
+
 async def process_tool_call(
     tool_name: str, arguments: Dict[str, Any], backend_url: str, timeout: float = 10.0
 ) -> Dict[str, Any]:
@@ -738,6 +807,20 @@ async def process_tool_call(
     if tool_name == "get_service_dependencies":
         deps = await _fetch_service_dependencies(arguments.get("namespace", ""), backend_url)
         return {"namespace": arguments.get("namespace", ""), "dependencies": deps}
+
+    # lookup_services_by_label (ROADMAP P32, ADR 0043): read-only — the
+    # conversational fallback for a label-scoped query the Tier-1 fast
+    # path didn't recognize. Same tracked-key validation + OR-scoped
+    # dependency fetch k8fy/agent.py's _build_label_scoped_graph uses for
+    # the deterministic path — duplicated here, not imported, because
+    # k8fy.agent already imports TOOLS/process_tool_call FROM this module,
+    # so the reverse import would be circular.
+    if tool_name == "lookup_services_by_label":
+        return await _lookup_services_by_label(
+            label_key=str(arguments.get("label_key", "")),
+            label_value=str(arguments.get("label_value", "")),
+            backend_url=backend_url,
+        )
 
     url = f"{backend_url.rstrip('/')}/api/agent/fetch"
     payload = {"tool": tool_name, "args": arguments}

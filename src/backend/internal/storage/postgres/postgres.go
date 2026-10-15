@@ -1011,6 +1011,43 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- Generic label-based service scoping (ROADMAP P32, ADR 0043). One row
+	-- per (service, label_key) -- NOT per pod: every pod behind one
+	-- Service's selector is assumed to share the same business-meaningful
+	-- label value, the same atomicity assumption _service_for_labels
+	-- already makes when resolving one service name from a pod's labels.
+	-- label_key is free-form text drawn from the agent's TRACKED_LABEL_KEYS
+	-- allowlist at write time (an APM number, a team name, a cost center --
+	-- anything an operator decides to track) -- there is deliberately no
+	-- apm_id column or any other label-specific schema here, so a new
+	-- tracked dimension is a config change, never a migration.
+	CREATE TABLE IF NOT EXISTS service_labels (
+		tenant_id   TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+		cluster_id  TEXT NOT NULL DEFAULT '',
+		namespace   TEXT NOT NULL,
+		service     TEXT NOT NULL,
+		label_key   TEXT NOT NULL,
+		label_value TEXT NOT NULL,
+		last_seen   TIMESTAMP NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (tenant_id, cluster_id, namespace, service, label_key)
+	);
+	-- Backs both read paths: "which services have label_key=label_value"
+	-- (ListServicesByLabel) and, implicitly, the per-tenant RLS filter.
+	CREATE INDEX IF NOT EXISTS idx_service_labels_lookup ON service_labels(tenant_id, label_key, label_value);
+
+	ALTER TABLE IF EXISTS service_labels ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS service_labels FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'service_labels' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON service_labels
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
 	-- Add the vector column + IVFFlat index only when pgvector is installed.
 	-- Silently skipped on embedded-postgres (CI tests) which don't ship pgvector.
 	DO $$
@@ -3022,7 +3059,15 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		return nil, err
 	}
 	defer rows.Close()
+	return scanServiceDependencyRows(rows, c.logger)
+}
 
+// scanServiceDependencyRows is the row-scanning loop shared by
+// ListServiceDependencies and ListServiceDependenciesForServices below —
+// both SELECT the identical column list/order, only their WHERE clause
+// differs, so one scan implementation serves both rather than drifting
+// apart as two copies.
+func scanServiceDependencyRows(rows *sql.Rows, logger *slog.Logger) ([]ServiceDependency, error) {
 	var result []ServiceDependency
 	for rows.Next() {
 		var d ServiceDependency
@@ -3041,7 +3086,7 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		// ListServiceProfiles' own portsJSON handling already uses.
 		if len(sourcesJSON) > 0 {
 			if err := json.Unmarshal(sourcesJSON, &d.Sources); err != nil {
-				c.logger.Warn("bad sources JSON on service_dependencies row",
+				logger.Warn("bad sources JSON on service_dependencies row",
 					"namespace", d.Namespace, "from_service", d.FromService, "to_service", d.ToService, "error", err)
 				d.Sources = nil
 			}
@@ -3052,6 +3097,168 @@ func (c *Client) ListServiceDependencies(ctx context.Context, tenantID, namespac
 		result = append(result, d)
 	}
 	return result, rows.Err()
+}
+
+// ── Generic label-based service scoping (ROADMAP P32, ADR 0043) ────────────
+
+// ServiceRef identifies one service within one cluster+namespace — the
+// fleet-wide identity a label lookup resolves to, and the shape
+// ListServiceDependenciesForServices takes as its scope input.
+type ServiceRef struct {
+	ClusterID string `json:"cluster_id"`
+	Namespace string `json:"namespace"`
+	Service   string `json:"service"`
+}
+
+// UpsertServiceLabel records one (service, label_key) -> label_value
+// observation. Called once per tracked label key for every pod that
+// successfully resolved a from_service, by every miner that already does
+// that resolution (Discovery's live scan, the Glue miner, the Splunk
+// miner) — see service_labels' own schema comment for why this is
+// key/value, not a named column per label type. Last-observed value wins
+// on conflict, same convention service_dependencies' own outcome/
+// match_kind merge already uses.
+func (c *Client) UpsertServiceLabel(ctx context.Context, tenantID, clusterID, namespace, service, labelKey, labelValue string) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO service_labels (tenant_id, cluster_id, namespace, service, label_key, label_value, last_seen)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		ON CONFLICT (tenant_id, cluster_id, namespace, service, label_key) DO UPDATE SET
+		  label_value = EXCLUDED.label_value,
+		  last_seen   = NOW()`,
+		tenantID, clusterID, namespace, service, labelKey, labelValue); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ListServicesByLabel answers "which services carry label_key=label_value"
+// across the whole fleet for this tenant — the lookup a chat query like
+// "APM123456" or an explicit "team=checkout" resolves to before the
+// dependency graph itself is built. Returns an empty (non-nil) slice, not
+// an error, when nothing matches — "zero matches" and "lookup failed" are
+// different things callers need to tell apart.
+func (c *Client) ListServicesByLabel(ctx context.Context, tenantID, labelKey, labelValue string) ([]ServiceRef, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT cluster_id, namespace, service FROM service_labels WHERE label_key = $1 AND label_value = $2`,
+		labelKey, labelValue)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []ServiceRef{}
+	for rows.Next() {
+		var ref ServiceRef
+		if err := rows.Scan(&ref.ClusterID, &ref.Namespace, &ref.Service); err != nil {
+			return nil, err
+		}
+		result = append(result, ref)
+	}
+	return result, rows.Err()
+}
+
+// ListServiceDependenciesForServices scopes service_dependencies to a SET
+// of services spanning arbitrarily many namespaces/clusters (unlike
+// ListServiceDependencies' single-namespace scope), matching a row when
+// EITHER endpoint is in the set — not an intersection. This is deliberate
+// (ADR 0043 Decision #5): it is what surfaces a downstream system with a
+// different, or no, matching label at all, with no special-casing needed.
+// to_service's own cluster is sd.cluster_id for a same-cluster edge and
+// sd.target_cluster_id for a cross-cluster one (ADR 0037) —
+// COALESCE(NULLIF(...)) picks whichever applies.
+//
+// Same SELECT/JOIN shape as ListServiceDependencies (kept in sync
+// manually — see that function's comments for the full reasoning behind
+// each join); only the WHERE clause differs, so row-scanning is shared
+// via scanServiceDependencyRows rather than duplicated.
+func (c *Client) ListServiceDependenciesForServices(ctx context.Context, tenantID string, services []ServiceRef) ([]ServiceDependency, error) {
+	if len(services) == 0 {
+		return nil, nil // nothing to scope to — avoid a round trip for an answer we already know
+	}
+	scopeJSON, err := json.Marshal(services)
+	if err != nil {
+		return nil, fmt.Errorf("marshal service scope: %w", err)
+	}
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		WITH scope(cluster_id, namespace, service) AS (
+			SELECT * FROM jsonb_to_recordset($1::jsonb) AS t(cluster_id text, namespace text, service text)
+		)
+		SELECT sd.id, sd.namespace, sd.from_service, sd.to_service, sd.evidence_count, sd.first_seen, sd.last_seen,
+		       sd.tenant_id, COALESCE(sd.cluster_id, ''), COALESCE(sd.target_kind, 'service'),
+		       sd.port, sd.path, sd.outcome_success_count, sd.outcome_failure_count, sd.outcome_timeout_count,
+		       sd.qualified_match_count, sd.bare_match_count, COALESCE(sd.target_cluster_id, ''),
+		       COALESCE(cs.expected_failure_reason, ''), COALESCE(cpc.caller_pod_count, 0),
+		       COALESCE(cpc.sources, '[]'::jsonb),
+		       COALESCE(ocs.platform, ''), COALESCE(tcs.platform, ''),
+		       COALESCE(tb.last_24h_count, 0), COALESCE(tb.prior_24h_count, 0)
+		FROM service_dependencies sd
+		LEFT JOIN cluster_services cs
+		  ON cs.tenant_id = sd.tenant_id AND cs.cluster_id = sd.cluster_id
+		 AND cs.namespace = sd.namespace AND cs.service = sd.to_service
+		LEFT JOIN (
+		    SELECT tenant_id, cluster_id, namespace, from_service, to_service, port, path,
+		           COUNT(DISTINCT pod_name) AS caller_pod_count,
+		           jsonb_agg(DISTINCT source) FILTER (WHERE source != '') AS sources
+		    FROM service_dependency_callers
+		    GROUP BY tenant_id, cluster_id, namespace, from_service, to_service, port, path
+		) cpc ON cpc.tenant_id = sd.tenant_id AND cpc.cluster_id = sd.cluster_id
+		     AND cpc.namespace = sd.namespace AND cpc.from_service = sd.from_service
+		     AND cpc.to_service = sd.to_service AND cpc.port = sd.port AND cpc.path = sd.path
+		LEFT JOIN cluster_health_snapshots ocs ON ocs.cluster_id = sd.cluster_id
+		LEFT JOIN cluster_health_snapshots tcs ON tcs.cluster_id = sd.target_cluster_id
+		LEFT JOIN (
+		    SELECT tenant_id, cluster_id, namespace, from_service, to_service, port, path,
+		           SUM(CASE WHEN bucket_start >= NOW() - INTERVAL '24 hours' THEN evidence_count ELSE 0 END) AS last_24h_count,
+		           SUM(CASE WHEN bucket_start >= NOW() - INTERVAL '48 hours' AND bucket_start < NOW() - INTERVAL '24 hours'
+		                    THEN evidence_count ELSE 0 END) AS prior_24h_count
+		    FROM service_dependency_buckets
+		    GROUP BY tenant_id, cluster_id, namespace, from_service, to_service, port, path
+		) tb ON tb.tenant_id = sd.tenant_id AND tb.cluster_id = sd.cluster_id
+		    AND tb.namespace = sd.namespace AND tb.from_service = sd.from_service
+		    AND tb.to_service = sd.to_service AND tb.port = sd.port AND tb.path = sd.path
+		WHERE EXISTS (
+		        SELECT 1 FROM scope s
+		        WHERE s.cluster_id = sd.cluster_id AND s.namespace = sd.namespace AND s.service = sd.from_service
+		      )
+		   OR EXISTS (
+		        SELECT 1 FROM scope s
+		        WHERE s.cluster_id = COALESCE(NULLIF(sd.target_cluster_id, ''), sd.cluster_id)
+		          AND s.namespace = sd.namespace AND s.service = sd.to_service
+		      )
+		ORDER BY sd.evidence_count DESC`, string(scopeJSON))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanServiceDependencyRows(rows, c.logger)
 }
 
 // ── Service->cluster registry (ROADMAP P16 / ADR 0023) ──────────────────────

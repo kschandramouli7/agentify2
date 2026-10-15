@@ -136,6 +136,16 @@ type ServiceDependencyStore interface {
 	// its own interface for the same reason scan coverage does: it reads
 	// both tables this interface already owns.
 	ListColdServices(ctx context.Context, tenantID, namespace string, staleDays, scannedWithinDays int) ([]pgstore.ColdService, error)
+
+	// Generic label-based service scoping (ROADMAP P32, ADR 0043) — lives
+	// here rather than its own interface because ListServiceDependenciesForServices
+	// reads service_dependencies (and its caller/bucket/health joins) just
+	// like ListServiceDependencies above; splitting the two would mean two
+	// nil checks that are always equal, same reasoning scan coverage above
+	// already gives.
+	UpsertServiceLabel(ctx context.Context, tenantID, clusterID, namespace, service, labelKey, labelValue string) error
+	ListServicesByLabel(ctx context.Context, tenantID, labelKey, labelValue string) ([]pgstore.ServiceRef, error)
+	ListServiceDependenciesForServices(ctx context.Context, tenantID string, services []pgstore.ServiceRef) ([]pgstore.ServiceDependency, error)
 }
 
 // ClusterServiceStore is the service->cluster registry interface (ROADMAP

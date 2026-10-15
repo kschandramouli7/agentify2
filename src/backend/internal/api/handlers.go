@@ -216,7 +216,16 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	// "No data available for this query" — never reaching the skill that could
 	// answer it. Everything after this point exists to assemble pod data the
 	// dependency answer does not use.
-	if intent == "dependencies" {
+	//
+	// label_scoped_dependencies (ROADMAP P32, ADR 0043) shares this exact
+	// bypass for a stronger reason than "dependencies" does: it isn't even
+	// scoped to ONE namespace the way the normal path assumes (RouteToPods
+	// takes a single `namespace`) — a label-tagged service set can span
+	// arbitrarily many namespaces and clusters. answerDependencies itself
+	// is generic (forwards question+intent+context to the agent, no
+	// "dependencies"-specific logic inside it), so the same function
+	// serves both intents unchanged.
+	if intent == "dependencies" || intent == "label_scoped_dependencies" {
 		h.answerDependencies(w, r, req, intent, namespace, service, traceID, isEval, start)
 		return
 	}
@@ -764,6 +773,21 @@ func inferIntent(question string) string {
 			return "metrics_history"
 		}
 	}
+	// Label-scoped dependency traceability (ROADMAP P32, ADR 0043). Checked
+	// BEFORE cold_services/dependencies below, same reasoning cold_services'
+	// own comment already gives: a more specific question about the same
+	// mined graph. Only the two FIXED, unambiguous shapes a chat message can
+	// use without any config lookup are recognized here — explicit
+	// `key=value` syntax, or a bare APM-number-shaped token (the one
+	// conversational shorthand common enough to hardcode rather than push
+	// into the agent's operator-editable alias table). Resolving an alias
+	// table entry to the real tracked label key, and validating it against
+	// TRACKED_LABEL_KEYS, both need the agent's own config — deliberately
+	// NOT duplicated here; labelScopedDependencyRE only decides "should this
+	// skip the LLM", never what the key/value actually are.
+	if labelScopedDependencyRE.MatchString(question) {
+		return "label_scoped_dependencies"
+	}
 	// Cold services / decommission readiness (ROADMAP P31 phase 2, ADR
 	// 0038). Checked BEFORE the general dependencies branch below: "which
 	// services are safe to decommission" is a more specific question about
@@ -793,6 +817,24 @@ func inferIntent(question string) string {
 // COLD_SERVICES_KEYWORD_RE in src/agent/k8fy/agent.py (same reasoning as
 // dependencyKeywordRE's own sync-comment below).
 var coldServicesKeywordRE = regexp.MustCompile(`\b(cold service|service.{0,15}\bcold\b|stale service|dead service|unused service|decommission|safe to (delete|remove|decommission)|no longer (used|called|needed)|hasn'?t been called|not been called)`)
+
+// labelScopedDependencyRE (ROADMAP P32, ADR 0043), kept in sync with
+// LABEL_SCOPED_DEPENDENCY_RE in src/agent/k8fy/agent.py, same reasoning as
+// dependencyKeywordRE's own sync-comment below. Deliberately NOT
+// case-folded against `lower` the way every other pattern in this
+// function is — a label VALUE is case-sensitive (an APM number's digits
+// aside, an explicit key=value could carry a mixed-case value), so this
+// matches against the original `question` text.
+//
+//   - key=value: a bare identifier, "=", then a value with no internal
+//     whitespace — deliberately strict (no spaces around "=") to avoid
+//     matching ordinary English "x = y" phrasing, which this chat surface
+//     essentially never produces outside this exact shorthand.
+//   - APM\d+: the one conversational shorthand common enough to recognize
+//     without any config lookup — see the inferIntent call site's own
+//     comment for why this is hardcoded here rather than pushed into the
+//     agent's operator-editable alias table.
+var labelScopedDependencyRE = regexp.MustCompile(`\b[a-zA-Z][a-zA-Z0-9_-]{1,40}=[A-Za-z0-9._-]{1,80}\b|\bAPM\d{4,}\b`)
 
 // Keyword sets for isDependencyQuestion, as word-PREFIX matches (`\b` + stem),
 // not bare substring matches.
@@ -2304,6 +2346,66 @@ func (h *Handler) HandleServiceDependencyUpsert(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// serviceLabelUpsertRequest is the body accepted by POST /api/service-labels.
+// ClusterID is the same trusted-internal-caller override
+// serviceDependencyUpsertRequest's own ClusterID field already is (ADR
+// 0029) — a collector credential resolves clusterID itself; this field
+// only matters for a caller with no collector identity of its own (the
+// agent's own miners).
+type serviceLabelUpsertRequest struct {
+	Namespace  string `json:"namespace"`
+	Service    string `json:"service"`
+	ClusterID  string `json:"cluster_id,omitempty"`
+	LabelKey   string `json:"label_key"`
+	LabelValue string `json:"label_value"`
+}
+
+// HandleServiceLabelUpsert records one (service, label_key) -> label_value
+// observation (ROADMAP P32, ADR 0043) — called by every miner that already
+// resolves from_service (live scan, Glue, Splunk) once per tracked label
+// key on that pod. Which keys are "tracked" is an agent-side allowlist
+// (TRACKED_LABEL_KEYS), not enforced here — this endpoint stores whatever
+// it's given, same as HandleServiceDependencyUpsert trusts its caller's
+// target_kind.
+func (h *Handler) HandleServiceLabelUpsert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.serviceDepsStore == nil {
+		http.Error(w, "service dependency store not available", http.StatusServiceUnavailable)
+		return
+	}
+	tenantID, clusterID, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	var req serviceLabelUpsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Namespace == "" || req.Service == "" || req.LabelKey == "" || req.LabelValue == "" {
+		http.Error(w, "namespace, service, label_key, and label_value are required", http.StatusBadRequest)
+		return
+	}
+	if clusterID == "" && req.ClusterID != "" {
+		clusterID = req.ClusterID
+	}
+	if err := h.serviceDepsStore.UpsertServiceLabel(r.Context(), tenantID, clusterID, req.Namespace, req.Service, req.LabelKey, req.LabelValue); err != nil {
+		h.logger.Warn("failed to upsert service label", "namespace", req.Namespace, "service", req.Service, "label_key", req.LabelKey, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // namespaceInventory is one namespace's entry in the fleet collector's
 // inventory push — the namespace name plus its known services (ROADMAP
 // P16 / ADR 0023: the collector already fetches these to decide "active",
@@ -3073,6 +3175,93 @@ func (h *Handler) HandleServiceDependencyList(w http.ResponseWriter, r *http.Req
 	deps, err := h.serviceDepsStore.ListServiceDependencies(r.Context(), tenantID, namespace)
 	if err != nil {
 		h.logger.Warn("failed to list service dependencies", "namespace", namespace, "error", err)
+		writeJSON(w, http.StatusOK, []pgstore.ServiceDependency{})
+		return
+	}
+	writeJSON(w, http.StatusOK, deps)
+}
+
+// serviceLabelsLookupResponse wraps ListServicesByLabel's result the same
+// way clusterServiceSelectorsResponse wraps its own lookup — a named
+// object, not a bare array, since GET /api/service-labels is a pure
+// lookup (not a list-everything endpoint like service-dependencies).
+type serviceLabelsLookupResponse struct {
+	Services []pgstore.ServiceRef `json:"services"`
+}
+
+// HandleServiceLabelsLookup answers "which services carry
+// label_key=label_value" (ROADMAP P32, ADR 0043) — the lookup
+// lookup_services_by_label (the chat tool) calls before building a scoped
+// dependency graph. Whether label_key is one this deployment actually
+// tracks is validated by the caller (the agent's TRACKED_LABEL_KEYS
+// allowlist), not here — this endpoint answers truthfully either way, and
+// an untracked key simply has no rows to find.
+func (h *Handler) HandleServiceLabelsLookup(w http.ResponseWriter, r *http.Request) {
+	labelKey := r.URL.Query().Get("label_key")
+	labelValue := r.URL.Query().Get("label_value")
+	if labelKey == "" || labelValue == "" {
+		http.Error(w, "label_key and label_value are required", http.StatusBadRequest)
+		return
+	}
+	if h.serviceDepsStore == nil {
+		writeJSON(w, http.StatusOK, serviceLabelsLookupResponse{Services: []pgstore.ServiceRef{}})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	services, err := h.serviceDepsStore.ListServicesByLabel(r.Context(), tenantID, labelKey, labelValue)
+	if err != nil {
+		h.logger.Warn("failed to list services by label", "label_key", labelKey, "error", err)
+		writeJSON(w, http.StatusOK, serviceLabelsLookupResponse{Services: []pgstore.ServiceRef{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, serviceLabelsLookupResponse{Services: services})
+}
+
+// HandleServiceDependenciesForServices scopes service_dependencies to an
+// arbitrary SET of services spanning any namespace/cluster (ROADMAP P32,
+// ADR 0043) — the second half of the label-scoped dependency flow, called
+// with the service set HandleServiceLabelsLookup resolved. `services` is a
+// JSON-encoded array of {cluster_id,namespace,service} in the query
+// string, not individually-repeated params — the set size isn't bounded,
+// and a single opaque param is simpler for both sides than reinventing a
+// repeated-param convention nothing else in this API uses.
+func (h *Handler) HandleServiceDependenciesForServices(w http.ResponseWriter, r *http.Request) {
+	servicesParam := r.URL.Query().Get("services")
+	if servicesParam == "" {
+		http.Error(w, "services is required", http.StatusBadRequest)
+		return
+	}
+	var services []pgstore.ServiceRef
+	if err := json.Unmarshal([]byte(servicesParam), &services); err != nil {
+		http.Error(w, "services must be a JSON array of {cluster_id,namespace,service}", http.StatusBadRequest)
+		return
+	}
+	if h.serviceDepsStore == nil {
+		writeJSON(w, http.StatusOK, []pgstore.ServiceDependency{})
+		return
+	}
+	tenantID, _, err := h.resolveTenantContext(r)
+	if errors.Is(err, errInvalidCredential) {
+		http.Error(w, "invalid credential", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.logger.Warn("tenant resolution failed", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	deps, err := h.serviceDepsStore.ListServiceDependenciesForServices(r.Context(), tenantID, services)
+	if err != nil {
+		h.logger.Warn("failed to list service dependencies for services", "error", err)
 		writeJSON(w, http.StatusOK, []pgstore.ServiceDependency{})
 		return
 	}

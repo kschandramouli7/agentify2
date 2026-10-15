@@ -464,6 +464,41 @@ _COLD_SERVICES_KEYWORD_RE = re.compile(
     r"|hasn'?t been called|not been called)"
 )
 
+# ROADMAP P32 (generic label-based service scoping, ADR 0043). Kept in
+# sync with labelScopedDependencyRE in src/backend/internal/api/handlers.go
+# — same reasoning as _DEPENDENCY_QUESTION_RE's own sync comment above.
+# Deliberately NOT matched against `lowered` the way the other _chat_route
+# patterns are: a label value (an APM number's digits aside) can be
+# case-sensitive, so this is applied to the original, un-lowered text.
+_EXPLICIT_LABEL_KV_RE = re.compile(r"\b([a-zA-Z][a-zA-Z0-9_-]{1,40})=([A-Za-z0-9._-]{1,80})\b")
+# The one conversational shorthand common enough to hardcode rather than
+# push into settings.label_key_aliases' pattern-free key->key mapping —
+# see _resolve_label_query's own docstring for how the two combine.
+_APM_TOKEN_RE = re.compile(r"\bAPM\d{4,}\b")
+
+
+def _resolve_label_query(text: str) -> Optional["tuple[str, str]"]:
+    """(label_key, label_value) from a chat message, or None — the Tier-1
+    fast-path extraction ADR 0043 Decision #6 calls for: zero LLM calls for
+    the two fixed, unambiguous shapes this recognizes.
+
+    Explicit `key=value` syntax always wins when present (no config lookup
+    needed to trust it). Otherwise, a bare APM-shaped token resolves only
+    if settings.label_key_aliases maps "apm" to a real tracked label key —
+    the alias table is what turns "the user typed a number" into "the user
+    meant THIS label key", so an operator who never configured that alias
+    sees this fall through to the model, not a wrong guess.
+    """
+    kv = _EXPLICIT_LABEL_KV_RE.search(text)
+    if kv:
+        return kv.group(1), kv.group(2)
+    apm = _APM_TOKEN_RE.search(text)
+    if apm:
+        apm_key = settings.label_key_aliases.get("apm")
+        if apm_key:
+            return apm_key, apm.group(0)
+    return None
+
 
 def _latest_user_text(messages: List[Dict[str, Any]]) -> str:
     """The most recent user turn, as text.
@@ -580,6 +615,11 @@ def _chat_route(messages: List[Dict[str, Any]]) -> Optional[str]:
     # report, even though it matches _COLD_SERVICES_KEYWORD_RE too.
     if _NEEDS_SYNTHESIS_RE.search(lowered):
         return None
+    # ROADMAP P32 (ADR 0043): checked before cold_services/dependencies,
+    # same precedence Go's inferIntent gives labelScopedDependencyRE.
+    # Matched against latest_raw, not lowered — see _resolve_label_query.
+    if _resolve_label_query(latest_raw) is not None:
+        return "label_scoped_dependencies"
     if _COLD_SERVICES_KEYWORD_RE.search(lowered):
         return "cold_services"
     if not _DEPENDENCY_QUESTION_RE.search(lowered):
@@ -877,6 +917,95 @@ async def _resolve_namespace(question: str, backend_url: str) -> Optional[str]:
     if len(namespaces) == 1:
         return next(iter(namespaces))
     return None
+
+
+async def _build_label_scoped_graph(label_key: str, label_value: str, backend_url: str) -> Dict[str, Any]:
+    """Resolve the (cluster, namespace, service) set tagged
+    label_key=label_value, fleet-wide, then the dependency graph scoped to
+    it (ROADMAP P32, ADR 0043). Always returns a dict — unlike
+    _build_service_graph's Optional[...] — because "not a tracked key" and
+    "tracked but zero matches" are both answerable facts, not failures;
+    _label_scoped_answer below decides how to phrase each."""
+    from k8fy.service_topology import fetch_service_dependencies_for_services, fetch_services_by_label
+
+    tracked = settings.tracked_label_keys
+    if label_key not in tracked:
+        return {"label_key": label_key, "label_value": label_value, "tracked": False, "tracked_keys": tracked}
+
+    services = await fetch_services_by_label(label_key, label_value, backend_url)
+    edges = await fetch_service_dependencies_for_services(services, backend_url) if services else []
+    return {
+        "label_key": label_key, "label_value": label_value, "tracked": True,
+        "services": services, "dependencies": edges,
+    }
+
+
+def _label_scoped_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
+    """Prose + `details` for a label-scoped dependency question, with no
+    model call — same "one correct answer, a model only adds latency and a
+    chance of misreporting it" reasoning _dependency_answer's own
+    docstring gives."""
+    label_key = graph["label_key"]
+    label_value = graph["label_value"]
+
+    if not graph["tracked"]:
+        tracked_keys = graph.get("tracked_keys") or []
+        answer = (
+            f"'{label_key}' isn't a label this deployment tracks. "
+            + (f"Tracked keys: {', '.join(tracked_keys)}." if tracked_keys else "No label keys are tracked yet.")
+        )
+        return answer, {"severity": "info", "label_key": label_key, "label_value": label_value, "tracked": False}
+
+    services = graph["services"]
+    edges = graph["dependencies"]
+    if not services:
+        answer = f"No services found tagged {label_key}={label_value}."
+        return answer, {"severity": "info", "label_key": label_key, "label_value": label_value,
+                         "tracked": True, "services": []}
+
+    in_scope = sorted({s["service"] for s in services})
+    namespaces = sorted({s["namespace"] for s in services})
+    # Every edge endpoint NOT in the tagged set — this is what surfaces a
+    # downstream system with a different, or no, matching tag at all (ADR
+    # 0043 Decision #5), with no special-casing: it's just "the rest of
+    # the edge set's service names minus the ones we scoped to."
+    out_of_scope = sorted({
+        e[k] for e in edges for k in ("from_service", "to_service") if e.get(k) and e[k] not in in_scope
+    })
+
+    headline = (
+        f"{len(in_scope)} service{'' if len(in_scope) == 1 else 's'} tagged {label_key}={label_value}: "
+        f"{', '.join(in_scope)}."
+    )
+    lines = [headline]
+    if out_of_scope:
+        lines += ["", f"Also connected, but not tagged {label_key}={label_value}: " + ", ".join(out_of_scope)]
+    caveat = (
+        "Mined from pod logs, so this is a lower bound: an edge exists only where a caller "
+        "logged the callee's hostname. A missing edge means no evidence, not no dependency."
+    )
+    lines += ["", caveat]
+
+    details = {
+        "severity": "info",
+        "incident_summary": headline,
+        "findings": [
+            f"{len(in_scope)} services tagged {label_key}={label_value}: {', '.join(in_scope)}",
+            f"Connected but not tagged: {', '.join(out_of_scope) if out_of_scope else 'none observed'}",
+        ],
+        "label_key": label_key, "label_value": label_value, "tracked": True,
+        "services": in_scope, "out_of_scope_services": out_of_scope,
+        # Same {namespace, focus, dependencies} shape ServiceGraphSection
+        # already renders (api.ts's ServiceGraph type) — namespace is
+        # display text only on that path (confirmed: never used for a
+        # further API call), so a multi-namespace summary is safe here.
+        "service_graph": {
+            "namespace": ", ".join(namespaces) if namespaces else "",
+            "focus": None,
+            "dependencies": edges,
+        },
+    }
+    return "\n".join(lines), details
 
 
 async def _build_service_graph(
@@ -1513,6 +1642,37 @@ class K8fyAgent:
                     details=details,
                     tier="tier1",
                 )
+
+        # ROADMAP P32 (ADR 0043). _build_label_scoped_graph never returns
+        # None (unlike _build_service_graph) — "not a tracked key" and
+        # "tracked but zero matches" are both answerable facts, not
+        # reasons to fall through to the model. Only an actual exception
+        # (a Hub call raising instead of degrading) falls through.
+        if route == "label_scoped_dependencies":
+            resolved = _resolve_label_query(_latest_user_text(messages).strip())
+            if resolved is not None:
+                label_key, label_value = resolved
+                try:
+                    graph = await _build_label_scoped_graph(label_key, label_value, self.backend_url)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("deterministic label-scoped route failed, falling back to model: %s", e)
+                    graph = None
+                if graph is not None:
+                    answer, details = _label_scoped_answer(graph)
+                    metrics.record_request("ok")
+                    logger.info(
+                        "chat answered deterministically: intent=label_scoped_dependencies key=%s tracked=%s services=%d",
+                        label_key, graph["tracked"], len(graph.get("services") or []),
+                    )
+                    return AgentResponse(
+                        answer=answer,
+                        status="ok",
+                        confidence=1.0,
+                        sources=["service_labels", "service_dependencies"],
+                        tool_calls=[],
+                        details=details,
+                        tier="tier1",
+                    )
 
         system = [{"type": "text", "text": self._system_text(), "cache_control": {"type": "ephemeral"}}]
         # The deterministic routes above read context["namespace"]/["service"]

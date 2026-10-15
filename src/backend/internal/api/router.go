@@ -73,6 +73,16 @@ func NewRouter(h *Handler, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /api/service-dependencies", h.HandleServiceDependencyUpsert)
 	mux.HandleFunc("GET /api/service-dependencies", h.HandleServiceDependencyList)
 
+	// Generic label-based service scoping (ROADMAP P32, ADR 0043): capture
+	// one (service, label_key)->label_value observation, look up which
+	// services carry a given label, and fetch the dependency graph scoped
+	// to that service set. Called by the same three miners that already
+	// push to /api/service-dependencies above, and by the
+	// lookup_services_by_label chat tool.
+	mux.HandleFunc("POST /api/service-labels", h.HandleServiceLabelUpsert)
+	mux.HandleFunc("GET /api/service-labels", h.HandleServiceLabelsLookup)
+	mux.HandleFunc("GET /api/service-dependencies-for-services", h.HandleServiceDependenciesForServices)
+
 	// Scan-coverage accounting — the denominator for evidence_count
 	// (ROADMAP P27 phase 1). Same credential shape as the dependency upsert:
 	// a collector's CollectorToken derives (tenant, cluster).

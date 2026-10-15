@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed   ·   (date: 2026-10-15)
+Accepted   ·   (date: 2026-10-15)   ·   Implemented 2026-10-15 for the Glue and Splunk miners, the single-shot and chat entry points, and the LLM-tool fallback — Discovery's live-scan capture and the frontend in/out-of-scope visual treatment are explicitly NOT done yet; see the amendment after Consequences.
 
 ## Context
 
@@ -154,3 +154,47 @@ agentic latency/cost for a lookup that's really just a dictionary read.
   config edit; or if a tracked label key's value needs fuzzy/partial
   matching (not exact `label_value` equality) — out of scope here, exact
   match only.
+
+## Amendment (2026-10-15) — implementation status
+
+Shipped, with full test coverage at every layer (Go: `postgres_test.go`'s
+new `service_labels`/`ListServiceDependenciesForServices` subtests,
+`service_label_test.go`'s handler tests, `intent_test.go`'s
+`TestInferIntent_LabelScopedDependencies`; Python: `test_settings.py`,
+the `_push_service_labels` tests in `test_dependency_miner.py`/
+`test_splunk_dependency_miner.py`, `test_chat_label_scoped.py`,
+`test_label_scoped_dependency_skill.py`, `test_lookup_services_by_label_tool.py`):
+
+- `service_labels` table, RLS policy, `UpsertServiceLabel`/
+  `ListServicesByLabel`/`ListServiceDependenciesForServices`, and the
+  three new endpoints (`POST`/`GET /api/service-labels`,
+  `GET /api/service-dependencies-for-services`).
+- `TRACKED_LABEL_KEYS`/`LABEL_KEY_ALIASES` settings; `_push_service_labels`
+  wired into **the Glue and Splunk miners** (`dependency_miner.py`,
+  `splunk_dependency_miner.py`).
+- The Tier-1 fast path (`labelScopedDependencyRE` in Go's `inferIntent`,
+  mirrored by `_resolve_label_query`/`_chat_route` in `agent.py`), the
+  deterministic single-shot path (`LabelScopedDependencySkill`, reached
+  via the same `answerDependencies` bypass `dependencies` already uses —
+  it turned out to be fully generic, not `dependencies`-specific, so no
+  new Go handler was needed), the chat-page path (`reason_chat`'s new
+  `route == "label_scoped_dependencies"` branch), and the conversational
+  fallback (`lookup_services_by_label`, a new Claude tool in `tools.py`).
+
+**Explicitly NOT done, flagged rather than silently skipped:**
+
+- **Discovery's own live per-cluster scan** (`src/adapters/discovery/`)
+  does not yet call `_push_service_labels` — only the two Hub-side Python
+  miners do. Discovery is a separate deployable with its own config
+  system (dataclass + `_list_env`, not pydantic `Settings`), and wiring it
+  in properly deserves its own pass rather than a rushed addition here.
+  Until that lands, a service whose ONLY mining evidence comes from
+  Discovery's live scan (no Glue/Splunk coverage) will never appear in a
+  label-scoped lookup even if correctly tagged.
+- **Frontend visual distinction between in-scope and out-of-scope nodes**
+  (spec 012's open question #3) was not built. The existing
+  `ServiceGraphSection`/`service_graph` rendering path is reused as-is
+  (confirmed safe: `namespace` is display text only, never used for a
+  further API call), so the graph renders correctly today — just without
+  a badge distinguishing which nodes were in the tagged set versus pulled
+  in only because they're connected to one.

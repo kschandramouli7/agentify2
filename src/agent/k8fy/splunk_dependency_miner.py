@@ -29,7 +29,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
-from k8fy.dependency_miner import _fetch_registered_clusters, _fetch_selectors, _push_edge, _service_for_labels
+from k8fy.dependency_miner import (
+    _fetch_registered_clusters, _fetch_selectors, _push_edge, _push_service_labels, _service_for_labels,
+)
 from k8fy.log_platform_splunk import _run_query
 from k8fy.service_topology import extract_service_calls
 
@@ -70,6 +72,7 @@ def _extract_labels(row: Dict[str, Any]) -> Dict[str, str]:
 
 async def _mine_namespace(
     backend_url: str, splunk_config: Dict[str, Any], cluster_id: str, namespace: str, hours_back: int,
+    tracked_label_keys: Optional[Set[str]] = None,
 ) -> None:
     """Mine one (cluster, namespace)'s recent Splunk events for service-
     dependency edges. Same per-pod dedup/push shape dependency_miner.py's
@@ -115,6 +118,10 @@ async def _mine_namespace(
         from_service = _service_for_labels(pod_labels.get(pod_name, {}), selectors)
         if not from_service:
             continue
+        if tracked_label_keys:
+            await _push_service_labels(
+                backend_url, cluster_id, namespace, from_service, pod_labels.get(pod_name, {}), tracked_label_keys,
+            )
         log_text = "\n".join(lines)
 
         # Same "last known outcome wins, qualified match sticks" merge rules
@@ -142,11 +149,17 @@ async def _mine_namespace(
             )
 
 
-async def run_once(backend_url: str, splunk_config: Dict[str, Any], hours_back: int = 2) -> None:
+async def run_once(
+    backend_url: str, splunk_config: Dict[str, Any], hours_back: int = 2,
+    tracked_label_keys: Optional[Set[str]] = None,
+) -> None:
     """One full mining cycle across every registered fleet cluster's
     namespaces. Never raises — a failure mining one (cluster, namespace)
     never blocks the others (same discipline as dependency_miner.py's own
-    run_once / agentify-discovery's _scan_once)."""
+    run_once / agentify-discovery's _scan_once).
+
+    tracked_label_keys (ROADMAP P32, ADR 0043): see dependency_miner.py's
+    own run_once for the full reasoning — identical, independent knob."""
     if not (splunk_config.get("url") and splunk_config.get("index") and splunk_config.get("token")):
         logger.info("splunk_dependency_miner: Splunk not configured, skipping this cycle")
         return
@@ -158,13 +171,14 @@ async def run_once(backend_url: str, splunk_config: Dict[str, Any], hours_back: 
             continue
         for namespace in cluster.get("namespaces") or []:
             try:
-                await _mine_namespace(backend_url, splunk_config, cluster_id, namespace, hours_back)
+                await _mine_namespace(backend_url, splunk_config, cluster_id, namespace, hours_back, tracked_label_keys)
             except Exception:
                 logger.exception("splunk_dependency_miner: mining failed for cluster=%s namespace=%s", cluster_id, namespace)
 
 
 async def run_forever(
     backend_url: str, splunk_config: Dict[str, Any], interval_seconds: int, shutdown: asyncio.Event,
+    tracked_label_keys: Optional[Set[str]] = None,
 ) -> None:
     """Periodic background task — same shape as dependency_miner.py's own
     run_forever (and ultimately agentify-discovery's main.py::_run): run
@@ -173,7 +187,7 @@ async def run_forever(
     next time."""
     while not shutdown.is_set():
         try:
-            await run_once(backend_url, splunk_config)
+            await run_once(backend_url, splunk_config, tracked_label_keys=tracked_label_keys)
         except Exception:
             logger.exception("splunk_dependency_miner: mining cycle failed")
         try:

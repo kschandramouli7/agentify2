@@ -61,6 +61,13 @@ async def startup_event():
     prompt_manager.prefetch(ALL_PROMPTS)
     logger.info(f"Skill router initialized with model: {settings.claude_model}")
 
+    # ROADMAP P32 (ADR 0043): shared allowlist across BOTH miners below —
+    # a tracked label key isn't specific to Glue or Splunk as a data
+    # source, so one settings knob (TRACKED_LABEL_KEYS) governs capture
+    # for both, same as how each miner's own source-specific config
+    # (ATHENA_*/SPLUNK_*) stays independent.
+    tracked_label_keys = set(settings.tracked_label_keys)
+
     global _dependency_miner_task
     athena_config = {
         "workgroup": settings.athena_workgroup,
@@ -71,6 +78,7 @@ async def startup_event():
     _dependency_miner_task = asyncio.create_task(
         dependency_miner.run_forever(
             settings.backend_url, athena_config, settings.dependency_mining_interval_seconds, _dependency_miner_shutdown,
+            tracked_label_keys=tracked_label_keys,
         )
     )
 
@@ -84,6 +92,7 @@ async def startup_event():
     _splunk_dependency_miner_task = asyncio.create_task(
         splunk_dependency_miner.run_forever(
             settings.backend_url, splunk_config, settings.splunk_mining_interval_seconds, _splunk_dependency_miner_shutdown,
+            tracked_label_keys=tracked_label_keys,
         )
     )
 

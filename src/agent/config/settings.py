@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Dict, List
 
 import boto3
 from botocore.exceptions import ClientError
@@ -237,6 +238,37 @@ class Settings(BaseSettings):
     dependency_mining_interval_seconds: int = Field(
         default=300, validation_alias=AliasChoices("DEPENDENCY_MINING_INTERVAL_SECONDS")
     )
+
+    # Generic label-based service scoping (ROADMAP P32, ADR 0043). Which pod
+    # label keys get captured into service_labels at all — an operator
+    # ALLOWLIST, not a denylist over an unbounded label space (ADR 0043
+    # Decision #1: a new tracked dimension is a config change, not a
+    # migration or redeploy of mining logic). Comma-separated; stored raw
+    # and split via the tracked_label_keys property below rather than
+    # relying on pydantic-settings' own env-list parsing, which expects
+    # JSON by default and would silently reject a plain CSV value.
+    tracked_label_keys_raw: str = Field(default="", validation_alias=AliasChoices("TRACKED_LABEL_KEYS"))
+
+    # Conversational shorthand for the Tier-1 fast-path label lookup (ADR
+    # 0043 Decision #6) — e.g. {"apm": "apm-id"} lets a chat message say
+    # "APM123456" without the user knowing the literal K8s label key.
+    # JSON-encoded; empty/malformed degrades to no aliases (the fast path
+    # just falls through to the agent's normal tool-use turn), never a
+    # startup failure — this is a convenience table, not load-bearing
+    # config.
+    label_key_aliases_raw: str = Field(default="{}", validation_alias=AliasChoices("LABEL_KEY_ALIASES"))
+
+    @property
+    def tracked_label_keys(self) -> List[str]:
+        return [k.strip() for k in self.tracked_label_keys_raw.split(",") if k.strip()]
+
+    @property
+    def label_key_aliases(self) -> Dict[str, str]:
+        try:
+            parsed = json.loads(self.label_key_aliases_raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     # Langfuse prompt management (optional — falls back to local strings if not set)
     # Keys are resolved from LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY env vars,
