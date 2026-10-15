@@ -221,3 +221,16 @@ and a test-fixture `sourcetype` misconfiguration that silently dropped
 every event before it could even be searched) are infrastructure/test-
 harness issues, not connector-code bugs — see ROADMAP.md P15 for the full
 account.
+
+**The on-demand read connector itself — `log_router.get_logs()`, the
+actual production entry point, not just the schema it assumes — was
+separately exercised live.** Everything above verified the schema
+assumption via the continuous miner's query; it did not yet prove
+`get_logs()` routes to Splunk and returns its data correctly in
+production. Called directly inside the live `agentify-agent` pod
+(`get_logs("payments", None, tail_lines=5)`), it returned real,
+bracket-prefixed (`[pod/container]`) Splunk log text with none of the
+extra keys (`container`, `previous`) `log_router.py`'s own docstring
+says only the live-cluster fallback path adds — proving this answered
+from Splunk, not a silent fallback. The on-demand connector is now
+proven end-to-end, the same as the continuous miner.
