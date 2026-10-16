@@ -57,7 +57,7 @@ Redis → routed query → Opus 4.8 → correct health verdict). So the review's
 | **P30** | **Deployment Security Posture, staged toward active verification** — Phase 1 assesses the OWN cluster's security posture (NetworkPolicy coverage, pod securityContext, Ingress TLS) from what Discovery already reads, read-only, same evidence-based framing as P21; Phases 2-4 (named future direction) add engagement-gated active verification, exploitability checks, and eventually full pentest orchestration | **Phase 1 SHIPPED 2026-09-14** ([ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md)) — three checks (`namespace-has-networkpolicy`, `pod-security-context`, `ingress-missing-tls`), `security_findings` table with RLS from its first migration, `POST`/`GET /api/security-findings`, and a new "Security Posture" panel. **Promotes [ADR 0022](decisions/0022-multi-tenant-fleet-hub.md)'s use case #8**, flagged 2026-08-02. RBAC-surface scanning and CI/CD-visible findings (mutable ECR tags, no scan gate, EKS admin exposure) explicitly deferred, not part of Phase 1. Phases 2-4 intentionally not scheduled | [ADR 0033](decisions/0033-deployment-security-posture-and-staged-active-verification.md) |
 | **P31** | **Migration Decommissioning Support** — a CPaaS-to-CPaaS datacenter migration client needs confidence that a migrated app's old-cluster footprint is truly dead before decommissioning it; this gives the mined graph the evidence to answer that | **All three phases SHIPPED 2026-10-09.** **Phase 1 (cross-cluster call capture)** ([ADR 0037](decisions/0037-cross-cluster-call-capture.md)): a new `target_kind="cross_cluster"`, validated against `cluster_ingress_endpoints` (the fleet's own Route/Ingress inventory, P18 #3) rather than a shape guess — the same bar every other validated tier in this product already meets, and the reason this edge type can stay on unconditionally where plain `external` stays gated behind `MINE_EXTERNAL_EGRESS`. New fleet-wide `GET /admin/ingress-lookup` (same precedent as `GET /admin/tracked`). Found and fixed two pre-existing gaps in `cluster_ingress_endpoints`'s read path (`cluster_id` missing from `ListClusterIngress`'s SELECT, no index for a host-reverse lookup) as a byproduct. Took the opportunity to refactor `UpsertServiceDependency`'s 14-positional-parameter signature (about to become 15) into a `ServiceDependencyUpsert` struct, since every call site needed touching regardless. **Phase 2 (cold services)** ([ADR 0038](decisions/0038-cold-services-view.md)): no schema change — "scanned recently, not seen recently (or ever)" built entirely from `service_dependencies.last_seen`/`scan_coverage.last_scan`, deliberately starting the query from `scan_coverage` so a service that's NEVER had any edge evidence isn't silently dropped by an activity-first join. New deterministic Tier-1 `cold_services` intent, same zero-model-call posture as the existing `dependencies` intent, checked before it in both Go's `inferIntent` and Python's `_chat_route`. **Phase 3 (cross-cluster pairing)** ([ADR 0039](decisions/0039-cross-cluster-pairing-convention-based.md)): convention-based only, by explicit decision — same-named service across `cluster_id`s in `cluster_services` (the fleet inventory, not `service_dependencies`), each side's cold/warm state reusing phase 2's exact predicate (one shared Go constant, so the two can't drift). Store-only, no chat intent; surfaced only as a passive annotation on the cold-services UI toggle. Label-based pairing confirmation and an explicit `migration_mappings` table were considered and explicitly deferred, not attempted this pass. **Platform-labeling extension SHIPPED 2026-10-09** ([ADR 0037 amendment](decisions/0037-cross-cluster-call-capture.md#amendment-2026-10-09--widened-the-default-to-routeingresshttproute)): the fleet is heterogeneous (OpenShift + AWS EKS + GCP GKE), and OpenShift Route is an OpenShift-only CRD — the original Route-only `CROSS_CLUSTER_INGRESS_KINDS` default meant a cross-cluster edge touching EKS or GKE was structurally uncapturable, not just untrusted. Widened to `route,ingress,httproute` fleet-wide by default. Each cluster's platform is detected once per collector-pod lifetime from facts already gathered (`openshift_route` capability flag; a regex match on the `gitVersion` string's vendor suffix for EKS/GKE) — deliberately NOT via Node labels, since Discovery has never held a `nodes` RBAC grant (confirmed absent, not assumed, while designing this). Persisted on `cluster_health_snapshots` (the one cluster-level row Discovery already upserts every cycle; `Integration` is operator-managed and the wrong place), joined into `ListServiceDependencies` twice — once for the observing cluster, once for the resolved cross-cluster target — so the existing edge payload the frontend already fetches carries both ends' platform with no new endpoint. Diagram shows a short platform badge (OCP/EKS/GKE) on a cross-cluster node, loosely brand-coloured | [ADR 0037](decisions/0037-cross-cluster-call-capture.md), [ADR 0038](decisions/0038-cold-services-view.md), [ADR 0039](decisions/0039-cross-cluster-pairing-convention-based.md) |
 | **P32** | **Label-scoped dependency traceability** — key in a pod-label value (an APM number today, any operator-tracked label tomorrow) in chat and see the dependency flow for every service carrying it, including upstream/downstream services that don't carry the same tag. Grew directly out of P15's Splunk live-verification work (2026-10-15) | **Fully implemented 2026-10-15** — all three mining paths (Discovery's live scan, Glue, Splunk), both chat entry points, the LLM-tool fallback, and the frontend's "untagged" badge for out-of-scope nodes. `TRACKED_LABEL_KEYS`-allowlisted capture, a new `service_labels` table, a union-over-either-endpoint scoping query, a Tier-1 fast path making the common case zero-LLM-call. Ad-hoc Splunk-index-driven mining (the other half of the original ask) remains explicitly deferred to its own future ADR | [spec 012](specs/012-label-scoped-dependency-view.md), [ADR 0043](decisions/0043-generic-label-based-service-scoping.md) |
-| **P33** | **Dependency chat history + cross-session drift assessment** — surface recent conversations in the Dependencies panel's docked chat, and flag what's changed since a past conversation assessed something similar | Proposed (2026-10-16) — history reuses `ChatPanel.tsx`'s existing session-list pattern against the already-live `GET /api/chat/sessions`, tenant-wide (confirmed with the user: no per-user identity exists in this product, and building one for this would be disproportionate). Drift assessment splits into two tiers: a zero-LLM-call deterministic diff for the three Tier-1 routes (`dependencies`, `label_scoped_dependencies`, `cold_services`) against their own already-stored structured `details`, and a semantic-retrieval + LLM-narrated tier for free-form questions, extending P8's proven `get_similar_incidents` embed-then-cosine-search mechanism via a new sibling table rather than widening `incident_embeddings` (whose own docs explicitly scope it to diagnose conclusions, not chat) | [spec 013](specs/013-dependency-chat-history-and-drift.md), [ADR 0044](decisions/0044-dependency-chat-history-and-drift-assessment.md) |
+| **P33** | **Dependency chat history + cross-session drift assessment** — surface recent conversations in the Dependencies panel's docked chat, and flag what's changed since a past conversation assessed something similar | Proposed (2026-10-16), revised after user feedback same day — history list reuses `ChatPanel.tsx`'s existing session-list pattern against the already-live `GET /api/chat/sessions`, fully unfiltered/tenant-wide (no per-user identity exists in this product; building one for this would be disproportionate — confirmed with the user). Drift assessment splits into two tiers, both matching tightly on the specific question/service rather than loosely on recency: a zero-LLM-call **structural-only** deterministic diff (edges added/gone-quiet, each with its own `first_seen`/`last_seen` timestamp — no evidence-count magnitude comparison in v1) for the three Tier-1 routes against their own already-stored `details`, and a semantic-retrieval + LLM-narrated tier for free-form questions (scoped by namespace **and** service, not namespace alone), extending P8's proven `get_similar_incidents` embed-then-cosine-search mechanism via a new sibling table rather than widening `incident_embeddings` (whose own docs explicitly scope it to diagnose conclusions, not chat) | [spec 013](specs/013-dependency-chat-history-and-drift.md), [ADR 0044](decisions/0044-dependency-chat-history-and-drift-assessment.md) |
 
 **How P21–P27 relate.** agentify is, structurally, an **evidence engine**: the
 collector turns an opaque cluster into evidence that is otherwise expensive to
@@ -3158,36 +3158,51 @@ own comment says so. Ask: surface recent conversations there, and have a
 new question flag what's changed since a past conversation assessed
 something similar, "across all users for a specific query."
 
-**Design (not yet implemented):** see
-[spec 013](specs/013-dependency-chat-history-and-drift.md) and
+**Design (not yet implemented), revised 2026-10-16 after user feedback:**
+see [spec 013](specs/013-dependency-chat-history-and-drift.md) and
 [ADR 0044](decisions/0044-dependency-chat-history-and-drift-assessment.md).
 In short:
 
-- **History is tenant-wide, not per-user** — confirmed with the user
-  after establishing there is no per-user identity anywhere in this
-  product (no `user_id` column, no login, only tenant/cluster-scoped
-  collector-token auth). Reuses `ChatPanel.tsx`'s already-shipped
-  session-list pattern against the already-live
-  `GET /api/chat/sessions` — a UI reuse, not a new backend capability.
-- **Drift assessment splits into two tiers, never one mechanism covering
-  both:**
+- **History list stays completely unfiltered, tenant-wide** — reuses
+  `ChatPanel.tsx`'s already-shipped session-list pattern against the
+  already-live `GET /api/chat/sessions` as-is (the tenant's 20 most
+  recently active sessions), no namespace filtering either client- or
+  server-side. This is a resume-a-conversation convenience, not where
+  precision matters — confirmed with the user, who redirected the
+  precision requirement to the comparison logic below instead. No
+  per-user split either way — there is no per-user identity anywhere in
+  this product (no `user_id` column, no login, only tenant/cluster-scoped
+  collector-token auth), and building one for this is confirmed
+  disproportionate.
+- **Drift assessment splits into two tiers, both matching tightly on the
+  specific question/service — "context memory," never a loose match
+  against whatever's chronologically recent:**
   - **Tier A (deterministic, zero LLM cost):** for the three Tier-1
     routes (`dependencies`, `label_scoped_dependencies` — ADR 0043,
     `cold_services` — ADR 0038), which already attach structured
     `details` to their answers, persisted verbatim in
-    `chat_sessions.messages`. A new question resolving to the same
-    route+scope diffs the stored "before" against a fresh fetch —
-    edges added/removed, evidence-count deltas — straight structural
-    comparison, no model involved.
+    `chat_sessions.messages`. A new question resolving to the exact same
+    route+scope (same namespace+focus, or same label key=value) diffs
+    the stored "before" against a fresh fetch — **structural only**
+    (edges added/gone-quiet; no evidence-count magnitude comparison in
+    v1, deferred until real growth-rate data exists to calibrate a
+    threshold against). Every finding carries its **own** timestamp
+    (`first_seen` for an added edge, `last_seen` for one gone quiet) —
+    not one blanket "since we last asked." No staleness cutoff on how
+    old the compared session can be; an old comparison stays useful for
+    infrequently-asked namespaces, softened in framing rather than
+    hidden.
   - **Tier B (semantic + LLM-narrated, for free-form questions):**
     extends P8's proven embed-then-cosine-search mechanism
     (`get_similar_incidents`/`/api/incidents/similar`) via a new sibling
     table, `chat_query_embeddings` — not a widening of
     `incident_embeddings`, whose own docs explicitly scope it to
-    diagnose conclusions and state "chat is never embedded" today. A
-    retrieved past summary is handed to the model as context, with any
-    noted difference framed explicitly as an observation, never an
-    assertion.
+    diagnose conclusions and state "chat is never embedded" today.
+    Retrieval is scoped by **namespace AND service/focus**, not
+    namespace alone — a textually-similar question about a different
+    service must never qualify. A retrieved past summary is handed to
+    the model as context, with any noted difference framed explicitly
+    as an observation, never an assertion.
 - **Explicitly out of scope:** building real per-user accounts/auth for
   this — confirmed disproportionate to the actual ask; revisit only if
   identity gets built for an unrelated reason (e.g. audit/compliance).
