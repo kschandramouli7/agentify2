@@ -19,25 +19,27 @@ interface NavItem {
   description: string;
 }
 
+// "observability" is deliberately left out of both nav arrays (hidden from
+// the UI, not removed) -- its Page variant, import, and render branch below
+// stay intact so re-adding a nav entry for it is a one-line change.
 const MAIN_NAV: NavItem[] = [
-  {
-    id: "observability",
-    label: "K8s Observability",
-    icon: "◎",
-    description: "Diagnose services & pods",
-  },
   {
     id: "chat",
     label: "Investigate",
     icon: "✦",
     description: "Multi-turn AI conversation",
   },
+  {
+    id: "topology",
+    label: "Dependencies",
+    icon: "⇄",
+    description: "Mined service-to-service call graph (P18 #2)",
+  },
 ];
 
 const ADMIN_NAV: NavItem[] = [
   { id: "registry",     label: "Pod Registry",    icon: "⬡", description: "Browse live pods"            },
   { id: "traces",       label: "Query History",   icon: "≡", description: "Past queries & traces"       },
-  { id: "topology",     label: "Dependencies",    icon: "⇄", description: "Mined service-to-service call graph (P18 #2)" },
   { id: "security",     label: "Security Posture", icon: "🛡", description: "Deployment security checks — NetworkPolicy, securityContext, TLS (P30)" },
   { id: "sync",         label: "Namespace Sync",  icon: "⟳", description: "Sync cluster namespaces"    },
   { id: "metrics",      label: "Metrics",         icon: "◈", description: "Token usage & cost"          },
@@ -105,7 +107,7 @@ function PageHeader({ page }: { page: Page }) {
 }
 
 export function App() {
-  const [page, setPage] = useState<Page>("observability");
+  const [page, setPage] = useState<Page>("chat");
 
   return (
     <div className="app">
