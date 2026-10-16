@@ -1723,6 +1723,81 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P33 (ADR 0044): FindPriorTier1Session matches on intent+scope_key stored in message details", func(t *testing.T) {
+		mkSession := func(id string, details map[string]interface{}) *ChatSession {
+			return &ChatSession{
+				ID: id, Namespace: "payments",
+				Messages:   []ChatMessage{{Role: "assistant", Content: "answer", CreatedAt: time.Now(), Details: details}},
+				ExpiresAt:  time.Now().Add(24 * time.Hour),
+			}
+		}
+
+		// Matching scope — this is the one FindPriorTier1Session should find.
+		matching := mkSession(uuid.New().String(), map[string]interface{}{
+			"intent": "dependencies", "scope_key": "payments|payment-api",
+		})
+		if err := client.CreateChatSession(ctx, matching); err != nil {
+			t.Fatalf("create matching session: %v", err)
+		}
+
+		// A different scope_key — must never match.
+		differentScope := mkSession(uuid.New().String(), map[string]interface{}{
+			"intent": "dependencies", "scope_key": "payments|payment-worker",
+		})
+		if err := client.CreateChatSession(ctx, differentScope); err != nil {
+			t.Fatalf("create different-scope session: %v", err)
+		}
+
+		// A different intent, same scope_key text — must never match either
+		// (label_scoped_dependencies' scope_key format can coincidentally
+		// collide with a namespace|focus string; intent must still gate it).
+		differentIntent := mkSession(uuid.New().String(), map[string]interface{}{
+			"intent": "cold_services", "scope_key": "payments|payment-api",
+		})
+		if err := client.CreateChatSession(ctx, differentIntent); err != nil {
+			t.Fatalf("create different-intent session: %v", err)
+		}
+
+		// A model-answered message with no intent/scope_key at all (the
+		// common case) — must not crash the lookup or false-match.
+		noDeterministicTag := mkSession(uuid.New().String(), map[string]interface{}{
+			"incident_summary": "some model answer",
+		})
+		if err := client.CreateChatSession(ctx, noDeterministicTag); err != nil {
+			t.Fatalf("create no-tag session: %v", err)
+		}
+
+		found, err := client.FindPriorTier1Session(ctx, "exclude-nothing", "dependencies", "payments|payment-api")
+		if err != nil {
+			t.Fatalf("FindPriorTier1Session: %v", err)
+		}
+		if found == nil {
+			t.Fatal("want the matching session, got nil")
+		}
+		if found.ID != matching.ID {
+			t.Errorf("want session %s, got %s", matching.ID, found.ID)
+		}
+
+		// Excluding the matching session's own ID (e.g. the CURRENT turn
+		// being answered, which already has this intent/scope_key on its
+		// own in-flight message) must correctly find nothing else.
+		none, err := client.FindPriorTier1Session(ctx, matching.ID, "dependencies", "payments|payment-api")
+		if err != nil {
+			t.Fatalf("FindPriorTier1Session (excluded): %v", err)
+		}
+		if none != nil {
+			t.Fatalf("want nil once the only match is excluded, got session %s", none.ID)
+		}
+
+		noMatch, err := client.FindPriorTier1Session(ctx, "exclude-nothing", "dependencies", "payments|nonexistent-focus")
+		if err != nil {
+			t.Fatalf("FindPriorTier1Session (no match): %v", err)
+		}
+		if noMatch != nil {
+			t.Fatalf("want nil for a scope nothing answered, got session %s", noMatch.ID)
+		}
+	})
+
 	t.Run("ROADMAP P32 (ADR 0043): service labels upsert + lookup, last-observed-wins", func(t *testing.T) {
 		tenantID := uuid.New().String()
 

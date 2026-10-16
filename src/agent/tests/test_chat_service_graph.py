@@ -403,6 +403,9 @@ async def test_reason_chat_answers_a_dependency_question_without_a_model_call(mo
     assert resp.details["service_graph"]["focus"] == "payment-api"
     assert "payment-batch, payment-worker" in resp.answer
     assert resp.sources == ["service_dependencies"]
+    # ROADMAP P33 (ADR 0044): what a later session's Tier A diff looks up.
+    assert resp.details["intent"] == "dependencies"
+    assert resp.details["scope_key"] == "payments|payment-api"
 
 
 @pytest.mark.asyncio
@@ -425,6 +428,44 @@ async def test_reason_chat_falls_through_to_the_model_when_no_graph_exists(monke
     )
     assert resp.tier != "tier1"
     assert "service_graph" not in (resp.details or {})
+
+
+@pytest.mark.asyncio
+async def test_reason_chat_answers_a_cold_services_question_without_a_model_call(monkeypatch):
+    """ROADMAP P33 (ADR 0044): closed a pre-existing gap found while adding
+    this — _chat_route could already return "cold_services", but reason_chat
+    had no branch for it and silently fell through to the model every time.
+    Mirrors the single-shot ColdServicesSkill's own answer (same
+    _cold_services_answer, now shared via k8fy/agent.py)."""
+    async def fake_fetch(namespace, backend_url):
+        assert namespace == "payments"
+        return [{"service": "payment-legacy", "last_seen": "2026-01-01T00:00:00Z"}]
+
+    monkeypatch.setattr("k8fy.service_topology.fetch_cold_services", fake_fetch)
+
+    agent = _bare_agent()
+    resp = await type(agent).reason_chat(
+        agent, _user("which services are cold in this namespace?"), {"namespace": "payments"},
+    )
+
+    assert resp.tier == "tier1"
+    assert resp.input_tokens == 0 and resp.output_tokens == 0
+    assert "payment-legacy" in resp.answer
+    assert resp.details["intent"] == "cold_services"
+    assert resp.details["scope_key"] == "payments"
+    assert resp.details["cold_services"][0]["service"] == "payment-legacy"
+
+
+@pytest.mark.asyncio
+async def test_reason_chat_cold_services_falls_through_to_the_model_without_a_namespace(monkeypatch):
+    """No namespace means nothing to query -- same "let the model explain
+    it" posture test_reason_chat_falls_through_to_the_model_when_no_graph_exists
+    already pins for the dependencies route."""
+    agent = _bare_agent()
+    resp = await type(agent).reason_chat(
+        agent, _user("which services are cold in this namespace?"), {},
+    )
+    assert resp.tier != "tier1"
 
 
 @pytest.mark.asyncio

@@ -86,6 +86,10 @@ type ChatStore interface {
 	UpdateChatSession(ctx context.Context, s *pgstore.ChatSession) error
 	ListChatSessions(ctx context.Context, limit int) ([]pgstore.ChatSession, error)
 	DeleteChatSession(ctx context.Context, id string) error
+	// FindPriorTier1Session is ROADMAP P33 (ADR 0044)'s "context memory"
+	// lookup for the Tier A deterministic diff — see its own doc comment
+	// in postgres.go for the full reasoning.
+	FindPriorTier1Session(ctx context.Context, excludeSessionID, intent, scopeKey string) (*pgstore.ChatSession, error)
 }
 
 // ChatSessionResponse is the API shape of a chat session.

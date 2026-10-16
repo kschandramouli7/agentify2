@@ -1723,6 +1723,23 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	if agentErr == nil && agentResp != nil {
 		assistantDetails = agentResp.Details
 	}
+	// ROADMAP P33 (ADR 0044), Tier A: a deterministic diff against the most
+	// recent OTHER session that answered this exact route+scope before —
+	// only when the agent tagged this answer with intent/scope_key (the
+	// three Tier-1 routes do; a model-answered turn never has them, so
+	// this is a no-op there). Added onto the SAME message's details under
+	// "drift" rather than a second message or a second LLM call — Decision
+	// #3's "read-only addition to the existing answer."
+	if intentVal, _ := assistantDetails["intent"].(string); intentVal != "" {
+		scopeKey, _ := assistantDetails["scope_key"].(string)
+		if scopeKey != "" {
+			if prior, err := h.chatStore.FindPriorTier1Session(r.Context(), id, intentVal, scopeKey); err != nil {
+				h.logger.Warn("drift lookup failed", "session_id", id, "intent", intentVal, "error", err)
+			} else if diff := DiffTier1Answer(prior, intentVal, scopeKey, assistantDetails); diff != nil {
+				assistantDetails["drift"] = diff
+			}
+		}
+	}
 	assistantMsg := pgstore.ChatMessage{Role: "assistant", Content: assistantContent, CreatedAt: time.Now(), Details: assistantDetails}
 	s.Messages = append(s.Messages, assistantMsg)
 	s.LastActive = time.Now()

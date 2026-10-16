@@ -782,6 +782,12 @@ def _dependency_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
         "recommendations": [],
         "recommended_actions": [],
         "service_graph": graph,
+        # ROADMAP P33 (ADR 0044): what a later session's Tier A diff looks
+        # up to find THIS answer again. scope_key is deliberately exact
+        # (namespace+focus, "" for no focus) -- a later question about a
+        # related but different focus must never match this one.
+        "intent": "dependencies",
+        "scope_key": f"{graph['namespace']}|{graph.get('focus') or ''}",
     }
     return answer, details
 
@@ -995,6 +1001,9 @@ def _label_scoped_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
         ],
         "label_key": label_key, "label_value": label_value, "tracked": True,
         "services": in_scope, "out_of_scope_services": out_of_scope,
+        # ROADMAP P33 (ADR 0044): see _dependency_answer's identical note.
+        "intent": "label_scoped_dependencies",
+        "scope_key": f"{label_key}={label_value}",
         # Same {namespace, focus, dependencies} shape ServiceGraphSection
         # already renders (api.ts's ServiceGraph type) — namespace is
         # display text only on that path (confirmed: never used for a
@@ -1006,6 +1015,44 @@ def _label_scoped_answer(graph: Dict[str, Any]) -> "tuple[str, Dict[str, Any]]":
         },
     }
     return "\n".join(lines), details
+
+
+def _cold_services_answer(namespace: str, cold: list) -> str:
+    """Prose for a cold-services report. Deliberately states the two
+    thresholds it used (RELEVANT to decommissioning — a reader needs to
+    know how stale/how-recently-scanned "cold" meant here) and the lower-
+    bound caveat every evidence-based answer in this codebase carries: this
+    is mined log evidence, not a guarantee nothing else depends on it.
+
+    Lives here, not in k8fy/skills/cold_services.py, so reason_chat's new
+    `cold_services` route (ROADMAP P33) can call it without an import
+    cycle — that skill module already imports K8fyAgent from this one, so
+    the reverse import isn't possible. ColdServicesSkill imports this
+    function from here instead of defining its own copy.
+    """
+    if not cold:
+        return (
+            f"No services in {namespace} currently look cold — nothing scanned recently "
+            "has gone quiet for longer than the stale threshold.\n\n"
+            "This is a lower bound, same as every mined-evidence answer here: it reflects "
+            "what the scanner has sampled, not a certainty that nothing was missed."
+        )
+    lines = []
+    for svc in cold:
+        service = svc.get("service", "?")
+        last_seen = svc.get("last_seen")
+        if last_seen:
+            lines.append(f"- {service}: last evidence at {last_seen}")
+        else:
+            lines.append(f"- {service}: no evidence has ever been mined for it")
+    body = "\n".join(lines)
+    return (
+        f"{len(cold)} service{'s' if len(cold) != 1 else ''} in {namespace} look cold "
+        f"— scanned recently, with no recent (or, for some, any) call-graph evidence:\n\n"
+        f"{body}\n\n"
+        "This is a candidate list, not a decommission order: it reflects mined log "
+        "evidence only, and cannot see traffic the scanner never sampled."
+    )
 
 
 async def _build_service_graph(
@@ -1671,6 +1718,44 @@ class K8fyAgent:
                         sources=["service_labels", "service_dependencies"],
                         tool_calls=[],
                         details=details,
+                        tier="tier1",
+                    )
+
+        # ROADMAP P31 phase 2 (cold_services, ADR 0038) reaches _chat_route
+        # already, but had no handling branch here — a cold-services
+        # question asked via the docked chat fell through to the model
+        # even though the single-shot /api/query path already answers it
+        # deterministically (ColdServicesSkill). Closed as a byproduct of
+        # ROADMAP P33 (ADR 0044), which needs every Tier-1 route reachable
+        # through the chat session mechanism for its diff lookup to have
+        # anything to find.
+        if route == "cold_services":
+            namespace = context.get("namespace")
+            if namespace:
+                from k8fy.service_topology import fetch_cold_services
+
+                try:
+                    cold = await fetch_cold_services(namespace, self.backend_url)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("deterministic cold-services route failed, falling back to model: %s", e)
+                    cold = None
+                if cold is not None:
+                    answer = _cold_services_answer(namespace, cold)
+                    metrics.record_request("ok")
+                    logger.info(
+                        "chat answered deterministically: intent=cold_services namespace=%s cold_count=%d",
+                        namespace, len(cold),
+                    )
+                    return AgentResponse(
+                        answer=answer,
+                        status="ok",
+                        confidence=1.0,
+                        sources=["service_dependencies", "scan_coverage"],
+                        tool_calls=[],
+                        details={
+                            "namespace": namespace, "cold_services": cold,
+                            "intent": "cold_services", "scope_key": namespace,
+                        },
                         tier="tier1",
                     )
 

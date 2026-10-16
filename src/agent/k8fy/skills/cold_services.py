@@ -9,47 +9,19 @@ scan_coverage.last_scan), not something a model needs to reason about.
 Reuses fetch_cold_services (k8fy/service_topology.py) rather than building
 its own HTTP call, same "one function, two entry points" posture
 DependencyGraphSkill's own docstring describes for _build_service_graph.
+_cold_services_answer (the prose builder) is imported from k8fy/agent.py
+for the identical reason (ROADMAP P33): reason_chat's own `cold_services`
+route needs the same text, and this module already imports K8fyAgent from
+there, so the reverse import isn't possible.
 """
 
 import logging
 from typing import Any, Dict, Optional
 
-from k8fy.agent import K8fyAgent
+from k8fy.agent import K8fyAgent, _cold_services_answer
 from models.response import AgentResponse
 
 logger = logging.getLogger(__name__)
-
-
-def _cold_services_answer(namespace: str, cold: list) -> str:
-    """Prose for a cold-services report. Deliberately states the two
-    thresholds it used (RELEVANT to decommissioning — a reader needs to
-    know how stale/how-recently-scanned "cold" meant here) and the lower-
-    bound caveat every evidence-based answer in this codebase carries: this
-    is mined log evidence, not a guarantee nothing else depends on it.
-    """
-    if not cold:
-        return (
-            f"No services in {namespace} currently look cold — nothing scanned recently "
-            "has gone quiet for longer than the stale threshold.\n\n"
-            "This is a lower bound, same as every mined-evidence answer here: it reflects "
-            "what the scanner has sampled, not a certainty that nothing was missed."
-        )
-    lines = []
-    for svc in cold:
-        service = svc.get("service", "?")
-        last_seen = svc.get("last_seen")
-        if last_seen:
-            lines.append(f"- {service}: last evidence at {last_seen}")
-        else:
-            lines.append(f"- {service}: no evidence has ever been mined for it")
-    body = "\n".join(lines)
-    return (
-        f"{len(cold)} service{'s' if len(cold) != 1 else ''} in {namespace} look cold "
-        f"— scanned recently, with no recent (or, for some, any) call-graph evidence:\n\n"
-        f"{body}\n\n"
-        "This is a candidate list, not a decommission order: it reflects mined log "
-        "evidence only, and cannot see traffic the scanner never sampled."
-    )
 
 
 class ColdServicesSkill(K8fyAgent):
@@ -105,6 +77,14 @@ class ColdServicesSkill(K8fyAgent):
             confidence=1.0,
             sources=["service_dependencies", "scan_coverage"],
             tool_calls=[],
-            details={"namespace": namespace, "cold_services": cold},
+            details={
+                "namespace": namespace, "cold_services": cold,
+                # ROADMAP P33 (ADR 0044): same scope_key convention
+                # _dependency_answer/_label_scoped_answer use in agent.py —
+                # harmless here (Tier A diffing only reads it from stored
+                # chat sessions, which this single-shot path never creates),
+                # kept for consistency should that ever change.
+                "intent": "cold_services", "scope_key": namespace,
+            },
             tier="tier1",
         )

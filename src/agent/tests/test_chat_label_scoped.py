@@ -171,3 +171,6 @@ def test_label_scoped_answer_surfaces_out_of_scope_downstream():
     assert details["service_graph"]["dependencies"] == EDGES
     assert details["service_graph"]["focus"] is None
     assert "payments" in details["service_graph"]["namespace"]
+    # ROADMAP P33 (ADR 0044): what a later session's Tier A diff looks up.
+    assert details["intent"] == "label_scoped_dependencies"
+    assert details["scope_key"] == "apm-id=APM123456"

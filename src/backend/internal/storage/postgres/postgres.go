@@ -2012,6 +2012,43 @@ func (c *Client) DeleteChatSession(ctx context.Context, id string) error {
 	return err
 }
 
+// FindPriorTier1Session looks up the most recently active OTHER session
+// whose messages include an assistant answer tagged with this exact
+// intent+scopeKey (ROADMAP P33, ADR 0044) — the "context memory" lookup
+// Tier A's diff is built on. intent/scopeKey are read from each
+// message's details JSONB (set by k8fy/agent.py's _dependency_answer /
+// _label_scoped_answer / the cold_services chat route — see those for
+// scopeKey's exact per-route format), not a dedicated column: adding one
+// would mean a schema migration for a value that already rides along in
+// data already being stored.
+//
+// Deliberately NO staleness cutoff (ADR 0044 Decision #4/Consequences)
+// and, consistent with GetChatSession/ListChatSessions above, NO
+// tenant_id filter either — chat_sessions has a tenant_id column but was
+// never given an RLS policy (unlike service_dependencies, ADR 0022
+// Decision #5), a pre-existing gap this function inherits rather than
+// silently fixes while implementing an unrelated feature.
+func (c *Client) FindPriorTier1Session(ctx context.Context, excludeSessionID, intent, scopeKey string) (*ChatSession, error) {
+	row := c.db.QueryRowContext(ctx,
+		`SELECT id, title, namespace, service, messages, context_cache,
+		        context_fetched_at, tenant_id, COALESCE(cluster_id, ''), created_at, last_active, expires_at
+		 FROM chat_sessions
+		 WHERE id != $1
+		   AND EXISTS (
+		     SELECT 1 FROM jsonb_array_elements(messages) AS msg
+		     WHERE msg->'details'->>'intent' = $2
+		       AND msg->'details'->>'scope_key' = $3
+		   )
+		 ORDER BY last_active DESC
+		 LIMIT 1`,
+		excludeSessionID, intent, scopeKey)
+	s, err := scanChatSession(row)
+	if err == sql.ErrNoRows {
+		return nil, nil // no prior match -- not an error, see DiffTier1Answer's own handling
+	}
+	return s, err
+}
+
 func scanChatSession(row interface{ Scan(...any) error }) (*ChatSession, error) {
 	var s ChatSession
 	var msgsJSON, cacheJSON []byte
