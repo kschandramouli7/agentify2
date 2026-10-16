@@ -9,7 +9,9 @@ import { DiagnosisReport } from "./DiagnosisReport";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function relTime(iso: string) {
+// Exported so DependencyChatPanel.tsx's history list (ROADMAP P33, ADR
+// 0044) can format timestamps identically instead of duplicating this.
+export function relTime(iso: string) {
   const diff = Date.now() - new Date(iso).getTime();
   if (diff < 60_000) return "just now";
   if (diff < 3_600_000) return `${Math.round(diff / 60_000)}m ago`;

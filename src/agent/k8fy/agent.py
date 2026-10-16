@@ -1789,6 +1789,29 @@ class K8fyAgent:
                     "it."
                 ),
             })
+        # ROADMAP P33 (ADR 0044), Tier B: a similar past RESOLVED question,
+        # if the Go backend found one before this call (HandleSendChatMessage
+        # embeds this turn's own question and searches BEFORE calling the
+        # model — Decision #3, never a tool the model has to decide to
+        # invoke). Same uncached-second-block reasoning as scope_bits above.
+        # The explicit "note any difference, don't assert" instruction is
+        # load-bearing: this is retrieval, not ground truth, and the prior
+        # answer could easily be stale — framing it as an observation is
+        # what spec 013's own acceptance criteria require.
+        similar = context.get("similar_past_query")
+        if isinstance(similar, dict) and similar.get("summary"):
+            system.append({
+                "type": "text",
+                "text": (
+                    f"A similar question was asked before: {similar.get('question', '')!r}. "
+                    f"What was found then: {similar['summary']}\n\n"
+                    "If the current tool results or your own reasoning suggest something has "
+                    "changed since, note it explicitly as an observation (e.g. \"this differs "
+                    "from what was seen previously\") — never assert it as settled fact, and "
+                    "never let it override what the current evidence actually shows."
+                ),
+            })
+
         chat_messages = list(messages)  # copy so we can append tool results
         tool_calls_made: List[ToolCall] = []
         total_in_tok = total_out_tok = total_cache_write = total_cache_read = 0

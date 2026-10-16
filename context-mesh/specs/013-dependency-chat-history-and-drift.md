@@ -88,16 +88,24 @@ the mined-graph routes, as a soft observation for free-form questions.
 
 ## Interfaces
 
-**Frontend** (`DependencyChatPanel.tsx`):
+**Frontend** (`DependencyChatPanel.tsx`, implemented as built):
 
 ```tsx
-// New: a collapsible list above (or beside) the thread, reusing
-// ChatPanel.tsx's existing <SessionList> shape/component rather than a
-// parallel implementation. Calls GET /api/chat/sessions UNFILTERED —
-// the same tenant-wide top-20 ChatPanel.tsx already shows, no new query
-// param, no client-side namespace filtering. The list is a resume
-// convenience; precision lives in the diff/retrieval logic below, not
-// in which sessions are listed as clickable.
+// A collapsible list ("≡" toggle next to the existing "⤢" expand
+// button), rendered between the header and the thread rather than a
+// permanent sidebar — the docked rail is too narrow for
+// ChatPanel.tsx's full <SessionList/>, so this reuses its underlying
+// CSS classes (.chat-session-list/-item/-title/-meta) and its exported
+// relTime() helper, not the sidebar component itself. Calls
+// listChatSessions() -> GET /api/chat/sessions UNFILTERED — the same
+// tenant-wide top-20 ChatPanel.tsx shows, sharing its "chatSessions"
+// query-cache key so the two views don't double-fetch. Fetched lazily
+// (enabled: showHistory) since it's tenant-wide and most panel opens
+// never need it. Clicking an entry sets sessionId directly (same state
+// the "resume via initialSessionId" path already uses) — picking a
+// session from a different namespace than the panel's own props is
+// allowed, per Decision #1: this list is a resume convenience, not the
+// mechanism that needs to be precise.
 ```
 
 **Tier A — deterministic diff** (Go, `internal/api/handlers.go` or a new
@@ -142,27 +150,56 @@ the two conversations, however long that gap was.
 comparison in v1 (ADR 0044 Decision #2/Consequences) — structural change
 only.
 
-**Tier B — semantic retrieval** (Python, new `k8fy/chat_memory.py`
-mirroring `_get_similar_incidents`'s shape):
+**Tier B — semantic retrieval** (Go, `internal/api/handlers.go` —
+**revised from the original draft**, which sketched this as a new
+Python module + a new public HTTP endpoint. Neither was built that way:
+`embedAndStoreIncident`'s own embedding call already lives Go-side, not
+Python — it POSTs straight to the agent's `/embed` endpoint — so Tier B
+follows that same, already-established convention instead of
+introducing a second, inconsistent one):
 
-```python
-async def embed_and_store_chat_query(
-    backend_url: str, question: str, summary: str, namespace: str, service: str,
-) -> None:
-    """Best-effort, never blocks the answer -- same gate shape as
-    embedAndStoreIncident (handlers.go): only for resolved, non-Tier-1
-    answers."""
+```go
+// embedText is the shared helper both embedAndStoreIncident and Tier B
+// use to call the agent's /embed endpoint. Extracted, not duplicated.
+func (h *Handler) embedText(text string) []float32
 
-async def find_similar_chat_query(
-    backend_url: str, question: str, namespace: str, service: str = "", limit: int = 1,
-) -> List[Dict[str, Any]]:
-    """Same embed-then-GET-with-vec-param shape as _get_similar_incidents
-    / /api/incidents/similar -- scoped by namespace AND service/focus
-    when one is set, not namespace alone. A semantically-close match
-    from a DIFFERENT service in the same namespace must never qualify:
-    "context memory" means this specific question's own history, not a
-    loose topical match across unrelated services."""
+// Read side, in HandleSendChatMessage, BEFORE the agent/model call
+// (Decision #3 — retrieval feeds the call, it isn't a tool the model
+// decides whether to invoke): embed this turn's own question, then
+// look up a close match scoped by namespace AND service — never
+// namespace alone, so a semantically-close question about a DIFFERENT
+// service in the same namespace never qualifies. A match is handed to
+// the agent as context["similar_past_query"] = {question, summary}.
+type similarChatFinder interface {
+    FindSimilarChatQueries(ctx context.Context, namespace, service string, queryVec []float32, limit int) ([]pgstore.ChatQueryEmbedding, error)
+}
+
+// Write side, same function, only for a model-answered (non-Tier-1)
+// turn: redact the question and the answer, embed the question, store
+// both via UpsertChatQueryEmbedding. Best-effort, logged on failure,
+// never blocks the response — same posture embedAndStoreIncident
+// already has for P8. Both sides are a no-op (not an error) when
+// h.orch is nil or the relational backend isn't configured.
+type chatEmbStorer interface {
+    UpsertChatQueryEmbedding(ctx context.Context, e pgstore.ChatQueryEmbedding) error
+}
 ```
+
+No new public HTTP endpoint exists for this (the originally-sketched
+`GET /api/chat-queries/similar` was never built) — the lookup happens
+internally inside `HandleSendChatMessage` itself, the same way
+`embedAndStoreIncident`'s own embed call is internal to its caller
+rather than a separately-exposed route.
+
+On the Python side (`k8fy/agent.py`'s `reason_chat`), no new module or
+function was added either — `context.get("similar_past_query")` is read
+directly where the model's system prompt is assembled, and turned into
+one explicit instruction block: state what was found before, then tell
+the model to note any difference as an *observation*, never assert it
+as settled fact. Covered by
+`test_model_path_includes_a_similar_past_query_as_an_observation_not_fact`
+and `test_model_path_ignores_a_similar_past_query_with_no_summary` in
+`test_chat_service_graph.py`.
 
 **Storage** (Go, `postgres.go`):
 
@@ -183,8 +220,11 @@ CREATE TABLE IF NOT EXISTS chat_query_embeddings (
 -- block incident_embeddings already uses.
 ```
 
-New endpoint, mirroring `/api/incidents/similar`:
-`GET /api/chat-queries/similar?namespace=&service=&vec=&limit=`.
+RLS: `ENABLE`/`FORCE` + a `tenant_isolation` policy from this table's
+first migration — the newer-tables convention (`security_findings`,
+`service_labels`), not the older `tenant_id`-column-but-no-RLS gap
+`incident_embeddings`/`chat_sessions` still have. No new public HTTP
+endpoint — see the Tier B interface above for why.
 
 ## Open questions
 
@@ -216,24 +256,30 @@ All three original open questions are resolved (confirmed with the user,
 
 ## Acceptance criteria
 
-- [ ] The docked chat panel's history list shows the tenant's 20 most
+- [x] The docked chat panel's history list shows the tenant's 20 most
       recently active sessions, unfiltered, resuming one on click via
-      the existing `initialSessionId` mechanism.
-- [ ] A `dependencies` question with a matching-scope prior session
+      the existing `initialSessionId` mechanism (sessionId state, same
+      effect).
+- [x] A `dependencies` question with a matching-scope prior session
       produces a non-empty `GraphDiff` when edges genuinely changed —
       each entry carrying its own `ChangedAt` (not a blanket
       `PriorAskedAt`) — and no diff section when nothing did.
-- [ ] The same holds for `label_scoped_dependencies` (scoped by
+- [x] The same holds for `label_scoped_dependencies` (scoped by
       label_key=label_value) and `cold_services` (scoped by namespace).
-- [ ] A session with a DIFFERENT scope (different focus, different
-      label value) is never used as the diff baseline, however recent.
-- [ ] Tier A adds zero LLM calls, verified the same way P32's own
-      zero-LLM-call criteria were — by code-path inspection (no client
-      call in the diff path) or an explicit mock-assertion test.
-- [ ] A free-form question similar to a past one, for the SAME service,
+- [x] A session with a DIFFERENT scope (different focus, different
+      label value) is never used as the diff baseline, however recent
+      (`FindPriorTier1Session`'s exact scope-key match).
+- [x] Tier A adds zero LLM calls — the diff path never calls
+      `agentClient`, confirmed by code-path inspection and the handler
+      tests in `chat_session_drift_test.go`.
+- [x] A free-form question similar to a past one, for the SAME service,
       surfaces that past summary to the model, explicitly framed as an
       observation in the resulting answer text, never asserted as fact.
-- [ ] A free-form question textually similar to a past one but for a
-      DIFFERENT service never surfaces that past summary.
-- [ ] Embeddings unconfigured (no Voyage key) degrades Tier B to "answer
-      as today," never an error or a blocked response.
+- [x] A free-form question textually similar to a past one but for a
+      DIFFERENT service never surfaces that past summary (enforced by
+      `FindSimilarChatQueries`'s namespace+service scoping, not a
+      post-hoc filter).
+- [x] Embeddings unconfigured (no Voyage key) degrades Tier B to "answer
+      as today," never an error or a blocked response — same
+      `embedText`/`FindSimilarChatQueries` nil/error-tolerant paths
+      `embedAndStoreIncident` already relies on for P8.

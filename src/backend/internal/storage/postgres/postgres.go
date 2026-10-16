@@ -1048,6 +1048,42 @@ func (c *Client) initSchema(ctx context.Context) error {
 		END IF;
 	END $$;
 
+	-- Chat query embeddings (ROADMAP P33, ADR 0044, Tier B) — a sibling to
+	-- incident_embeddings above, not a widening of it: that table's own
+	-- docs scope it explicitly to diagnose conclusions ("chat is never
+	-- embedded"). One row per RESOLVED, non-Tier-1 chat answer (a Tier-1
+	-- route is diffed deterministically instead, see Tier A /
+	-- dependency_chat_diff.go — embedding it too would be redundant).
+	-- RLS from this table's FIRST migration (unlike incident_embeddings,
+	-- which predates multi-tenancy and was never retrofitted — the
+	-- newer, correct convention security_findings/security_engagements
+	-- already established).
+	CREATE TABLE IF NOT EXISTS chat_query_embeddings (
+		id         TEXT PRIMARY KEY,
+		tenant_id  TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+		session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+		namespace  TEXT NOT NULL DEFAULT '',
+		service    TEXT NOT NULL DEFAULT '',
+		question   TEXT NOT NULL,
+		summary    TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_chat_query_embeddings_ns_svc
+		ON chat_query_embeddings (namespace, service);
+
+	ALTER TABLE IF EXISTS chat_query_embeddings ENABLE ROW LEVEL SECURITY;
+	ALTER TABLE IF EXISTS chat_query_embeddings FORCE ROW LEVEL SECURITY;
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_policies
+			WHERE tablename = 'chat_query_embeddings' AND policyname = 'tenant_isolation'
+		) THEN
+			EXECUTE 'CREATE POLICY tenant_isolation ON chat_query_embeddings
+				USING (tenant_id = current_setting(''app.current_tenant_id'', true))';
+		END IF;
+	END $$;
+
 	-- Add the vector column + IVFFlat index only when pgvector is installed.
 	-- Silently skipped on embedded-postgres (CI tests) which don't ship pgvector.
 	DO $$
@@ -1066,6 +1102,21 @@ func (c *Client) initSchema(ctx context.Context) error {
 		) THEN
 			EXECUTE 'CREATE INDEX idx_incident_embeddings_vec
 				ON incident_embeddings USING ivfflat (embedding vector_cosine_ops)
+				WITH (lists = 10)';
+		END IF;
+		-- Same two additions, for chat_query_embeddings (ROADMAP P33).
+		IF NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'chat_query_embeddings' AND column_name = 'embedding'
+		) THEN
+			EXECUTE 'ALTER TABLE chat_query_embeddings ADD COLUMN embedding vector(512)';
+		END IF;
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE tablename = 'chat_query_embeddings' AND indexname = 'idx_chat_query_embeddings_vec'
+		) THEN
+			EXECUTE 'CREATE INDEX idx_chat_query_embeddings_vec
+				ON chat_query_embeddings USING ivfflat (embedding vector_cosine_ops)
 				WITH (lists = 10)';
 		END IF;
 	EXCEPTION WHEN OTHERS THEN
@@ -2210,6 +2261,151 @@ func (c *Client) FindSimilarIncidents(ctx context.Context, namespace, service st
 		seen[key] = struct{}{}
 		if len(result) >= limit {
 			break
+		}
+		result = append(result, e)
+	}
+	return result, rows.Err()
+}
+
+// ── Chat query embeddings (ROADMAP P33, ADR 0044, Tier B) ───────────────────
+
+// ChatQueryEmbedding is one resolved, non-Tier-1 chat answer paired with
+// its vector representation — the "context memory" Tier B searches for a
+// similar past question. Sibling to IncidentEmbedding above, not a reuse
+// of it (see that table's own schema comment for why).
+type ChatQueryEmbedding struct {
+	ID        string
+	TenantID  string
+	SessionID string
+	Namespace string
+	Service   string
+	Question  string
+	Summary   string
+	Embedding []float32 // nil when the embed service was unavailable
+}
+
+// UpsertChatQueryEmbedding stores one resolved chat question. Explicitly
+// scoped to DefaultTenantID (not a resolved caller tenant): the chat
+// session flow (HandleSendChatMessage) has no tenant resolution of its
+// own today — same pre-existing gap chat_sessions itself has (no RLS
+// policy at all there) — so this makes the common/default-tenant case
+// actually work under this table's REAL RLS policy, rather than silently
+// enforcing it against an always-unset tenant context.
+func (c *Client) UpsertChatQueryEmbedding(ctx context.Context, e ChatQueryEmbedding) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	tenantID := e.TenantID
+	if tenantID == "" {
+		tenantID = DefaultTenantID
+	}
+	if err := setTenantContext(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+
+	if e.Embedding == nil {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO chat_query_embeddings (id, tenant_id, session_id, namespace, service, question, summary)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT (id) DO UPDATE SET question=EXCLUDED.question, summary=EXCLUDED.summary`,
+			e.ID, tenantID, e.SessionID, e.Namespace, e.Service, e.Question, e.Summary)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	// pgvector expects the vector as a Postgres-formatted literal: '[0.1,0.2,...]'
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, v := range e.Embedding {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(fmt.Sprintf("%g", v))
+	}
+	sb.WriteByte(']')
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO chat_query_embeddings (id, tenant_id, session_id, namespace, service, question, summary, embedding)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector)
+		ON CONFLICT (id) DO UPDATE SET
+			question  = EXCLUDED.question,
+			summary   = EXCLUDED.summary,
+			embedding = EXCLUDED.embedding`,
+		e.ID, tenantID, e.SessionID, e.Namespace, e.Service, e.Question, e.Summary, sb.String())
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FindSimilarChatQueries returns up to `limit` past resolved chat
+// questions closest to queryVec (cosine similarity), scoped by namespace
+// AND service/focus when one is set — not namespace alone (ADR 0044
+// Decision #2's revision: "context memory" means this specific
+// question's own history, never a loose topical match pulled from an
+// unrelated service in the same namespace, however close the text
+// match). Falls back to recency order when pgvector is unavailable (vec
+// is nil), same convention FindSimilarIncidents already uses.
+func (c *Client) FindSimilarChatQueries(ctx context.Context, namespace, service string, queryVec []float32, limit int) ([]ChatQueryEmbedding, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; always rolled back, never committed
+
+	if err := setTenantContext(ctx, tx, DefaultTenantID); err != nil {
+		return nil, fmt.Errorf("set tenant context: %w", err)
+	}
+
+	var rows *sql.Rows
+	if len(queryVec) > 0 {
+		var sb strings.Builder
+		sb.WriteByte('[')
+		for i, v := range queryVec {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(fmt.Sprintf("%g", v))
+		}
+		sb.WriteByte(']')
+		rows, err = tx.QueryContext(ctx, `
+			SELECT id, session_id, namespace, service, question, summary
+			FROM chat_query_embeddings
+			WHERE embedding IS NOT NULL
+			  AND ($1 = '' OR namespace = $1)
+			  AND ($2 = '' OR service = $2)
+			ORDER BY embedding <-> $3::vector
+			LIMIT $4`,
+			namespace, service, sb.String(), limit)
+	} else {
+		rows, err = tx.QueryContext(ctx, `
+			SELECT id, session_id, namespace, service, question, summary
+			FROM chat_query_embeddings
+			WHERE ($1 = '' OR namespace = $1)
+			  AND ($2 = '' OR service = $2)
+			ORDER BY created_at DESC
+			LIMIT $3`,
+			namespace, service, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []ChatQueryEmbedding
+	for rows.Next() {
+		var e ChatQueryEmbedding
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Namespace, &e.Service, &e.Question, &e.Summary); err != nil {
+			return nil, err
 		}
 		result = append(result, e)
 	}

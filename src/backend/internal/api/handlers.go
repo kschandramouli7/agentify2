@@ -1063,6 +1063,41 @@ func (h *Handler) logTrace(traceID, question, intent, namespace, tier, status st
 	}
 }
 
+// embedText calls the agent's /embed endpoint (Voyage AI) with a 10s
+// deadline and returns the resulting vector, or nil when the embed
+// service is unavailable/unconfigured — never an error, since every
+// caller already treats "no embedding" as a valid, degrade-gracefully
+// outcome (keyword/recency fallback), not a failure. Shared by
+// embedAndStoreIncident (P8) and the chat-query embedding flow (ROADMAP
+// P33, ADR 0044 Tier B) — same HTTP call, two different callers.
+func (h *Handler) embedText(text string) []float32 {
+	type embedResp struct {
+		Embedding []float32 `json:"embedding"`
+		Available bool      `json:"available"`
+	}
+	body, _ := json.Marshal(map[string]string{"text": text})
+	req, err := http.NewRequest("POST", h.agentClient.baseURL+"/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := h.agentClient.client.Do(req)
+	if err != nil {
+		h.logger.Info("embed unavailable", "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	var er embedResp
+	if json.NewDecoder(resp.Body).Decode(&er) != nil || !er.Available {
+		return nil
+	}
+	return er.Embedding
+}
+
 // embedAndStoreIncident calls the agent's /embed endpoint and stores the
 // resulting vector in incident_embeddings. Never blocks the query response —
 // called from a goroutine. Silently skips if the embed service is unavailable.
@@ -1101,34 +1136,7 @@ func (h *Handler) embedAndStoreIncident(rowID, traceID, namespace, service strin
 	// service name) matched nothing. With pgvector absent, semantic memory
 	// returned an empty list every time.
 
-	// Call the agent's /embed endpoint with a 10 s deadline.
-	type embedResp struct {
-		Embedding []float32 `json:"embedding"`
-		Available bool      `json:"available"`
-	}
-	body, _ := json.Marshal(map[string]string{"text": summary})
-	req, err := http.NewRequest("POST", h.agentClient.baseURL+"/embed",
-		bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	embedCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(embedCtx)
-
-	resp, err := h.agentClient.client.Do(req)
-	if err != nil {
-		h.logger.Info("embed unavailable, storing summary only", "error", err)
-	}
-	var vec []float32
-	if err == nil {
-		defer resp.Body.Close()
-		var er embedResp
-		if json.NewDecoder(resp.Body).Decode(&er) == nil && er.Available {
-			vec = er.Embedding
-		}
-	}
+	vec := h.embedText(summary)
 
 	// Persist the embedding (or just the summary when vec is nil).
 	if relational, rerr := h.orch.GetBackendFactory().GetBackend("relational"); rerr == nil {
@@ -1702,15 +1710,42 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 		history[i] = map[string]string{"role": m.Role, "content": m.Content}
 	}
 
+	chatContext := map[string]interface{}{"namespace": s.Namespace, "service": s.Service, "session_id": s.ID}
+	// ROADMAP P33 (ADR 0044), Tier B: looked up BEFORE the model call, not
+	// via a tool the model has to decide to invoke (Decision #3) — embed
+	// this turn's own question and check for a similar past RESOLVED
+	// question, scoped to this session's namespace+service (Decision #2's
+	// revision: never namespace alone). Always attempted regardless of
+	// whether this turn will end up Tier-1 or model-answered — Go has no
+	// cheap way to predict that in advance (only Python's _chat_route
+	// knows), and the cost is the same small embed call
+	// embedAndStoreIncident already treats as cheap/best-effort. A Tier-1
+	// route's own early return never reads this key, so it's simply
+	// unused, not wrong, on that path. h.orch == nil is guarded explicitly
+	// here (unlike HandleSimilarIncidents/embedAndStoreIncident's own
+	// identical calls, which assume it's always set) — this path runs on
+	// EVERY chat turn rather than only after a successful diagnose, so a
+	// nil orchestrator during startup is a more likely window to hit.
+	if h.orch != nil {
+		if relational, rerr := h.orch.GetBackendFactory().GetBackend("relational"); rerr == nil {
+			type similarChatFinder interface {
+				FindSimilarChatQueries(ctx context.Context, namespace, service string, queryVec []float32, limit int) ([]pgstore.ChatQueryEmbedding, error)
+			}
+			if finder, ok := relational.(similarChatFinder); ok {
+				if vec := h.embedText(req.Content); vec != nil {
+					if matches, ferr := finder.FindSimilarChatQueries(r.Context(), s.Namespace, s.Service, vec, 1); ferr == nil && len(matches) > 0 {
+						chatContext["similar_past_query"] = map[string]interface{}{
+							"question": matches[0].Question,
+							"summary":  matches[0].Summary,
+						}
+					}
+				}
+			}
+		}
+	}
+
 	traceID := uuid.New().String()
-	agentResp, agentErr := h.agentClient.Chat(
-		history,
-		// session_id lets the agent group a conversation's observations into one
-		// Langfuse session (P19 gap E) — conversation-level evaluation is
-		// impossible turn-by-turn.
-		map[string]interface{}{"namespace": s.Namespace, "service": s.Service, "session_id": s.ID},
-		traceID,
-	)
+	agentResp, agentErr := h.agentClient.Chat(history, chatContext, traceID)
 
 	assistantContent := "I'm sorry, I encountered an error. Please try again."
 	if agentErr != nil {
@@ -1730,13 +1765,40 @@ func (h *Handler) HandleSendChatMessage(w http.ResponseWriter, r *http.Request) 
 	// this is a no-op there). Added onto the SAME message's details under
 	// "drift" rather than a second message or a second LLM call — Decision
 	// #3's "read-only addition to the existing answer."
-	if intentVal, _ := assistantDetails["intent"].(string); intentVal != "" {
+	intentVal, _ := assistantDetails["intent"].(string)
+	if intentVal != "" {
 		scopeKey, _ := assistantDetails["scope_key"].(string)
 		if scopeKey != "" {
 			if prior, err := h.chatStore.FindPriorTier1Session(r.Context(), id, intentVal, scopeKey); err != nil {
 				h.logger.Warn("drift lookup failed", "session_id", id, "intent", intentVal, "error", err)
 			} else if diff := DiffTier1Answer(prior, intentVal, scopeKey, assistantDetails); diff != nil {
 				assistantDetails["drift"] = diff
+			}
+		}
+	} else if agentErr == nil && agentResp != nil && assistantContent != "" {
+		// ROADMAP P33 (ADR 0044), Tier B write side: only for a
+		// model-answered (non-Tier-1) turn — intentVal == "" is exactly
+		// that, the same distinction Tier A's own branch above makes.
+		// Best-effort, never blocks the response — same "goroutine,
+		// degrade silently" discipline embedAndStoreIncident already
+		// uses for P8, except this doesn't need a goroutine since the
+		// response has not been written yet and the embed call already
+		// has its own 10s deadline.
+		if h.orch != nil {
+			summary := h.redactor.RedactText(assistantContent)
+			vec := h.embedText(req.Content)
+			if relational, rerr := h.orch.GetBackendFactory().GetBackend("relational"); rerr == nil {
+				type chatEmbStorer interface {
+					UpsertChatQueryEmbedding(ctx context.Context, e pgstore.ChatQueryEmbedding) error
+				}
+				if es, ok := relational.(chatEmbStorer); ok {
+					if serr := es.UpsertChatQueryEmbedding(r.Context(), pgstore.ChatQueryEmbedding{
+						ID: uuid.New().String(), SessionID: s.ID, Namespace: s.Namespace, Service: s.Service,
+						Question: h.redactor.RedactText(req.Content), Summary: summary, Embedding: vec,
+					}); serr != nil {
+						h.logger.Warn("chat query embedding store failed", "error", serr)
+					}
+				}
 			}
 		}
 	}

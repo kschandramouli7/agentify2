@@ -3082,6 +3082,23 @@ code {
   background: var(--surface);
   border-color: var(--border-bright);
 }
+.topo-chat__expand--active {
+  color: var(--accent-light);
+  background: var(--accent-dim);
+  border-color: rgba(91,141,238,0.3);
+}
+/* Recent-conversations list (ROADMAP P33, ADR 0044) -- reuses ChatPanel's
+   own .chat-session-* classes, bounded to a scrollable strip rather than
+   the full-height sidebar those classes were originally sized for. */
+.topo-chat__history {
+  max-height: 200px;
+  overflow-y: auto;
+  flex: none;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border-bright);
+}
+.topo-chat__history .chat-session-list { padding: 6px 8px; }
+.topo-chat__history .chat-session-meta { text-transform: lowercase; }
 .topo-chat__thread {
   flex: 1;
   overflow-y: auto;

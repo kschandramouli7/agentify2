@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { createChatSession, getChatSession, sendChatMessage, type ChatSession } from "../api";
-import { Bubble } from "./ChatPanel";
+import { createChatSession, getChatSession, listChatSessions, sendChatMessage, type ChatSession } from "../api";
+import { Bubble, relTime } from "./ChatPanel";
 
 // A docked chat panel for the Dependencies view (ROADMAP P29) — same
 // interface style as the Investigate page (ChatPanel.tsx), but scoped to
@@ -32,6 +32,7 @@ export function DependencyChatPanel({
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -39,6 +40,17 @@ export function DependencyChatPanel({
     queryKey: ["dependencyChatSession", sessionId],
     queryFn: () => getChatSession(sessionId!),
     enabled: !!sessionId,
+  });
+
+  // ROADMAP P33 (ADR 0044): the tenant's 20 most recently active sessions,
+  // across every namespace -- deliberately unfiltered (resolved design
+  // question #3, spec 013). Shares ChatPanel.tsx's "chatSessions" query key
+  // so the two views don't double-fetch the same list.
+  const { data: recentSessions = [] } = useQuery<ChatSession[]>({
+    queryKey: ["chatSessions"],
+    queryFn: listChatSessions,
+    enabled: showHistory,
+    staleTime: 10_000,
   });
 
   useEffect(() => {
@@ -108,6 +120,16 @@ export function DependencyChatPanel({
         </span>
         <button
           type="button"
+          className={`topo-chat__expand${showHistory ? " topo-chat__expand--active" : ""}`}
+          onClick={() => setShowHistory(v => !v)}
+          title="Recent conversations"
+          aria-label="Recent conversations"
+          aria-expanded={showHistory}
+        >
+          ≡
+        </button>
+        <button
+          type="button"
           className="topo-chat__expand"
           onClick={openInNewTab}
           title="Open this conversation in a new tab"
@@ -116,6 +138,30 @@ export function DependencyChatPanel({
           ⤢
         </button>
       </div>
+
+      {showHistory && (
+        <div className="topo-chat__history">
+          <div className="chat-session-list">
+            {recentSessions.length === 0 && (
+              <p className="chat-empty-sessions">No conversations yet.</p>
+            )}
+            {recentSessions.map(s => (
+              <div
+                key={s.id}
+                className={`chat-session-item${s.id === sessionId ? " chat-session-item--active" : ""}`}
+                onClick={() => { setSessionId(s.id); setShowHistory(false); }}
+              >
+                <span className="chat-session-title" title={s.title || "New conversation"}>
+                  {s.title || "New conversation"}
+                </span>
+                <span className="chat-session-meta">
+                  {s.namespace || "—"} · {relTime(s.last_active)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="topo-chat__thread">
         {messages.length === 0 && (

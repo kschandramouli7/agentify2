@@ -584,6 +584,53 @@ async def test_model_path_adds_no_scope_block_when_context_is_empty():
     assert len(first_call["system"]) == 1
 
 
+@pytest.mark.asyncio
+async def test_model_path_includes_a_similar_past_query_as_an_observation_not_fact():
+    """ROADMAP P33 (ADR 0044), Tier B: HandleSendChatMessage (Go) embeds the
+    question and searches BEFORE calling the model, handing a match in as
+    context["similar_past_query"] -- never a tool the model decides whether
+    to call (Decision #3). The instruction must explicitly frame any noted
+    difference as an observation, never an assertion (spec 013's own
+    acceptance criteria)."""
+    agent = _bare_agent()
+    agent.client = _CapturingClient()
+
+    await type(agent).reason_chat(
+        agent, _user("which services here are unhealthy?"),
+        {
+            "namespace": "payments",
+            "similar_past_query": {
+                "question": "which services here are unhealthy?",
+                "summary": "payment-worker was crash-looping.",
+            },
+        },
+    )
+
+    first_call = agent.client.messages.calls[0]
+    system_text = " ".join(b["text"] for b in first_call["system"])
+    assert "payment-worker was crash-looping" in system_text
+    assert "observation" in system_text
+    assert "never assert" in system_text
+
+
+@pytest.mark.asyncio
+async def test_model_path_ignores_a_similar_past_query_with_no_summary():
+    """A malformed/empty similar_past_query (e.g. Go found nothing, or the
+    embed call failed) must add no block at all -- same "nothing to add"
+    posture as test_model_path_adds_no_scope_block_when_context_is_empty."""
+    agent = _bare_agent()
+    agent.client = _CapturingClient()
+
+    await type(agent).reason_chat(
+        agent, _user("which services here are unhealthy?"),
+        {"namespace": "payments", "similar_past_query": {"question": "x", "summary": ""}},
+    )
+
+    first_call = agent.client.messages.calls[0]
+    system_text = " ".join(b["text"] for b in first_call["system"])
+    assert "similar question" not in system_text.lower()
+
+
 # ── Word-boundary matching ────────────────────────────────────────────────────
 
 

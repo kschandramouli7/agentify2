@@ -197,3 +197,55 @@ func TestHandleSendChatMessage_NoDriftWhenAnswerIsNotTier1Tagged(t *testing.T) {
 		t.Errorf("want no drift key on a non-Tier-1 answer, got %+v", resp.Message.Details)
 	}
 }
+
+// TestHandleSendChatMessage_TierBSkipsSafelyWithoutAnOrchestrator pins the
+// bug this test file's own two tests above caught during ROADMAP P33 (ADR
+// 0044) Tier B development: both tests construct a bare *Handler with
+// h.orch left nil (the same pattern namespace_sync_test.go documents as
+// this package's convention for paths that would otherwise need a real
+// orchestrator/Postgres backend), and Tier B's embed-and-store write path
+// originally called h.orch.GetBackendFactory() unconditionally, panicking
+// on exactly this nil case. This test exercises that same nil-orchestrator,
+// model-answered (non-Tier-1, so the Tier B write branch is the one that
+// runs) shape explicitly, so a future edit that drops the "if h.orch !=
+// nil" guard fails loudly here instead of only in whichever other test
+// happens to hit it first.
+//
+// Tier B's actual embedding/retrieval correctness (UpsertChatQueryEmbedding,
+// FindSimilarChatQueries) is covered against a real embedded Postgres in
+// postgres_test.go — this test is only about the nil-orchestrator guard.
+func TestHandleSendChatMessage_TierBSkipsSafelyWithoutAnOrchestrator(t *testing.T) {
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"answer": "payment-api looks healthy.", "status": "ok", "confidence": 0.9,
+			"sources": []string{}, "tier": "tier2", "details": map[string]interface{}{},
+		})
+	}))
+	defer agent.Close()
+
+	store := &fakeChatStore{
+		session: &pgstore.ChatSession{ID: "current-session", Namespace: "payments"},
+	}
+	h := &Handler{
+		agentClient: NewAgentClient(agent.URL),
+		chatStore:   store,
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// orch deliberately left nil, redactor deliberately left nil -- the
+		// exact combination that panicked before the fix.
+	}
+
+	body := `{"content":"is payment-api healthy?"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/chat/sessions/current-session/messages", bytes.NewReader([]byte(body)))
+	req.SetPathValue("id", "current-session")
+	rec := httptest.NewRecorder()
+
+	h.HandleSendChatMessage(rec, req) // must not panic
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if store.updated == nil || len(store.updated.Messages) == 0 {
+		t.Fatal("UpdateChatSession was never called with the assistant message")
+	}
+}

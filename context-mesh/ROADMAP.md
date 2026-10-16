@@ -3150,7 +3150,7 @@ breakdown). In short, the design:
 
 ---
 
-## P33 — Dependency chat history + cross-session drift assessment (proposed 2026-10-16)
+## P33 — Dependency chat history + cross-session drift assessment (implemented 2026-10-16)
 
 **Context:** the Dependencies panel's docked chat (ROADMAP P29) ships
 without a session-list sidebar by original design, not oversight — its
@@ -3158,8 +3158,8 @@ own comment says so. Ask: surface recent conversations there, and have a
 new question flag what's changed since a past conversation assessed
 something similar, "across all users for a specific query."
 
-**Design (not yet implemented), revised 2026-10-16 after user feedback:**
-see [spec 013](specs/013-dependency-chat-history-and-drift.md) and
+**Design, revised 2026-10-16 after user feedback, implemented the same
+day:** see [spec 013](specs/013-dependency-chat-history-and-drift.md) and
 [ADR 0044](decisions/0044-dependency-chat-history-and-drift-assessment.md).
 In short:
 

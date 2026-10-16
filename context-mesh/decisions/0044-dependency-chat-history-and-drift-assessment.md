@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed   ·   (date: 2026-10-16)   ·   Revised 2026-10-16 — user feedback tightened Decision #1 (history list stays fully unfiltered, not namespace-scoped) and Decision #2 (structural-only Tier A diff, per-item timestamps, service-scoped Tier B retrieval); see Decision #4 and the Consequences updates.
+Accepted   ·   (date: 2026-10-16)   ·   Revised 2026-10-16 — user feedback tightened Decision #1 (history list stays fully unfiltered, not namespace-scoped) and Decision #2 (structural-only Tier A diff, per-item timestamps, service-scoped Tier B retrieval); see Decision #4 and the Consequences updates. Implemented 2026-10-16 — Tier B's embedding call is Go-side (`handlers.go`'s `embedText`, extracted from `embedAndStoreIncident`), not the Python module/new-endpoint shape spec 013 originally sketched; see that spec's Interfaces section for the as-built shape.
 
 ## Context
 

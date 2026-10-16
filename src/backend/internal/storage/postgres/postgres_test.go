@@ -1798,6 +1798,76 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
+	t.Run("ROADMAP P33 (ADR 0044): chat query embeddings upsert + recency fallback + namespace/service scoping", func(t *testing.T) {
+		// embedded-postgres (CI) has no pgvector, so this exercises the
+		// recency-fallback path (queryVec=nil) -- the same path
+		// FindSimilarIncidents already falls back to, and the one path
+		// that's actually testable without a real pgvector install. The
+		// vector-search branch is syntactically identical SQL, reviewed
+		// by hand against FindSimilarIncidents' own proven query shape.
+		session := &ChatSession{ID: uuid.New().String(), Namespace: "payments", ExpiresAt: time.Now().Add(24 * time.Hour)}
+		if err := client.CreateChatSession(ctx, session); err != nil {
+			t.Fatalf("create chat session: %v", err)
+		}
+
+		mk := func(id, namespace, service, question string) ChatQueryEmbedding {
+			return ChatQueryEmbedding{
+				ID: id, SessionID: session.ID, Namespace: namespace, Service: service,
+				Question: question, Summary: "answer for: " + question,
+			}
+		}
+		if err := client.UpsertChatQueryEmbedding(ctx, mk(uuid.New().String(), "payments", "checkout-api", "what does checkout-api depend on?")); err != nil {
+			t.Fatalf("upsert checkout-api embedding: %v", err)
+		}
+		if err := client.UpsertChatQueryEmbedding(ctx, mk(uuid.New().String(), "payments", "checkout-ui", "is checkout-ui healthy?")); err != nil {
+			t.Fatalf("upsert checkout-ui embedding: %v", err)
+		}
+		// Same namespace, DIFFERENT service -- must never surface for a
+		// checkout-api-scoped search (ADR 0044 Decision #2's revision:
+		// scoped by namespace AND service, not namespace alone).
+		matches, err := client.FindSimilarChatQueries(ctx, "payments", "checkout-api", nil, 5)
+		if err != nil {
+			t.Fatalf("find similar (checkout-api): %v", err)
+		}
+		if len(matches) != 1 || matches[0].Service != "checkout-api" {
+			t.Fatalf("want only the checkout-api row, got %+v", matches)
+		}
+		if matches[0].Summary != "answer for: what does checkout-api depend on?" {
+			t.Errorf("unexpected summary: %q", matches[0].Summary)
+		}
+
+		// No service filter (empty string) -- both rows in the namespace match.
+		both, err := client.FindSimilarChatQueries(ctx, "payments", "", nil, 5)
+		if err != nil {
+			t.Fatalf("find similar (namespace only): %v", err)
+		}
+		if len(both) != 2 {
+			t.Fatalf("want both rows with no service filter, got %+v", both)
+		}
+
+		none, err := client.FindSimilarChatQueries(ctx, "payments", "nonexistent-service", nil, 5)
+		if err != nil {
+			t.Fatalf("find similar (no match): %v", err)
+		}
+		if len(none) != 0 {
+			t.Fatalf("want no matches for an unseen service, got %+v", none)
+		}
+
+		// Upsert with the SAME id updates in place (question/summary), same
+		// convention InsertIncidentEmbedding's own ON CONFLICT already uses.
+		dup := mk(matches[0].ID, "payments", "checkout-api", "what does checkout-api call now?")
+		if err := client.UpsertChatQueryEmbedding(ctx, dup); err != nil {
+			t.Fatalf("re-upsert same id: %v", err)
+		}
+		updated, err := client.FindSimilarChatQueries(ctx, "payments", "checkout-api", nil, 5)
+		if err != nil {
+			t.Fatalf("find similar after re-upsert: %v", err)
+		}
+		if len(updated) != 1 || updated[0].Question != "what does checkout-api call now?" {
+			t.Fatalf("want the re-upserted question to replace the old one, got %+v", updated)
+		}
+	})
+
 	t.Run("ROADMAP P32 (ADR 0043): service labels upsert + lookup, last-observed-wins", func(t *testing.T) {
 		tenantID := uuid.New().String()
 
