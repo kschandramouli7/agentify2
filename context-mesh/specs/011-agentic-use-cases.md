@@ -4,6 +4,21 @@
 > two-tier architecture, skill pattern, and semantic memory. Each use case
 > is self-contained and can be shipped independently.
 
+> **⚠️ Correction (2026-10-18), found during a documentation audit:** Use
+> Cases 1 and 2 below have since shipped (`IncidentResponderSkill`,
+> `DeploymentGuardianSkill`, `action_executor.py`/`remediation_executor.py`
+> — see `src/agent/k8fy/skills/`), but **not** with the design this spec
+> describes. [ADR 0020](../decisions/0020-phase-3-remediation-with-approval-gate.md)
+> explicitly **rejected** Use Case 2's "confidence > 0.9 → auto-rollback,
+> no human review" flow (see its "Rejected alternatives") and shipped a
+> mandatory human-approval gate (`checkRemediationAuth`) for every
+> remediation action at every confidence level instead — no auto-execute
+> path exists at all. The flows below are kept as the original proposal for
+> historical context; **ADR 0020 is the current source of truth for what
+> actually runs.** Use Cases 3–5 remain unimplemented (no matching code
+> found for `CapacityIntelligenceSkill`/`KnowledgeBuilderSkill`/
+> `PRReviewSkill`), consistent with their "proposed" status below.
+
 ---
 
 ## Use Case 1 — Autonomous Incident Responder
@@ -88,8 +103,9 @@ DeploymentGuardianAgent triggered (webhook or poll)
         │
         └── DEGRADATION detected
                 │
-                ├── confidence > 0.9  → auto-rollback + report
-                └── confidence < 0.9  → human alert with recommendation
+                ├── confidence > 0.9  → auto-rollback + report   # NOT what shipped — see the
+                └── confidence < 0.9  → human alert with recommendation  # ⚠️ banner above; ADR 0020
+                                                                          # requires human approval always
 ```
 
 ### Why it's agentic

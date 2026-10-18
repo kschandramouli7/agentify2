@@ -45,10 +45,13 @@ The agent integration connects the backend's query orchestrator to Claude AI for
 - Dispatches each intent to the narrowest skill sub-agent (spec 010)
 - O(1) dispatch table — intent is pre-classified by Go; no classification cost here
 - Falls back to the full `K8fyAgent` for unrecognised intents
-- Registers 9 skills today (`health_check`, `cert_check`, `diagnose`,
-  `change_history`, `metrics_history`, `vault_cert`/`renew_cert`,
-  `incident_respond`, `execute_remediation`, `deploy_guardian_check`) —
-  `router.py` is the source of truth for the current list.
+- Registers 13 dispatch entries / 12 distinct skill classes today
+  (`health_check`, `cert_check`, `diagnose`, `change_history`,
+  `metrics_history`, `vault_cert`/`renew_cert` [share `VaultCertSkill`],
+  `incident_respond`, `execute_remediation`, `deploy_guardian_check`,
+  `dependencies` [ROADMAP P18 #2], `cold_services` [ADR 0038],
+  `label_scoped_dependencies` [ADR 0043]) — `router.py` is the source of
+  truth for the current list.
 
 ### Skills (core K8s observability path)
 
@@ -250,9 +253,10 @@ The system currently recognises these intents:
 | `metrics_query` | "metric", "cpu", "memory", "usage" | `K8fyAgent` (fallback) | All tools |
 | `general_query` | (default) | `K8fyAgent` (fallback) | All tools |
 
-`vault_cert`/`renew_cert`, `incident_respond`, `execute_remediation`, and
-`deploy_guardian_check` route to their own skills too — see `router.py` and
-`inferIntent()` for the current full list.
+`vault_cert`/`renew_cert`, `incident_respond`, `execute_remediation`,
+`deploy_guardian_check`, `dependencies`, `cold_services`, and
+`label_scoped_dependencies` route to their own skills too — see `router.py`
+and `inferIntent()` for the current full list.
 
 ## Tools
 

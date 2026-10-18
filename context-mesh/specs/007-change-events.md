@@ -64,8 +64,12 @@ appear in the agent's initial data; the tool widens the window on demand.
 
 ## Acceptance criteria
 
-- [ ] A deployment revision change produces one append-only `deploy` event (not latest-wins).
-- [ ] `get_change_history` returns deploy events filtered by deployment/service + window.
-- [ ] Given a deploy shortly before a restart climb, the diagnosis names it as a
+> Checked 2026-10-18. `get_change_history` is implemented and tested
+> (`src/agent/tests/test_change_history.py`, `ChangeHistorySkill`,
+> `handlers.go`). Shipped and tested; simply never checked off.
+
+- [x] A deployment revision change produces one append-only `deploy` event (not latest-wins).
+- [x] `get_change_history` returns deploy events filtered by deployment/service + window.
+- [x] Given a deploy shortly before a restart climb, the diagnosis names it as a
       **candidate** trigger ("likely / to confirm"), not a certainty.
-- [ ] Given no deploy events, no trigger is fabricated.
+- [x] Given no deploy events, no trigger is fabricated.

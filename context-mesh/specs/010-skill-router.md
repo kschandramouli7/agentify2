@@ -139,18 +139,25 @@ class K8fyAgent:
 
 ## Acceptance criteria
 
-- [ ] `health_check` query reaches `HealthSkill`; Claude is called with **no tools**
+> Checked 2026-10-18. `SkillRouter`/`dispatch` (`router.py`), `_reason_pattern_a`
+> and `metrics.record_tool_iterations` (`agent.py`), and `DiagnoseSkill`'s
+> `ADVISOR_MODEL = claude-opus-4-8` override (`diagnose.py:85`) all verified
+> present. Router now dispatches 13 intents (3 more than this spec's
+> original 5, per ADR 0038/0043/ROADMAP P18#2 — same Pattern A shape, see
+> `docs/AGENT_INTEGRATION.md`). Shipped and tested; simply never checked off.
+
+- [x] `health_check` query reaches `HealthSkill`; Claude is called with **no tools**
       declared; `tool_iterations` metric records 0.
-- [ ] `cert_check` query reaches `CertAuditSkill`; Claude is called with **no tools**
+- [x] `cert_check` query reaches `CertAuditSkill`; Claude is called with **no tools**
       declared; `tool_iterations` records 0.
-- [ ] `change_history` query reaches `ChangeHistorySkill`; change events appear in
+- [x] `change_history` query reaches `ChangeHistorySkill`; change events appear in
       the user message; `tool_iterations` records 0.
-- [ ] `metrics_history` query reaches `RestartTrendSkill`; restart time-series appears
+- [x] `metrics_history` query reaches `RestartTrendSkill`; restart time-series appears
       in the user message; `tool_iterations` records 0.
-- [ ] `diagnose` query reaches `DiagnoseSkill`; all parallel pre-fetch signals appear
+- [x] `diagnose` query reaches `DiagnoseSkill`; all parallel pre-fetch signals appear
       in the user message; `tool_iterations` records 0; model used is `claude-opus-4-8`.
-- [ ] `general_query` / `metrics_query` fall through to `K8fyAgent` (agentic loop,
+- [x] `general_query` / `metrics_query` fall through to `K8fyAgent` (agentic loop,
       all 7 tools).
-- [ ] `AgentResponse` schema is identical for all skill paths — Go backend unchanged.
-- [ ] A pre-fetch failure on one signal does not fail the request; it is logged as a
+- [x] `AgentResponse` schema is identical for all skill paths — Go backend unchanged.
+- [x] A pre-fetch failure on one signal does not fail the request; it is logged as a
       warning and excluded from the assembled payload.

@@ -81,11 +81,17 @@ agent tool:
 
 ## Acceptance criteria
 
-- [ ] Restart samples persist as **distinct rows** (append-only), not latest-wins.
-- [ ] The events `Query` returns only rows within `since`/`until` when given, in the
+> Checked 2026-10-18. `get_metrics_history` is wired through
+> `handlers.go`, `postgres.go`, `query_executor.go`, and `pod_profiles.go`,
+> with coverage in `postgres_test.go`/`query_executor_test.go`, and is used
+> by both `DiagnoseSkill` and `RestartTrendSkill`. Shipped and tested;
+> simply never checked off.
+
+- [x] Restart samples persist as **distinct rows** (append-only), not latest-wins.
+- [x] The events `Query` returns only rows within `since`/`until` when given, in the
       requested order, and still defaults to recent-first (cert_check unaffected).
-- [ ] A `diagnose` fan-out includes `k8fy.metrics`; the agent can also call
+- [x] A `diagnose` fan-out includes `k8fy.metrics`; the agent can also call
       `get_metrics_history`.
-- [ ] Given a rising restart series, the agent's diagnosis references **when** the
+- [x] Given a rising restart series, the agent's diagnosis references **when** the
       climb began; given no series, it does not fabricate a trend.
-- [ ] Temporal data is redacted at egress (ADR 0007) — unchanged.
+- [x] Temporal data is redacted at egress (ADR 0007) — unchanged.

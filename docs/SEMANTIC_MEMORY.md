@@ -10,6 +10,16 @@ it is actually working, which for most of its life it was not.
 > for [ROADMAP P19](../context-mesh/ROADMAP.md): chat is never embedded, and
 > per-turn evidence is not in the index. P19 reads `traces` and Langfuse
 > observations instead.
+>
+> **A sibling table does embed chat, for a different, narrower purpose:**
+> `chat_query_embeddings` (2026-10-18, [ADR
+> 0044](../context-mesh/decisions/0044-dependency-chat-history-and-drift-assessment.md))
+> stores one row per resolved free-form question in the Dependencies panel's
+> chat, scoped by namespace+service, so a later similar question there can
+> see what a past one found. Same Voyage→pgvector mechanism as below, same
+> Postgres instance, but a separate table — this doc's "chat is never
+> embedded" claim is specifically about *this* table and skill, not the
+> whole product.
 
 ## Is Voyage AI just an embedding API?
 

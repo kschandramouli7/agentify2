@@ -3,6 +3,18 @@
 > Example/starter spec — the natural first feature: get events *into* the mesh
 > before worrying about routing them perfectly. Edit freely or delete.
 
+> **Status note (2026-10-18), found during a documentation audit:** the
+> feature this sketches shipped long ago (`HandleIngestEvent`, `POST
+> /api/ingest`, `src/backend/internal/api/handlers.go`) and is a cited
+> dependency of specs 002/003, but — unlike [spec
+> 003](003-tier1-deterministic-queries.md), which says outright "written
+> post-implementation to pin the contract" — this one was never revisited
+> against what actually got built. The real, current ingestion contract
+> (per-source push over plain HTTP, not a generic `ingest(event)` pod-mesh
+> call) is better read from ADR 0022/0027 and `docs/HUB_DATA_PATH.md` than
+> from this spec's Interfaces section below, which is left as the original
+> starter sketch rather than rewritten to match.
+
 ## Goal
 
 Accept a streamed data event, decide where to store it, and write it to the

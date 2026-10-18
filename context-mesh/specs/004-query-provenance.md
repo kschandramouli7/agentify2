@@ -64,7 +64,13 @@ log: "query.trace" { trace_id, question, intent, namespace, tier, status, confid
 
 ## Acceptance criteria
 
-- [ ] Every `/api/query` response carries a non-empty `trace_id`.
-- [ ] A `query.trace` log per query includes tier, sources, status, confidence, latency.
-- [ ] The agent receives and logs the same `trace_id` (cross-service correlation).
-- [ ] Tier-2 traces list the tool calls the agent made.
+> Checked 2026-10-18. `handlers.go:1004-1005` logs `"query.trace"` with
+> `trace_id` on every query; `trace_id` threads through `types.go`,
+> `agent.py`, and the dedicated `trace_search.py` feature built on top of
+> it, with coverage in `test_chat_trace.py`/`test_trace_search.py`. Shipped
+> and tested; these were simply never checked off.
+
+- [x] Every `/api/query` response carries a non-empty `trace_id`.
+- [x] A `query.trace` log per query includes tier, sources, status, confidence, latency.
+- [x] The agent receives and logs the same `trace_id` (cross-service correlation).
+- [x] Tier-2 traces list the tool calls the agent made.

@@ -10,7 +10,7 @@
 ## Working agreement (for Claude)
 
 1. **Before implementing a feature**, read its spec in `context-mesh/specs/` and any policy it depends on under `context-mesh/policies/`.
-2. **Before changing storage, routing, or pod behavior**, read the four core policies (see below). These are the product's brain — do not silently deviate from them.
+2. **Before changing storage, routing, or pod behavior**, read the five core policies (see below). These are the product's brain — do not silently deviate from them.
 3. **When you make a hard-to-reverse or non-obvious decision**, write an ADR in `context-mesh/decisions/` (use the `_TEMPLATE.md`).
 4. **Specs and policies are the source of truth.** If code and spec disagree, surface it — don't quietly "fix" one to match the other.
 5. Prefer English-first: refine the spec/policy, then generate code from it.
@@ -23,6 +23,7 @@
 | [pod-formation](context-mesh/policies/pod-formation.md) | When does a pod get born / split / merge / retire? |
 | [refinement-loop](context-mesh/policies/refinement-loop.md) | How does query feedback reshape storage over time? |
 | [correlation](context-mesh/policies/correlation.md) | How do we fan out & correlate across multiple pods? |
+| [data-governance](context-mesh/policies/data-governance.md) | What data is allowed to leave our boundary to an external model, and how is it minimized? |
 
 Routing logic lives in [_orchestrator.md](context-mesh/_orchestrator.md).
 Domain terms live in [glossary.md](context-mesh/glossary.md).
@@ -36,17 +37,29 @@ Domain terms live in [glossary.md](context-mesh/glossary.md).
 - **Frontend (Ops + Admin UI):** TypeScript + React 18+, Vite build tool
 
 **Data & Storage:**
-- **Relational:** AWS RDS PostgreSQL (Multi-AZ for production)
-- **Key-Value:** AWS ElastiCache Redis (single-node MVP, cluster for scale)
-- **Vector:** Pinecone (SaaS) or Weaviate (self-hosted for enterprise)
-- **Time-Series:** Prometheus (local) or managed Time-Series DB (AWS)
-- **Logs/Search:** Loki or Elasticsearch
-- **Configuration:** AWS DynamoDB (low-latency metadata)
+- **Relational, Key-Value, and Vector:** a single AWS RDS PostgreSQL instance
+  backs all three (Multi-AZ for production) — `current_state` (KV,
+  latest-wins), `events` (relational, append-only), and pgvector for
+  semantic search (`incident_embeddings`, `chat_query_embeddings`). Redis,
+  Pinecone, and Weaviate were the original MVP plan; [ADR
+  0010](context-mesh/decisions/0010-postgres-single-store.md) consolidated
+  onto Postgres before any of the three were actually adopted — none is
+  live today.
+- **Time-Series / Logs:** also realized in the same Postgres `events` table
+  ([ADR 0013](context-mesh/decisions/0013-temporal-data-in-postgres-events-table.md))
+  — aliased store types, not separate engines. One narrow exception: a
+  test-scoped OpenSearch domain for the P15 log-connector test harness
+  ([ADR 0021](context-mesh/decisions/0021-log-platform-test-infra.md)), not
+  a production log store.
+- **Configuration:** AWS DynamoDB (pod registry, profiles, thresholds)
 - **Secrets:** AWS Secrets Manager
 - **Object Storage:** AWS S3 (pod-registry backups, cold data)
 
 **Deployment & Infrastructure:**
-- **Orchestration:** AWS ECS Fargate (no EC2 management)
+- **Orchestration:** AWS EKS — one cluster; backend, agent, and the
+  per-fleet-cluster Discovery collectors all run on it as Deployments. [ADR
+  0017](context-mesh/decisions/0017-all-on-eks-topology.md) superseded the
+  original ECS Fargate choice below. Frontend stays on S3 + CloudFront.
 - **Load Balancing:** AWS Application Load Balancer (ALB)
 - **Monitoring:** AWS CloudWatch (Logs, Metrics, Alarms) + X-Ray (optional)
 - **IaC:** Terraform for AWS resource definitions
@@ -54,16 +67,23 @@ Domain terms live in [glossary.md](context-mesh/glossary.md).
 - **API:** REST + WebSocket (for real-time chat)
 
 **Key Dependencies:**
-- **Go:** `gorilla/websocket`, `aws-sdk-go-v2`, `pq` (PostgreSQL driver)
-- **Python:** `fastapi`, `anthropic` (Claude SDK), `pydantic`, `boto3` (AWS SDK), `redis`, `sqlalchemy`
-- **React:** `@tanstack/react-query`, `zustand` (state mgmt), `shadcn/ui` (components)
+- **Go:** `gorilla/websocket`, `aws-sdk-go-v2`, `lib/pq` (PostgreSQL driver)
+- **Python:** `fastapi`, `anthropic` (Claude SDK), `pydantic`, `boto3` (AWS
+  SDK). `redis` and `sqlalchemy` are still in `requirements.txt` from the
+  original design but are not imported anywhere in the agent today —
+  vestigial, not a live dependency.
+- **React:** `@tanstack/react-query` only — no state-management library or
+  component kit has been adopted; components are hand-rolled with plain CSS.
 
 **Third-party APIs:**
 - Anthropic Claude API (with prompt caching for cost savings)
 - Kubernetes API (via `client-go` or Python `kubernetes` library)
 - AWS APIs (via SDK)
 
-See [ADR 0004](context-mesh/decisions/0004-tech-stack-polyglot-go-python-typescript.md) for rationale and scaling strategies.
+See [ADR 0004](context-mesh/decisions/0004-tech-stack-polyglot-go-python-typescript.md)
+for the original polyglot-language rationale (still accurate) and [ADR
+0017](context-mesh/decisions/0017-all-on-eks-topology.md) for the EKS
+placement that superseded ADR 0004's ECS Fargate choice.
 
 ## Conventions
 

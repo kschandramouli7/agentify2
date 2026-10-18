@@ -92,8 +92,13 @@ These are defaults; can be overridden per-namespace or service (future work).
 
 ## The renewal rule (knowledge, not data)
 
-- Default: **renew if a cert expires within 30 days** (make this configurable).
-- _<Open: is this a global rule, per-service override, or learned from past renewals?>_
+- Default: **renew if a cert expires within 30 days**.
+- **Resolved, as of [spec 003](003-tier1-deterministic-queries.md)'s
+  implementation:** shipped as a single global constant in
+  `internal/orchestrator/evaluator`'s `CertRenewal`, not a per-service
+  override or a learned value. Whether it should become either of those is
+  still open — moved to Open Questions below instead of left as an inline
+  placeholder once the v1 answer was settled.
 
 ## Behavior
 
@@ -113,18 +118,25 @@ ask(question, context) -> Answer { text, sources: [pod_id], freshness, confidenc
 ## Open questions
 
 - [ ] Should thresholds (3 restarts in 1h, 75% endpoint Ready) be configurable per-namespace or global-only for v1?
+- [ ] Should the 30-day cert-renewal threshold become per-service/configurable, or learned from past renewals? (v1 shipped as one global constant — see "The renewal rule" above.)
 - [ ] When an endpoint is in transition (Ready → NotReady), which do we report?
-- [ ] Read-only now — when do we add *actions* (renew/restart) and how is that gated? (See ADR 0003, TBD)
-- [ ] Single cluster v1 → how does multi-cluster change pod partitioning?
+- [x] Read-only now — when do we add *actions* (renew/restart) and how is that gated? Resolved: [ADR 0003](../decisions/0003-read-only-to-actions-boundary.md) + its 2026-10-18 amendment, and [ADR 0020](../decisions/0020-phase-3-remediation-with-approval-gate.md) — cert renewal is live (`VaultCertSkill._renew()`), other actions require human approval.
+- [x] Single cluster v1 → how does multi-cluster change pod partitioning? Resolved: [ADR 0024](../decisions/0024-ingested-data-cluster-scoping.md) — an optional `cluster_id` segment in the pod ID (`models.PodID`), not a repartition.
 
 ## Acceptance criteria
 
+> Checked 2026-10-18 against `internal/orchestrator/evaluator/{evaluator.go,evaluator_test.go}`.
+> Items 2/3/4/6 have direct unit-test evidence (`TestPodHealth`,
+> `TestServiceStatus`, `TestCertRenewal`). Items 1/5/7/8 are live-query/
+> handler-level properties this test file doesn't exercise — left
+> unchecked pending that verification, rather than assumed.
+
 - [ ] Health query for a known service returns current status (Healthy | Degraded | Unhealthy) with ≤ few-seconds freshness.
-- [ ] Pod-level health is determined by Phase + Ready condition + restart count; service-level by endpoint count/readiness.
-- [ ] Restart count is measured over the last 1h; >= 3 → degraded.
-- [ ] Endpoint thresholds: Healthy if >= 1 and >= 75% Ready; Degraded if >= 1 but < 75%; Unhealthy if 0 or all NotReady.
+- [x] Pod-level health is determined by Phase + Ready condition + restart count; service-level by endpoint count/readiness. (`TestPodHealth`, `TestServiceStatus`)
+- [x] Restart count is measured over the last 1h; >= 3 → degraded. (`TestPodHealth`'s "too-many-restarts" case)
+- [x] Endpoint thresholds: Healthy if >= 1 and >= 75% Ready; Degraded if >= 1 but < 75%; Unhealthy if 0 or all NotReady. (`TestServiceStatus`)
 - [ ] Cert query can both look up one service and list "expiring within N days".
-- [ ] "Should we renew?" applies the 30-day renewal threshold and explains its reasoning.
+- [x] "Should we renew?" applies the 30-day renewal threshold and explains its reasoning. (`TestCertRenewal`)
 - [ ] When the K8s API is down, the answer states that instead of guessing.
 - [ ] Every answer cites which pod(s) it came from (e.g. "`k8fy.live-state` shard for namespace X").
 

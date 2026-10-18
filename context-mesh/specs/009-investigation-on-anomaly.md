@@ -67,8 +67,13 @@ webhook payload: { "text": "<formatted: severity, ns, reasons, cause, actions, s
 
 ## Acceptance criteria
 
-- [ ] Disabled by default; no webhook URL ⇒ no-op.
-- [ ] One alert per incident (no repeat while still anomalous); a resolve note on recovery.
-- [ ] Per-sweep cap enforced; deferrals logged, not dropped silently.
-- [ ] Outbound summary passes the egress scrubber; no action is ever taken (ADR 0003).
-- [ ] The open/close/cooldown decision is a pure function with unit tests.
+> Checked 2026-10-18. `internal/api/investigator.go` has `sweep()` and the
+> pure `decideActions()` function; `investigator_test.go` has
+> `TestDecideActions`, `TestInvestigateAndNotify`, `TestFormatAlertText`.
+> Shipped and tested; simply never checked off.
+
+- [x] Disabled by default; no webhook URL ⇒ no-op.
+- [x] One alert per incident (no repeat while still anomalous); a resolve note on recovery.
+- [x] Per-sweep cap enforced; deferrals logged, not dropped silently.
+- [x] Outbound summary passes the egress scrubber; no action is ever taken (ADR 0003).
+- [x] The open/close/cooldown decision is a pure function with unit tests.

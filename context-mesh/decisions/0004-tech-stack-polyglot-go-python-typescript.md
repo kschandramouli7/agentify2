@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted   ·   2026-05-30
+Accepted   ·   2026-05-30   ·   **Placement superseded 2026-06-06 by [ADR
+0017](0017-all-on-eks-topology.md)** — the ECS Fargate orchestration choice
+below is no longer current; backend, agent, and adapters all run on a
+single EKS cluster today. The polyglot *language* choice (Go/Python/
+TypeScript) made in this ADR is unaffected and still stands.
 
 ## Context
 

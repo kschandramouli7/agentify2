@@ -34,9 +34,10 @@ Relevant constraints discovered while scoping this:
 - **`/api/query` is unauthenticated.** `QueryRequest` is `{question, context}`
   and no bearer check runs on it (`internal/api/router.go`).
 - **A `/admin/` prefix grants nothing.** Every route — `/admin/*` included —
-  does pass through one global middleware (`NewMiddleware`, wired at
-  `internal/api/router.go:122`), but it does request logging and Prometheus
-  metrics only, and carries an explicit `// TODO: add auth middleware`. There is
+  does pass through one global middleware (`NewMiddleware`, wired in
+  `internal/api/router.go`; the function itself and its explicit `// TODO:
+  add auth middleware` comment live in `internal/api/middleware.go`), but
+  it does request logging and Prometheus metrics only. There is
   no authentication at the middleware or route layer anywhere. The only
   authenticated surfaces do an explicit in-handler bearer check:
   `checkRemediationAuth` (ADR 0020) and the collector token. Auth here must

@@ -415,7 +415,7 @@ agentify Investigate / K8s Observability
 most damaging gap in the portfolio. The feedback explicitly praised evaluation pipeline
 work. Agentify has no eval code — only a roadmap line. This must be fixed first.
 
-**Prerequisite met:** All five skills are on Pattern A (ADR 0017). The infrastructure
+**Prerequisite met:** All five skills are on Pattern A (ADR 0026). The infrastructure
 is in place (Langfuse wired, `trace_id` returned, `query.trace` logged). The missing
 piece is the test dataset and CI step.
 

@@ -79,9 +79,15 @@ agent structured output (additions): {
 
 ## Acceptance criteria
 
-- [ ] Diagnostic phrasing routes to `diagnose` (Tier-2 fan-out), not Tier-1.
-- [ ] Given multi-signal data, the agent's answer names the active incident, the
+> Checked 2026-10-18. `src/agent/models/response.py` has `findings`,
+> `likely_cause`, `severity`, `recommendations` exactly as specified.
+> `diagnose` intent and the fan-out logic are live and relied on by later
+> specs (006/007/008/010) as already-working infrastructure. Shipped;
+> simply never checked off.
+
+- [x] Diagnostic phrasing routes to `diagnose` (Tier-2 fan-out), not Tier-1.
+- [x] Given multi-signal data, the agent's answer names the active incident, the
       latent risk(s), a likely cause, and a prioritized action order.
-- [ ] With only one signal present, it diagnoses that signal and does not fabricate
+- [x] With only one signal present, it diagnoses that signal and does not fabricate
       a cause for absent signals.
-- [ ] Multi-signal data is redacted before egress (ADR 0007) — unchanged.
+- [x] Multi-signal data is redacted before egress (ADR 0007) — unchanged.

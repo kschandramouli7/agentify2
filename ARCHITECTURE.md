@@ -164,12 +164,16 @@ and of every deterministic skill since.
              │
     ┌────────▼──────────────────────────────────────────┐
     │  Storage Layer (Managed AWS services)             │
-    │  ┌──────────────┬──────────┬──────────────────┐  │
-    │  │ RDS Postgres │ Redis KV │ Pinecone Vector │  │
-    │  ├──────────────┼──────────┼──────────────────┤  │
-    │  │ DynamoDB     │ S3       │ Secrets Manager  │  │
-    │  └──────────────┴──────────┴──────────────────┘  │
+    │  ┌───────────────────────────┬──────────────────┐  │
+    │  │ RDS Postgres + pgvector  │ DynamoDB         │  │
+    │  │ (relational + KV + vec,  │ (pod registry,   │  │
+    │  │  single store — ADR 0010)│  profiles)        │  │
+    │  ├───────────────────────────┼──────────────────┤  │
+    │  │ S3                        │ Secrets Manager  │  │
+    │  └───────────────────────────┴──────────────────┘  │
     └───────────────────────────────────────────────────┘
+    (Redis, Pinecone, Weaviate were the original plan below in sections
+    4/8 — never adopted; ADR 0010 consolidated onto one Postgres first.)
              │
     ┌────────▼──────────────────────────────────────────┐
     │  Refinement Loop (observer + decision engine)     │
@@ -188,145 +192,108 @@ and of every deterministic skill since.
 
 ## 2. Code structure (`src/` folder layout)
 
+> **Note (2026-10-18):** this section was the original day-one sketch and
+> had drifted significantly out of date — wrong storage subdirectories,
+> missing packages, and a whole ingestion pipeline (`adapters/k8fy/`) that
+> was deleted in commit `fe2aee4a` (ADR 0027). Rewritten below to match the
+> actual tree. Section 0 above was already accurate; this just catches
+> section 2 up to it.
+
 ```
 src/
 ├── backend/                        # Go application
 │   ├── cmd/
-│   │   └── agentify/
-│   │       └── main.go            # entry point
+│   │   ├── agentify/main.go              # entry point
+│   │   └── migrate-integration-tokens/   # one-time token migration (ADR 0025)
 │   ├── internal/
-│   │   ├── api/                   # HTTP handlers
-│   │   │   ├── handlers.go        # /query, /admin/*, /chat
-│   │   │   ├── middleware.go      # auth, rate-limit, logging
-│   │   │   └── websocket.go       # chat WebSocket handler
-│   │   ├── orchestrator/          # core routing + pod management
-│   │   │   ├── router.go          # route query → pod(s)
-│   │   │   ├── correlator.go      # fan-out + combine results
-│   │   │   ├── registry.go        # pod-registry management
-│   │   │   └── cache.go           # query result caching
-│   │   ├── models/                # domain models (shared with other services)
-│   │   │   ├── pod.go
-│   │   │   ├── event.go
-│   │   │   ├── query.go
-│   │   │   └── k8fy/
-│   │   │       ├── service.go
-│   │   │       ├── pod.go
-│   │   │       ├── health.go
-│   │   │       └── certificate.go
-│   │   ├── storage/               # pod connectors
-│   │   │   ├── relational/        # Postgres
-│   │   │   ├── kv/                # Redis
-│   │   │   ├── vector/            # Pinecone
-│   │   │   ├── timeseries/        # Prometheus/TSDB
-│   │   │   └── logs/              # Elasticsearch/Loki
-│   │   ├── config/                # configuration
-│   │   │   ├── env.go
-│   │   │   ├── pod_profiles.go    # event profiles from context-mesh
-│   │   │   └── aws.go             # AWS SDK setup
-│   │   └── telemetry/             # observability
-│   │       ├── logger.go
-│   │       ├── metrics.go
-│   │       └── tracer.go
+│   │   ├── api/                    # HTTP handlers + fleet/chat/remediation logic
+│   │   │   ├── handlers.go         # most endpoint handlers (/api/query, /api/chat/*, admin/*)
+│   │   │   ├── router.go           # route registration (paths/methods)
+│   │   │   ├── middleware.go       # request logging + metrics (no auth yet — TODO in code)
+│   │   │   ├── websocket.go        # chat WebSocket handler
+│   │   │   ├── agent_client.go     # HTTP client to the Python agent service
+│   │   │   ├── collector_hub.go    # Discovery connection registry + live-fetch relay (ADR 0022)
+│   │   │   ├── investigator.go     # proactive investigation sweep (spec 009)
+│   │   │   ├── remediation.go / deployment_guardian.go / security_engagements.go
+│   │   │   ├── dependency_chat_diff.go   # Tier A drift diff (ADR 0044)
+│   │   │   ├── eval_query.go       # POST /admin/eval/query (ADR 0030)
+│   │   │   └── types.go            # shared interfaces (ChatStore, etc.)
+│   │   ├── orchestrator/           # query routing + tier selection
+│   │   │   ├── router.go           # Router: pod registry + backend factory
+│   │   │   ├── query_executor.go   # fetch data for a routed query
+│   │   │   ├── config.go
+│   │   │   └── evaluator/          # Tier-1 deterministic rules (PodHealth/ServiceStatus/CertRenewal — spec 003)
+│   │   ├── models/                 # domain models
+│   │   │   ├── pod.go, event.go, integration.go
+│   │   │   └── shard.go            # models.PodID — cluster-aware pod-ID shape (ADR 0024)
+│   │   ├── storage/
+│   │   │   ├── postgres/           # postgres.go — THE store: backs relational + KV + pgvector (ADR 0010)
+│   │   │   ├── registry/           # pod-registry cache fronting DynamoDB (ADR 0012)
+│   │   │   └── vector/             # weaviate.go — written, never wired up; "vector" store type is
+│   │   │                           # unprovisioned by design (storage/backend.go says so explicitly)
+│   │   ├── config/                 # env.go, pod_profiles.go (event profiles from context-mesh)
+│   │   ├── governance/             # Redactor — egress allowlist/denylist (ADR 0007)
+│   │   ├── ingestion/               # Ingester — event → pod routing (spec 001)
+│   │   ├── retention/               # Janitor — events/buckets/callers retention sweeps
+│   │   ├── secrets/                 # Secrets Manager wrapper (ADR 0025)
+│   │   └── telemetry/               # metrics.go — Prometheus counters (ADR 0011)
 │   ├── go.mod
 │   └── go.sum
 │
-├── agent/                         # Python application (FastAPI)
-│   ├── main.py                    # entry point
-│   ├── app.py                     # FastAPI app setup + /reason endpoint
-│   ├── metrics.py                 # Prometheus token-usage metrics (ADR 0011)
+├── agent/                          # Python application (FastAPI, :8001)
+│   ├── main.py, app.py             # entry point + /reason, /reason-chat, /embed endpoints
+│   ├── metrics.py                  # Prometheus token-usage metrics (ADR 0011)
 │   ├── k8fy/
-│   │   ├── agent.py               # K8fyAgent: base + _reason_pattern_a() + _fetch()
-│   │   ├── prompt_manager.py      # Langfuse-first prompt fetcher; local fallback
-│   │   ├── prompts.py             # local fallback strings (source of truth when Langfuse absent)
-│   │   ├── tools.py               # 7 Claude tool definitions
-│   │   └── skills/                # spec 010 — Pattern A skill router (ADR 0017)
-│   │       ├── router.py          # SkillRouter: intent → skill dispatch table
-│   │       ├── health_check.py    # HealthSkill — pre-fetch service_health + pod_events
-│   │       ├── cert_audit.py      # CertAuditSkill — pre-fetch certificates
-│   │       ├── change_history.py  # ChangeHistorySkill — pre-fetch change_history
-│   │       ├── restart_trend.py   # RestartTrendSkill — pre-fetch metrics_history
-│   │       └── diagnose.py        # DiagnoseSkill — parallel pre-fetch 5 signals, Opus 4.8
-│   │   # deterministic health/cert rules now live in the Go backend's
-│   │   # internal/orchestrator/evaluator (Tier-1) — see spec 003
-│   ├── scripts/
-│   │   └── migrate_prompts_to_langfuse.py  # one-time: push local prompts to Langfuse
-│   ├── adapters/                  # adapter-specific agents (future)
-│   │   └── __init__.py
-│   ├── models/                    # Pydantic models (shared)
-│   │   ├── health.py
-│   │   ├── query.py
-│   │   └── response.py
-│   ├── config/
-│   │   ├── settings.py
-│   │   └── claude_client.py
+│   │   ├── agent.py                # K8fyAgent base: _reason_pattern_a(), _fetch(), reason_chat()
+│   │   ├── prompt_manager.py       # Langfuse-first prompt resolver; local fallback
+│   │   ├── prompts.py              # local fallback strings (docs/PROMPT_LIFECYCLE.md)
+│   │   ├── tools.py                # Claude tool definitions — source of truth for the full list
+│   │   ├── service_topology.py     # resolve_service_clusters, dependency-graph helpers
+│   │   ├── dependency_miner.py / splunk_dependency_miner.py   # Glue/Athena + Splunk dependency mining
+│   │   ├── log_router.py / log_platform.py / log_platform_splunk.py / log_redaction.py
+│   │   ├── live_diagnostics.py, trace_search.py, tracing.py, action_executor.py
+│   │   └── skills/                 # spec 010 — Pattern A skill router (ADR 0026)
+│   │       ├── router.py           # SkillRouter: intent → skill dispatch table (13 entries today)
+│   │       ├── health_check.py, cert_audit.py, change_history.py, restart_trend.py, diagnose.py
+│   │       ├── vault_cert.py, incident_responder.py, remediation_executor.py, deployment_guardian.py
+│   │       └── dependency_graph.py, cold_services.py, label_scoped_dependency.py
+│   ├── scripts/migrate_prompts_to_langfuse.py
+│   ├── models/response.py          # Pydantic AgentResponse, etc.
+│   ├── config/settings.py, claude_client.py
 │   ├── requirements.txt
 │   └── Dockerfile
 │
-├── adapters/                      # Integration adapters
-│   ├── k8fy/                      # Kubernetes adapter
-│   │   ├── main.py                # entry point (reads SQS, emits events)
-│   │   ├── k8s_client.py          # K8s API wrapper
-│   │   ├── event_watcher.py       # watch events
-│   │   ├── cert_scraper.py        # scrape certificates
-│   │   ├── normalizer.py          # canonical event emission
-│   │   └── requirements.txt
-│   ├── crm/                       # (future) CRM adapter
-│   └── webhooks/                  # webhook receiver
+├── adapters/                       # Integration adapters
+│   ├── discovery/                  # agentify-discovery: deterministic, non-agentic,
+│   │   │                           # one Deployment PER FLEET CLUSTER (ADR 0022/0027).
+│   │   │                           # Replaced the old adapters/k8fy/ entirely (deleted,
+│   │   │                           # commit fe2aee4a) — no SQS/EventBridge anywhere here;
+│   │   │                           # it pushes over plain HTTP + holds one outbound WSS.
+│   │   ├── main.py, config.py, k8s_client.py
+│   │   ├── inventory.py, ingress.py, health.py, health_snapshot.py, service_index.py
+│   │   ├── service_topology.py, watch.py, normalize.py, security_posture.py
+│   │   ├── live_relay.py, live_tools.py   # the persistent connection + on-demand relay side
+│   │   └── log_redaction.py
+│   └── security_verifier/          # active-verification adapter (ADR 0033)
 │
-├── frontend/                      # TypeScript / React
+├── frontend/                       # TypeScript / React (plain React + @tanstack/react-query;
+│   │                                # no state-management library or component kit adopted)
 │   ├── src/
-│   │   ├── components/
-│   │   │   ├── ChatInterface.tsx  # ops dashboard chat
-│   │   │   ├── AdminPanel.tsx     # config UI
-│   │   │   ├── StatusDashboard.tsx # health overview
-│   │   │   └── ...
-│   │   ├── services/
-│   │   │   ├── api.ts             # API client (fetch + WebSocket)
-│   │   │   └── auth.ts            # auth provider
-│   │   ├── types/
-│   │   │   ├── query.ts
-│   │   │   ├── response.ts
-│   │   │   └── integration.ts
-│   │   ├── App.tsx
-│   │   └── index.tsx
+│   │   ├── components/             # ChatPanel, TopologyPanel, DependencyFlow, DiagnosisReport,
+│   │   │                           # SecurityPosturePanel, RemediationPanel, TracesPanel, etc.
+│   │   ├── api.ts                  # API client
+│   │   ├── App.tsx, main.tsx
+│   │   └── styles.css
 │   ├── package.json
 │   └── vite.config.ts
 │
-├── shared/                        # Shared libraries / contracts
-│   ├── models/
-│   │   ├── health.go / health.ts  # health model (Go + TS versions)
-│   │   ├── pod.go / pod.ts
-│   │   └── query.go / query.ts
-│   └── constants/
-│       └── event_profiles.yaml    # event profiles (shared)
+├── infra/
+│   ├── terraform/aws/              # eks.tf, iam.tf, rds.tf, dynamodb.tf, secrets.tf, logging.tf, …
+│   └── kubernetes/                 # backend.yaml, agent.yaml, discovery.yaml, …
 │
-├── infra/                         # Infrastructure as Code (Terraform / CDK)
-│   ├── aws/
-│   │   ├── main.tf                # ALB, ECS, RDS, etc.
-│   │   ├── ecs.tf                 # Fargate task definitions
-│   │   ├── rds.tf                 # Postgres setup
-│   │   ├── elasticache.tf         # Redis setup
-│   │   ├── dynamodb.tf            # DynamoDB tables
-│   │   ├── secrets.tf             # Secrets Manager
-│   │   └── outputs.tf
-│   ├── docker/
-│   │   ├── Dockerfile.backend     # Go backend
-│   │   ├── Dockerfile.agent       # Python agent
-│   │   ├── Dockerfile.adapter     # Python adapter
-│   │   └── Dockerfile.frontend    # React app
-│   └── README.md                  # infra deployment guide
-│
-├── tests/                         # Test suite
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
-│
-├── docs/                          # Additional docs
-│   ├── DEPLOYMENT.md              # step-by-step AWS deployment
-│   ├── OPERATIONS.md              # runbooks
-│   └── DEVELOPMENT.md             # local dev setup
-│
-└── Makefile                       # common tasks (build, test, deploy)
+└── (tests live beside the code they test: *_test.go next to .go files,
+    test_*.py under src/agent/tests/ and src/adapters/discovery/tests/,
+    plus src/backend/tests/integration/ for cross-component tests)
 ```
 
 ## 3. Layer responsibilities and communication
@@ -389,7 +356,15 @@ src/
 - Emits decisions to SQS
 - Updates pod-registry when changes complete
 
-## 4. AWS deployment architecture (enterprise, cost-optimized)
+## 4. AWS deployment architecture
+
+> **Note (2026-10-18):** this section originally described ADR 0004's ECS
+> Fargate placement. [ADR 0017](context-mesh/decisions/0017-all-on-eks-topology.md)
+> (2026-06-06) superseded that with a single EKS cluster for backend +
+> agent + Discovery; see `infra/terraform/aws/eks.tf` and
+> `infra/kubernetes/*.yaml`. Rewritten below to match. This also drops
+> ElastiCache/Pinecone, which section 1 above already corrected (ADR 0010 —
+> neither was ever provisioned).
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -399,52 +374,42 @@ src/
 │  ┌─────────────────────────────────────────────────────────┐
 │  │  Networking & CDN                                       │
 │  │  - Route 53 (DNS)                                       │
-│  │  - CloudFront (CDN for frontend)                        │
-│  │  - ALB (Application Load Balancer)                      │
+│  │  - CloudFront (CDN for frontend, served from S3)        │
+│  │  - ALB (Application Load Balancer, ingress into EKS)    │
 │  │  - VPC (with public + private subnets)                  │
 │  └────────────────────┬────────────────────────────────────┘
 │                       │
 │  ┌────────────────────▼────────────────────────────────────┐
-│  │  ECS Cluster (Fargate launch type)                      │
+│  │  EKS Cluster (single cluster, all compute — ADR 0017)   │
 │  │  ┌─────────────────────────────────────────────────────┐
-│  │  │ Service: Backend (Go)                               │
-│  │  │ - Task CPU: 0.5 vCPU, Memory: 1 GB (start)          │
-│  │  │ - Desired: 2 tasks (min HA), Max: 10                │
-│  │  │ - Auto-scale: target CPU 70%                        │
+│  │  │ Deployment: Backend (Go) — svc/agentify-backend     │
+│  │  │ - Min 2 pods (HA), auto-scale on CPU                │
 │  │  └─────────────────────────────────────────────────────┘
 │  │  ┌─────────────────────────────────────────────────────┐
-│  │  │ Service: Agent (Python)                             │
-│  │  │ - Task CPU: 0.25 vCPU, Memory: 512 MB (start)       │
-│  │  │ - Desired: 1 task (can be 0 if serverless later)    │
-│  │  │ - Auto-scale: on request queue length               │
+│  │  │ Deployment: Agent (Python) — svc/agentify-agent     │
 │  │  └─────────────────────────────────────────────────────┘
 │  │  ┌─────────────────────────────────────────────────────┐
-│  │  │ Service: Adapters (Python / Go)                     │
-│  │  │ - Task CPU: 0.25–0.5 vCPU, Memory: 512 MB           │
-│  │  │ - Desired: 1 per adapter (start minimal)            │
-│  │  │ - Auto-scale on SQS queue depth                     │
+│  │  │ Deployment: agentify-discovery                      │
+│  │  │ - one per FLEET cluster (ADR 0022) — pushes          │
+│  │  │   inventory/edges to the Hub, holds one outbound     │
+│  │  │   WSS for on-demand live reads; no SQS/EventBridge   │
 │  │  └─────────────────────────────────────────────────────┘
 │  └─────────────────────────────────────────────────────────┘
 │
 │  ┌─────────────────────────────────────────────────────────┐
 │  │  Data Services (Managed)                                │
-│  │  ┌──────────────────┬──────────────┬─────────────────┐ │
-│  │  │ RDS Postgres     │ ElastiCache  │ DynamoDB        │ │
-│  │  │ - Multi-AZ       │ Redis        │ - Pods table    │ │
-│  │  │ - db.t3.micro    │ - t3.micro   │ - Integrations  │ │
-│  │  │ - 20 GB storage  │ - 512 MB     │ - Configs       │ │
-│  │  └──────────────────┴──────────────┴─────────────────┘ │
-│  │  ┌──────────────────┬──────────────┬─────────────────┐ │
-│  │  │ S3 (Storage)     │ Secrets Mgr  │ Pinecone        │ │
-│  │  │ - Pod registry   │ - K8s tokens │ - Vector store  │ │
-│  │  │ - Config backups │ - API keys   │ - SaaS          │ │
-│  │  └──────────────────┴──────────────┴─────────────────┘ │
-│  └─────────────────────────────────────────────────────────┘
-│
-│  ┌─────────────────────────────────────────────────────────┐
-│  │  Async Processing                                       │
-│  │  - SQS queue (integration tasks, ingestion events)      │
-│  │  - EventBridge (scheduled refinement loop, scraping)    │
+│  │  ┌──────────────────────────────┬─────────────────────┐ │
+│  │  │ RDS Postgres + pgvector      │ DynamoDB            │ │
+│  │  │ - Multi-AZ                   │ - Pod registry      │ │
+│  │  │ - backs relational + KV +    │ - Integrations      │ │
+│  │  │   vector, single store       │ - Configs/profiles  │ │
+│  │  │   (ADR 0010)                 │                      │ │
+│  │  └──────────────────────────────┴─────────────────────┘ │
+│  │  ┌──────────────────┬──────────────────────────────────┐ │
+│  │  │ S3 (Storage)     │ Secrets Manager                   │ │
+│  │  │ - Pod registry   │ - Collector/DB/Anthropic creds    │ │
+│  │  │   backups        │ - read from env, K8s Secret only  │ │
+│  │  └──────────────────┴──────────────────────────────────┘ │
 │  └─────────────────────────────────────────────────────────┘
 │
 │  ┌─────────────────────────────────────────────────────────┐
@@ -458,72 +423,61 @@ src/
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Cost breakdown (monthly estimate, MVP):**
-- ECS Fargate: ~$50 (3 tasks × 0.25–0.5 vCPU, 30 days)
-- RDS t3.micro: ~$30
-- ElastiCache t3.micro: ~$25
-- DynamoDB: ~$10 (on-demand, low volume)
-- S3: ~$1
-- Data transfer: ~$5
-- **Total: ~$120/month** (scales linearly with load until reaching ALB/RDS limits)
+**Cost (per ADR 0017's own accounting):**
+- EKS control plane: ~$73/month flat, regardless of node count
+- Worker nodes + RDS + DynamoDB + S3 + data transfer: scales with load
+- See `docs/DEPLOYMENT.md` for the current, maintained cost table — this
+  section no longer carries its own numbers to avoid a second copy drifting
+  out of sync with that one.
 
-**Enterprise HA (no major refactoring):**
-- Add RDS read replica (RDS Multi-AZ)
-- Upgrade to db.t3.small (~$60/mo)
-- Add ElastiCache cluster mode (Redis Cluster)
-- Upgrade Fargate tasks to 1 vCPU, 2 GB RAM
-- Add NAT Gateway for private subnets (egress to external APIs)
-- **Total: ~$500–800/month** for HA across AZs
+## 5. Integration flow (end-to-end, as actually built)
 
-## 5. Integration flow (end-to-end)
+> **Note (2026-10-18):** this section originally described a K8s Adapter
+> polling via EventBridge and emitting to an SQS ingestion queue. That
+> component (`adapters/k8fy/`) was deleted outright in commit `fe2aee4a`
+> (ADR 0027) and replaced by `agentify-discovery` — no SQS, no EventBridge,
+> no separate "Event Ingestion Service" anywhere in this path. Rewritten
+> below to match what actually runs.
 
 ```
-1. K8s Adapter (runs on schedule via EventBridge)
+1. agentify-discovery (one Deployment PER FLEET CLUSTER, on a 60s timer)
    │
-   ├─► Calls K8s API: GET /api/v1/pods
+   ├─► Calls its OWN cluster's K8s API directly (inventory.py, ingress.py,
+   │   service_topology.py, health_snapshot.py) — no queue, no schedule
+   │   service; it's a plain in-process timer loop (main.py)
    │
-   ├─► Normalizes event:
-   │   {
-   │     "event_namespace": "k8fy.live-state",
-   │     "pod_id": "payment-svc-abc123",
-   │     "phase": "Running",
-   │     "ready": true,
-   │     "restarts": 0,
-   │     "timestamp": "2026-05-30T10:00:00Z"
-   │   }
-   │
-   └─► Emits to SQS ingestion queue
+   └─► Pushes straight over HTTP to the Hub (plain POST, bearer
+       CollectorToken — resolveTenantContext identifies tenant/cluster):
+       POST /api/ingest, /api/cluster-inventory, /api/cluster-health,
+       /api/cluster-ingress, /api/service-dependencies
        │
        ▼
-2. Event Ingestion Service (consumes SQS)
+2. Go backend (the Hub) — handlers.go
    │
-   ├─► Routes via storage-strategy (see context-mesh)
-   │   → "k8fy.live-state" with access pattern "point-lookup"
-   │   → store in Redis (KV)
+   ├─► resolveTenantContext authenticates the push, resolves (tenant_id, cluster_id)
    │
-   ├─► Updates pod stats (event_count, freshness)
+   ├─► Writes straight into Postgres (ADR 0010 — one store backs
+   │   relational + KV + vector): current_state, events, cluster_services,
+   │   service_dependencies, cluster_health_snapshots
    │
-   └─► Emits observation to refinement loop
+   └─► Updates pod-registry stats in DynamoDB (via internal/storage/registry)
        │
        ▼
-3. Refinement Loop (runs periodically)
-   │
-   ├─► Observes: "k8fy.live-state" has grown 10k pods"
-   │
-   ├─► Decides: "split by namespace" (ADR 0002)
-   │
-   └─► Executes: create index pod, populate shard map, update DynamoDB
+3. On-demand live reads (separate from the push path above): Discovery also
+   holds ONE persistent outbound WebSocket to the Hub (GET
+   /api/collector/connect). When the agent needs a live K8s read (pod logs,
+   events, certs), the Hub relays the request down that socket
+   (CollectorHub / POST /api/live-fetch) and Discovery answers it directly
+   against its own cluster — the Hub never dials a cluster itself.
        │
        ▼
-4. Frontend / Admin: queries via Go backend
+4. Frontend / operator: queries via the Go backend
    │
-   ├─► GET /admin/integrations
-   │   → returns list of adapters, last sync time, event count
+   ├─► GET /admin/integrations → list of fleet clusters, last push, status
    │
    ├─► POST /api/query "health of service X"
-   │   → orchestrator routes to k8fy.live-state pod(s)
-   │   → fetches from Redis
-   │   → calls Python agent for reasoning
+   │   → orchestrator routes to the right Postgres-backed pod
+   │   → calls the Python agent (Skill Router → Pattern A skill) for reasoning
    │   → returns answer with sources + confidence
 ```
 
@@ -622,21 +576,21 @@ Ops User (browser) → React Frontend → Go WebSocket → Agent → Storage
 
 | Scenario | Strategy |
 |----------|----------|
-| **Dev/Testing** | Run with minimal: 1 backend (0.25 vCPU), 1 agent (0.25 vCPU), 1 adapter (0.25 vCPU). Total ~$30/mo. |
-| **Production (low volume)** | 2 backend tasks (HA), 1 agent, 1 adapter. Total ~$120/mo. |
-| **Production (scale)** | 10+ backend tasks (auto-scale), 3+ agents, multiple adapters. RDS multi-AZ. ~$500+/mo. |
-| **Reduce compute costs** | Cache query results (1 hour TTL); batch adapter scrapes (every 5min, not per-event). |
+| **Dev/Testing** | Minimal pod replicas for backend + agent; scale nodes to 0 off-hours (see `docs/DEPLOYMENT.md`'s "Pause" cost tier, ~$73/mo — the EKS control-plane floor). |
+| **Production (low volume)** | 2 backend pods (HA), 1 agent pod, one `agentify-discovery` pod per fleet cluster. See `docs/DEPLOYMENT.md` for the current, maintained cost table. |
+| **Production (scale)** | Auto-scaled backend/agent pods, RDS Multi-AZ, more fleet clusters (each adding one more Discovery pod, not a new compute tier). |
+| **Reduce compute costs** | Cache query results (1 hour TTL); Discovery already scans on a fixed interval (60s) rather than per-event. |
 | **Reduce storage costs** | Archive old events to S3 Glacier (after 30d); move cold data out of hot stores. |
 | **Reduce agent costs** | Use Claude prompt caching (saves ~90% of repeated queries). |
 
 ## 9. Deployment & operations
 
 See `infra/` folder and `docs/DEPLOYMENT.md` for:
-- Terraform IaC (all AWS resources)
+- Terraform IaC (all AWS resources, including the EKS cluster itself — ADR 0017)
 - Docker images (all services)
-- Helm charts (if moving to k8s later)
+- Plain Kubernetes manifests (`infra/kubernetes/*.yaml`) — no Helm chart exists
 - Monitoring & alerting
-- Runbooks (incident response)
+- Runbooks (incident response — also `docs/CLOUDSHELL_RUNBOOK.md`)
 
 ## 10. Future scaling (no major refactoring)
 

@@ -10,11 +10,12 @@ layer, described by a self-maintained `pod-registry`, not here.)
 ```
 context-mesh/
 ├── _orchestrator.md      # how query routing & correlation works (the primary pod)
-├── policies/             # the 4 "brain" policies — start here
+├── policies/             # the 5 "brain" policies — start here
 │   ├── storage-strategy.md
 │   ├── pod-formation.md
 │   ├── refinement-loop.md
-│   └── correlation.md
+│   ├── correlation.md
+│   └── data-governance.md
 ├── specs/                # one feature = one spec  (copy _TEMPLATE.md)
 │   ├── _TEMPLATE.md
 │   └── 001-event-ingestion.md

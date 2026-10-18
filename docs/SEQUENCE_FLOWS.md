@@ -302,11 +302,11 @@ amendment (2026-08-03) for why these weren't unified onto one connection.
 
 | Hop | File | What it does |
 |-----|------|---------------|
-| Connection setup | [`handlers.go:2096`](../src/backend/internal/api/handlers.go#L2096) `HandleCollectorConnect` | Upgrades to WebSocket, registers the connection under `cluster_id` |
+| Connection setup | [`handlers.go:3133`](../src/backend/internal/api/handlers.go#L3133) `HandleCollectorConnect` | Upgrades to WebSocket, registers the connection under `cluster_id` |
 | Connection setup | [`live_relay.py:71`](../src/adapters/discovery/live_relay.py#L71) `run_forever` | Dials out, reconnects with capped backoff on drop |
-| Agent → Hub | [`handlers.go:2155`](../src/backend/internal/api/handlers.go#L2155) `HandleLiveFetch` | Requires `cluster_id`; checks `liveFetchAllowedTools` |
-| Hub → Discovery | [`collector_hub.go:152`](../src/backend/internal/api/collector_hub.go#L152) `CollectorHub.RequestLive` | Writes a WS frame over the already-open connection, awaits the matching response by `id` |
-| Discovery execution | [`live_tools.py:64`](../src/adapters/discovery/live_tools.py#L64) `dispatch()` | K8s API call against Discovery's own cluster, own RBAC |
+| Agent → Hub | [`handlers.go:3192`](../src/backend/internal/api/handlers.go#L3192) `HandleLiveFetch` | Requires `cluster_id`; checks `liveFetchAllowedTools` |
+| Hub → Discovery | [`collector_hub.go:154`](../src/backend/internal/api/collector_hub.go#L154) `CollectorHub.RequestLive` | Writes a WS frame over the already-open connection, awaits the matching response by `id` |
+| Discovery execution | [`live_tools.py:231`](../src/adapters/discovery/live_tools.py#L231) `dispatch()` | K8s API call against Discovery's own cluster, own RBAC |
 
 ---
 
@@ -365,11 +365,11 @@ outcome.
 
 | Hop | File | What it does |
 |-----|------|---------------|
-| Frontend → Hub | [`api.ts:169`](../src/frontend/src/api.ts#L169) `runLiveTool()` | POSTs to `/api/live-query` |
-| Hub proxy | [`handlers.go:1466`](../src/backend/internal/api/handlers.go#L1466) `HandleLiveToolCall` | Allow-list check (`liveDiagnosticTools`), then forwards as-is |
-| Hub → Agent | [`agent_client.go:108`](../src/backend/internal/api/agent_client.go#L108) `AgentClient.LiveToolCall` | Plain HTTP POST — no `cluster_id` added |
-| Agent dispatch | [`tools.py:629`](../src/agent/k8fy/tools.py#L629) `_dispatch_live_diagnostic` | Branches on `cluster_ids` (fan-out, Diagram 8) → `cluster_id` (relay, Diagram 6) → local (this diagram) |
-| Cluster resolution (ADR 0028) | [`agent.py:829`](../src/agent/k8fy/agent.py#L829) `_structure_chat_answer` | Calls `resolve_service_clusters` once per response, injects `cluster_id`/`cluster_ids` per action |
+| Frontend → Hub | [`api.ts:232`](../src/frontend/src/api.ts#L232) `runLiveTool()` | POSTs to `/api/live-query` |
+| Hub proxy | [`handlers.go:1868`](../src/backend/internal/api/handlers.go#L1868) `HandleLiveToolCall` | Allow-list check (`liveDiagnosticTools`), then forwards as-is |
+| Hub → Agent | [`agent_client.go:114`](../src/backend/internal/api/agent_client.go#L114) `AgentClient.LiveToolCall` | Plain HTTP POST — no `cluster_id` added |
+| Agent dispatch | [`tools.py:670`](../src/agent/k8fy/tools.py#L670) `_dispatch_live_diagnostic` | Branches on `cluster_ids` (fan-out, Diagram 8) → `cluster_id` (relay, Diagram 6) → local (this diagram) |
+| Cluster resolution (ADR 0028) | [`agent.py:1913`](../src/agent/k8fy/agent.py#L1913) `_structure_chat_answer` | Calls `resolve_service_clusters` once per response, injects `cluster_id`/`cluster_ids` per action |
 | Local execution | [`live_diagnostics.py`](../src/agent/k8fy/live_diagnostics.py) | Direct in-cluster K8s API call, agent pod's own service account |
 
 ### Diagram 6 vs. 7 vs. 8 — which one actually runs
@@ -440,10 +440,10 @@ best-effort single `cluster_id` instead (see ADR 0028).
 
 | Hop | File | What it does |
 |-----|------|---------------|
-| Fan-out trigger | [`tools.py:629`](../src/agent/k8fy/tools.py#L629) `_dispatch_live_diagnostic` | Sees `cluster_ids`, calls `_remote_live_fetch` once per cluster via `asyncio.gather` |
-| Per-cluster relay | [`tools.py:560`](../src/agent/k8fy/tools.py#L560) `_remote_live_fetch` | Unchanged — same function Diagram 6's single-cluster case already uses |
+| Fan-out trigger | [`tools.py:670`](../src/agent/k8fy/tools.py#L670) `_dispatch_live_diagnostic` | Sees `cluster_ids`, calls `_remote_live_fetch` once per cluster via `asyncio.gather` |
+| Per-cluster relay | [`tools.py:601`](../src/agent/k8fy/tools.py#L601) `_remote_live_fetch` | Unchanged — same function Diagram 6's single-cluster case already uses |
 | Merge | [`tools.py`](../src/agent/k8fy/tools.py) `_merge_fanout_results` | Tags each item with `cluster_id`, concatenates, surfaces `clusters_failed` |
-| Cluster resolution | [`agent.py:829`](../src/agent/k8fy/agent.py#L829) `_structure_chat_answer` | Attaches `cluster_ids` (plural) only when 2+ resolve and no `pod` is set |
+| Cluster resolution | [`agent.py:1913`](../src/agent/k8fy/agent.py#L1913) `_structure_chat_answer` | Attaches `cluster_ids` (plural) only when 2+ resolve and no `pod` is set |
 
 ---
 
