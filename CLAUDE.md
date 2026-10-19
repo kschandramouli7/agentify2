@@ -1,6 +1,38 @@
 # agentify
 
-> One-line product description: _<fill in: what does agentify do and for whom?>_
+> agentify is an AI-powered Kubernetes operations platform for SRE and
+> platform teams — it answers natural-language questions about cluster
+> health, certificates, and service dependencies from live and mined data,
+> diagnoses incidents by correlating signals into a root-cause narrative,
+> proactively alerts on anomalies, and takes corrective action (cert
+> renewal automatically, riskier actions only with human approval) —
+> scaling across a fleet of clusters via lightweight per-cluster
+> collectors reporting to a central hub.
+
+## What it actually does, by use case
+
+- **Answers natural-language ops questions instantly** — health,
+  readiness, certificate expiry — via a deterministic fast path with zero
+  model cost (Tier 1).
+- **Diagnoses incidents by correlating signals** — pod health, restart
+  trends, deploy history, logs — into one prioritized root-cause
+  narrative, citing its evidence rather than guessing (Tier 2,
+  Claude-powered).
+- **Maps service dependencies with zero instrumentation** — mines
+  who-calls-whom from existing logs across a fleet of clusters, including
+  cross-cluster calls, and shows it as an explorable graph.
+- **Watches clusters proactively** — detects anomalies on its own and
+  pushes a diagnosed summary to on-call before anyone has to notice.
+- **Takes action, but only with a human in the loop** — automatic cert
+  renewal, and human-approved restart/scale/rollback for anything riskier.
+- **Checks security posture** — NetworkPolicy, securityContext, TLS gaps —
+  across the fleet.
+- **Scales across many clusters from one place** — each cluster runs a
+  small collector that pushes data to a central hub and relays on-demand
+  live reads, so the fleet looks like one system to the operator.
+- **Remembers** — a chat interface with history, cross-session "what's
+  changed" drift detection, and semantic recall of similar past incidents,
+  so repeat questions get sharper answers over time.
 
 ## How this repo is organized
 
