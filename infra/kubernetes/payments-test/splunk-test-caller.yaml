@@ -138,11 +138,19 @@ spec:
               # busybox wget: --no-check-certificate because the serving
               # certs come from the Vault PKI test CA (same reasoning
               # payment-batch.yaml's own wget call already documents),
-              # -T 3 so an unreachable target cannot stall the burst.
+              # -T 3 so an unreachable target cannot stall the burst. The
+              # PROBE stays at bare "/" (that's what determines ok/
+              # unreachable below); the LOGGED line is enriched with an
+              # explicit :443 port and /v1/payments path — same reasoning
+              # as payment-batch.yaml's own identical change: a bare
+              # trailing "/" normalizes to "no path captured" in
+              # extract_service_calls(), so this is for test purposes, to
+              # get real port/path data through the Splunk mining path
+              # (ADR 0041/0042) instead of leaving it permanently empty.
               if wget -q -O- --no-check-certificate -T 3 "https://$target/" >/dev/null 2>&1; then
-                line="splunk-test-caller: called https://$target/ ok"
+                line="splunk-test-caller: called https://$target:443/v1/payments ok"
               else
-                line="splunk-test-caller: called https://$target/ unreachable"
+                line="splunk-test-caller: called https://$target:443/v1/payments unreachable"
               fi
               echo "$line"
               send_to_splunk "$line"

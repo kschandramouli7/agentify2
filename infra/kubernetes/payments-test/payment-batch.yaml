@@ -118,15 +118,28 @@ spec:
               target="$svc.$NAMESPACE.svc.cluster.local"
               # busybox wget: --no-check-certificate because the serving certs
               # come from the Vault PKI test CA, -T 3 so an unreachable target
-              # cannot stall the burst.
+              # cannot stall the burst. The PROBE stays at bare "/" — that's
+              # what actually determines ok/unreachable below, so the real
+              # reachability signal is unaffected by the line below.
+              #
+              # The LOGGED line is deliberately enriched with an explicit
+              # :443 port and a representative /v1/payments path, which the
+              # probe itself does not use. extract_service_calls()
+              # (service_topology.py) normalizes a bare trailing "/" to "no
+              # path captured" by design (see its _normalize_path), so a
+              # literal `https://$target/` here always left port/path empty
+              # in the mined service_dependencies rows — this is for test
+              # purposes, to exercise ADR 0031/0034's port/path capture
+              # end-to-end with real data instead of leaving it permanently
+              # unverified in this namespace.
               if wget -q -O- --no-check-certificate -T 3 "https://$target/" >/dev/null 2>&1; then
-                echo "payment-batch: called https://$target/ ok"
+                echo "payment-batch: called https://$target:443/v1/payments ok"
               else
                 # Logged anyway, deliberately: the edge is real whether or not
                 # the callee answers, and an unreachable dependency is exactly
                 # what an operator wants surfaced. payment-worker has no
                 # listener, so this branch is the expected one for it.
-                echo "payment-batch: called https://$target/ unreachable"
+                echo "payment-batch: called https://$target:443/v1/payments unreachable"
               fi
             done
             # ROADMAP P31 phase 1 (ADR 0037) validation: logged as a FULL
