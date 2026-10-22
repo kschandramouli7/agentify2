@@ -122,6 +122,36 @@ function buildGraph(edges: ServiceDependency[]): Graph {
   };
 }
 
+// Edge table: click-to-sort. "evidence"/"last_seen"/"first_seen" default to
+// descending on first click (newest/most-confirmed first — what someone
+// scanning for "what's active" wants); the two service-name columns default
+// to ascending (alphabetical reads naturally A→Z first). A second click on
+// the same column flips direction.
+type EdgeSortKey = "from_service" | "to_service" | "port" | "callers" | "evidence" | "last_seen" | "first_seen";
+const EDGE_SORT_DEFAULT_DIR: Record<EdgeSortKey, "asc" | "desc"> = {
+  from_service: "asc", to_service: "asc", port: "desc", callers: "desc",
+  evidence: "desc", last_seen: "desc", first_seen: "desc",
+};
+
+function sortEdges(edges: ServiceDependency[], key: EdgeSortKey, dir: "asc" | "desc"): ServiceDependency[] {
+  const sign = dir === "asc" ? 1 : -1;
+  return edges.slice().sort((a, b) => {
+    switch (key) {
+      case "from_service": return sign * a.from_service.localeCompare(b.from_service);
+      case "to_service":   return sign * a.to_service.localeCompare(b.to_service);
+      // Unset (0/undefined) sorts last regardless of direction — it isn't a
+      // real "low" port, it's "never captured," and burying it at the top
+      // of a descending sort would be misleading.
+      case "port":         return (a.port ? 0 : 1) - (b.port ? 0 : 1) || sign * ((a.port ?? 0) - (b.port ?? 0));
+      case "callers":      return sign * ((a.caller_pod_count ?? 0) - (b.caller_pod_count ?? 0));
+      case "last_seen":    return sign * (new Date(a.last_seen).getTime() - new Date(b.last_seen).getTime());
+      case "first_seen":   return sign * (new Date(a.first_seen).getTime() - new Date(b.first_seen).getTime());
+      case "evidence":
+      default:              return sign * (a.evidence_count - b.evidence_count);
+    }
+  });
+}
+
 // Mermaid rather than an inline diagram: it renders in GitHub, docs and PRs,
 // where a dependency picture is genuinely useful, and costs no runtime library.
 function toMermaid(g: Graph, namespace: string): string {
@@ -286,6 +316,38 @@ function EvidenceBar({ edge }: { edge: ServiceDependency }) {
   );
 }
 
+// A plain <th> for columns that aren't a sort key (the arrow spacer, Health,
+// Path — Health is derived/computed and Path is free text, neither is a
+// meaningful sort axis) vs. a clickable one that reports its own active/
+// direction state visually, never by colour alone (an outlined ▲/▼ glyph,
+// same "word/symbol + colour" rule the rest of this panel already follows).
+function EdgeTh({
+  label, sortKey, active, dir, onSort, align,
+}: {
+  label: string;
+  sortKey: EdgeSortKey;
+  active: boolean;
+  dir: "asc" | "desc";
+  onSort: (key: EdgeSortKey) => void;
+  align?: "right";
+}) {
+  return (
+    <th className={align === "right" ? "topo-edges-th--num" : undefined}>
+      <button
+        type="button"
+        className={`topo-edges-sort${active ? " topo-edges-sort--active" : ""}`}
+        onClick={() => onSort(sortKey)}
+        title={`Sort by ${label.toLowerCase()}`}
+      >
+        {label}
+        <span className="topo-edges-sort__arrow" aria-hidden="true">
+          {active ? (dir === "asc" ? "▲" : "▼") : "⇅"}
+        </span>
+      </button>
+    </th>
+  );
+}
+
 function EdgeList({
   edges, direction, onSelect,
 }: {
@@ -327,6 +389,19 @@ export function TopologyPanel() {
   // than it needs to for a first look, and the count is always still in
   // each edge's own tooltip regardless of this toggle.
   const [showFlowCount, setShowFlowCount] = useState(false);
+
+  // Edge table sort (see EdgeTh/sortEdges above). Defaults to the original
+  // fixed "most-evidenced first" order.
+  const [edgeSortKey, setEdgeSortKey] = useState<EdgeSortKey>("evidence");
+  const [edgeSortDir, setEdgeSortDir] = useState<"asc" | "desc">("desc");
+  const toggleEdgeSort = useCallback((key: EdgeSortKey) => {
+    if (key === edgeSortKey) {
+      setEdgeSortDir(d => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setEdgeSortKey(key);
+      setEdgeSortDir(EDGE_SORT_DEFAULT_DIR[key]);
+    }
+  }, [edgeSortKey]);
 
   // Drag-to-resize the chat rail (`.topo-side`) against the diagram
   // (`.topo-main`). Width lives in state so it can be dragged; persisted to
@@ -488,6 +563,10 @@ export function TopologyPanel() {
   });
 
   const graph = useMemo(() => buildGraph(filteredData ?? []), [filteredData]);
+  const sortedEdges = useMemo(
+    () => sortEdges(graph.edges, edgeSortKey, edgeSortDir),
+    [graph.edges, edgeSortKey, edgeSortDir],
+  );
 
   // Declared entry points become synthetic nodes and edges. Their ids are
   // prefixed so they can never collide with a real service name.
@@ -989,31 +1068,38 @@ export function TopologyPanel() {
                 )}
               </div>
 
-              <div className="adm-table-wrap">
-                <table className="adm-table">
+              <div className="adm-table-wrap topo-edges-wrap">
+                <table className="adm-table topo-edges-table">
                   <thead>
                     <tr>
-                      <th>From</th><th></th><th>To</th><th>Port</th><th>Path</th><th>Callers</th><th>Seen in</th><th>Health</th><th>Last seen</th><th>First seen</th>
+                      <EdgeTh label="From" sortKey="from_service" active={edgeSortKey === "from_service"} dir={edgeSortDir} onSort={toggleEdgeSort} />
+                      <th aria-hidden="true" />
+                      <EdgeTh label="To" sortKey="to_service" active={edgeSortKey === "to_service"} dir={edgeSortDir} onSort={toggleEdgeSort} />
+                      <EdgeTh label="Port" sortKey="port" active={edgeSortKey === "port"} dir={edgeSortDir} onSort={toggleEdgeSort} align="right" />
+                      <th>Path</th>
+                      <EdgeTh label="Callers" sortKey="callers" active={edgeSortKey === "callers"} dir={edgeSortDir} onSort={toggleEdgeSort} align="right" />
+                      <EdgeTh label="Seen in" sortKey="evidence" active={edgeSortKey === "evidence"} dir={edgeSortDir} onSort={toggleEdgeSort} />
+                      <th>Health</th>
+                      <EdgeTh label="Last seen" sortKey="last_seen" active={edgeSortKey === "last_seen"} dir={edgeSortDir} onSort={toggleEdgeSort} />
+                      <EdgeTh label="First seen" sortKey="first_seen" active={edgeSortKey === "first_seen"} dir={edgeSortDir} onSort={toggleEdgeSort} />
                     </tr>
                   </thead>
                   <tbody>
-                    {graph.edges
-                      .slice()
-                      .sort((a, b) => b.evidence_count - a.evidence_count)
+                    {sortedEdges
                       .map(e => (
                         <tr key={e.id}>
-                          <td>
+                          <td className="topo-edges-td--svc">
                             <button type="button" className="topo-link" onClick={() => setFocus(e.from_service)}>{e.from_service}</button>
                             {showColdOnly && <CrossClusterNote service={e.from_service} pairs={crossClusterByService} />}
                           </td>
-                          <td className="adm-muted">→</td>
-                          <td>
+                          <td className="topo-edges-td--arrow" aria-hidden="true">→</td>
+                          <td className="topo-edges-td--svc">
                             <button type="button" className="topo-link" onClick={() => setFocus(e.to_service)}>{e.to_service}</button>
                             {showColdOnly && <CrossClusterNote service={e.to_service} pairs={crossClusterByService} />}
                           </td>
-                          <td className="adm-muted">{e.port ? e.port : "—"}</td>
-                          <td className="adm-muted" title={e.path || undefined}>{e.path || "—"}</td>
-                          <td className="adm-muted">
+                          <td className="adm-muted topo-edges-td--num topo-edges-td--mono">{e.port ? e.port : "—"}</td>
+                          <td className="adm-muted topo-edges-td--path" title={e.path || undefined}>{e.path || "—"}</td>
+                          <td className="adm-muted topo-edges-td--num">
                             {(() => {
                               // ROADMAP P27 phase 4 (caller cardinality). 0/absent
                               // means "no caller-pod evidence yet", never shown as
